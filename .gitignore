@@ -1,69 +1,24 @@
-# Dependencies
-node_modules/
-.pnp
-.pnp.js
-.yarn/*
-!.yarn/patches
-!.yarn/releases
-!.yarn/plugins
-!.yarn/sdks
-!.yarn/versions
-
-# Build output
-dist/
-build/
-out/
-*.tsbuildinfo
-
-# Packaged extension
-*.zip
-*.crx
-*.pem
-
-# Vite
-.vite/
-vite.config.*.timestamp-*
-
-# Test and coverage
-coverage/
-.nyc_output/
-playwright-report/
-test-results/
-
-# Caches
-.cache/
-.eslintcache
-.npm/
-.turbo/
-
 # Logs
-logs/
+logs
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+lerna-debug.log*
 
-# Environment and secrets
-.env
-.env.*
-!.env.example
-*.key
-secrets.json
+node_modules
+dist
+dist-ssr
+*.local
 
-# Editors
-.idea/
-*.swp
-*.swo
+# Editor directories and files
 .vscode/*
-!.vscode/settings.json
 !.vscode/extensions.json
-!.vscode/launch.json
-!.vscode/tasks.json
-
-# OS
+.idea
 .DS_Store
-.DS_Store?
-._*
-Thumbs.db
-Desktop.ini
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
