@@ -33,4 +33,4 @@ export class TaskQueue<T> {
   clear(): void {
     this.tasks.length = 0;
   }
-}       
+}

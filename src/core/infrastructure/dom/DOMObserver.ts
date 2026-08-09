@@ -31,11 +31,7 @@ export class DOMObserver {
       const timeoutId = window.setTimeout(() => {
         observer.disconnect();
 
-        reject(
-          new Error(
-            `Timed out waiting for element: ${selector}`,
-          ),
-        );
+        reject(new Error(`Timed out waiting for element: ${selector}`));
       }, timeout);
     });
   }

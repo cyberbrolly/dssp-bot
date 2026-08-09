@@ -19,39 +19,25 @@ export class DOMService {
     return element;
   }
 
-  click(
-    selector: string,
-    root: ParentNode = document,
-  ): void {
+  click(selector: string, root: ParentNode = document): void {
     const element = this.findRequired<HTMLElement>(selector, root);
 
     element.click();
   }
 
-  setValue(
-    selector: string,
-    value: string,
-    root: ParentNode = document,
-  ): void {
+  setValue(selector: string, value: string, root: ParentNode = document): void {
     const element = this.findRequired<
       HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
     >(selector, root);
 
     element.value = value;
 
-    element.dispatchEvent(
-      new Event("input", { bubbles: true }),
-    );
+    element.dispatchEvent(new Event("input", { bubbles: true }));
 
-    element.dispatchEvent(
-      new Event("change", { bubbles: true }),
-    );
+    element.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  exists(
-    selector: string,
-    root: ParentNode = document,
-  ): boolean {
+  exists(selector: string, root: ParentNode = document): boolean {
     return this.find(selector, root) !== null;
   }
 }

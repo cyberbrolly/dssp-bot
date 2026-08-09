@@ -1,55 +1,55 @@
 import { defineManifest } from "@crxjs/vite-plugin";
 
-export default defineManifest({
-  manifest_version: 3,
+const FALLBACK_PORTAL_MATCH = "https://portal.dssp.invalid/*";
 
-  name: "DSSP Training Logger",
+export function parsePortalMatches(value: string | undefined): string[] {
+  const patterns = (value ?? "")
+    .split(",")
+    .map((pattern) => pattern.trim())
+    .filter((pattern) => pattern.length > 0);
 
-  short_name: "DSSP",
+  return patterns.length > 0 ? patterns : [FALLBACK_PORTAL_MATCH];
+}
 
-  version: "0.1.0",
+export function createManifest(portalMatches: string[]) {
+  return defineManifest({
+    manifest_version: 3,
 
-  description:
-    "Automates training log submissions for DSSP instructors.",
+    name: "DSSP Training Logger",
 
-  icons: {
-    16: "icons/icon16.png",
-    32: "icons/icon32.png",
-    48: "icons/icon48.png",
-    128: "icons/icon128.png",
-  },
+    short_name: "DSSP",
 
-  action: {
-    default_popup: "src/popup/index.html",
-    default_title: "DSSP Training Logger",
-  },
+    version: "0.1.0",
 
-  background: {
-    service_worker: "src/background/index.ts",
-    type: "module",
-  },
+    description: "Automates training log submissions for DSSP instructors.",
 
-  content_scripts: [
-    {
-      matches: ["<all_urls>"],
-      js: ["src/content/index.ts"],
-      run_at: "document_idle",
+    icons: {
+      16: "icons/icon16.png",
+      32: "icons/icon32.png",
+      48: "icons/icon48.png",
+      128: "icons/icon128.png",
     },
-  ],
 
-  permissions: [
-    "storage",
-    "tabs",
-    "activeTab",
-    "scripting",
-  ],
-
-  host_permissions: ["<all_urls>"],
-
-  web_accessible_resources: [
-    {
-      resources: ["assets/*"],
-      matches: ["<all_urls>"],
+    action: {
+      default_popup: "src/popup/index.html",
+      default_title: "DSSP Training Logger",
     },
-  ],
-});
+
+    background: {
+      service_worker: "src/background/index.ts",
+      type: "module",
+    },
+
+    content_scripts: [
+      {
+        matches: portalMatches,
+        js: ["src/content/index.ts"],
+        run_at: "document_idle",
+      },
+    ],
+
+    permissions: ["storage", "tabs", "activeTab"],
+
+    host_permissions: portalMatches,
+  });
+}

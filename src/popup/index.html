@@ -1,12 +1,77 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <title>DSSP Logger</title>
-</head>
-<body>
-  <div id="app"></div>
+  <head>
+    <meta charset="UTF-8" />
+    <title>DSSP Training Logger</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <header class="panel__header">
+        <h1>DSSP Training Logger</h1>
+        <span id="state" class="badge">idle</span>
+      </header>
 
-  <script type="module" src="./main.ts"></script>
-</body>
+      <section class="section">
+        <h2>Session</h2>
+
+        <label for="instructor">Instructor ID</label>
+        <input id="instructor" type="text" autocomplete="off" />
+
+        <label for="training-type">Training type ID</label>
+        <input id="training-type" type="text" autocomplete="off" />
+
+        <label for="training-date">Training date</label>
+        <input id="training-date" type="date" />
+
+        <label for="trainees">Trainee IDs</label>
+        <textarea
+          id="trainees"
+          rows="3"
+          placeholder="One trainee ID per line"
+        ></textarea>
+      </section>
+
+      <section class="section">
+        <h2>Progress</h2>
+
+        <p id="current" class="muted">No batch running</p>
+
+        <div class="grid">
+          <div><span class="label">Total</span><span id="total">0</span></div>
+          <div>
+            <span class="label">Done</span><span id="processed">0</span>
+          </div>
+          <div><span class="label">OK</span><span id="successful">0</span></div>
+          <div><span class="label">Failed</span><span id="failed">0</span></div>
+          <div>
+            <span class="label">Skipped</span><span id="skipped">0</span>
+          </div>
+          <div>
+            <span class="label">Unconfirmed</span
+            ><span id="indeterminate">0</span>
+          </div>
+          <div>
+            <span class="label">Left</span><span id="remaining">0</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="controls">
+        <button id="start" type="button">Start batch</button>
+        <button id="pause" type="button" disabled>Pause</button>
+        <button id="resume" type="button" disabled>Resume</button>
+        <button id="stop" type="button" disabled>Stop</button>
+      </section>
+
+      <p id="status" class="status" role="status"></p>
+
+      <section id="report-section" class="section" hidden>
+        <h2>Last report</h2>
+        <p id="report" class="muted"></p>
+      </section>
+    </main>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
 </html>
