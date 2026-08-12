@@ -8,7 +8,14 @@ export type SubmissionOutcome =
   | { status: "rejected"; message: string };
 
 export interface PortalAdapter {
-  isPortalPage(): boolean;
+  /**
+   * Whether the pinned tab is still a usable portal page, checked live.
+   *
+   * Deliberately async and uncached. A batch runs for minutes and the portal
+   * session can lapse at any point in it, so a value read once before the run
+   * says nothing about the trainee about to be submitted.
+   */
+  isPortalPage(): Promise<boolean>;
 
   getTrainees(): Promise<Result<Trainee[]>>;
 

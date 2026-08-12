@@ -1,4 +1,5 @@
 import type { BatchReport } from "../../domain/BatchReport";
+import type { BatchCheckpoint } from "../../automation/BatchCheckpoint";
 import type { TrainingSession } from "../../domain/TrainingSession";
 import type { AutomationState } from "../../automation/AutomationState";
 
@@ -25,7 +26,8 @@ export type Message =
   | { type: "PAUSE_AUTOMATION" }
   | { type: "RESUME_AUTOMATION" }
   | { type: "STOP_AUTOMATION" }
-  | { type: "GET_REPORT" };
+  | { type: "GET_REPORT" }
+  | { type: "GET_CHECKPOINT" };
 
 export type MessageType = Message["type"];
 
@@ -40,4 +42,9 @@ export interface StatusResponse {
 export interface ReportResponse {
   success: true;
   data: BatchReport | null;
+}
+
+export interface CheckpointResponse {
+  success: true;
+  data: BatchCheckpoint | null;
 }

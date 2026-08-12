@@ -13,24 +13,60 @@ import {
 
 export class RemotePortalAdapter implements PortalAdapter {
   private readonly tabs: BrowserTabs;
-  private portalPage = true;
+
+  /**
+   * The tab this batch is driving, fixed at attach time.
+   *
+   * Resolving the active tab per command would let the target move mid-batch:
+   * a batch runs for minutes while the operator is at their desk, and any tab
+   * switch or newly focused window would redirect the next command. With a
+   * second portal tab open that means filling one page and submitting on
+   * another — a real training record written against the wrong trainee.
+   */
+  private tabId: number | null = null;
 
   constructor(tabs: BrowserTabs) {
     this.tabs = tabs;
   }
 
-  isPortalPage(): boolean {
-    return this.portalPage;
+  async isPortalPage(): Promise<boolean> {
+    const result = await this.dispatch<boolean>({ type: "PORTAL_IS_PAGE" });
+
+    return result.success && result.data === true;
   }
 
-  async refreshPortalPage(): Promise<boolean> {
-    const result = await this.dispatch<boolean>({
-      type: "PORTAL_IS_PAGE",
-    });
+  /**
+   * Bind to the currently active tab for the duration of a batch.
+   *
+   * Call once before the run and `detach()` when it ends. Commands issued while
+   * unattached fail rather than guessing at a target.
+   */
+  async attach(): Promise<Result<number>> {
+    const tabId = await this.tabs.getActiveTabId();
 
-    this.portalPage = result.success && result.data;
+    if (tabId === undefined) {
+      this.tabId = null;
 
-    return this.portalPage;
+      return {
+        success: false,
+        error: new PortalUnavailableError(
+          "No active tab is available for the portal.",
+        ),
+      };
+    }
+
+    this.tabId = tabId;
+
+    return { success: true, data: tabId };
+  }
+
+  detach(): void {
+    this.tabId = null;
+  }
+
+  /** The pinned tab, or null when unattached. Exposed for diagnostics. */
+  get attachedTabId(): number | null {
+    return this.tabId;
   }
 
   getTrainees(): Promise<Result<Trainee[]>> {
@@ -78,18 +114,18 @@ export class RemotePortalAdapter implements PortalAdapter {
   }
 
   private async dispatch<T>(command: PortalCommand): Promise<Result<T>> {
+    const tabId = this.tabId;
+
+    if (tabId === null) {
+      return {
+        success: false,
+        error: new PortalUnavailableError(
+          "Portal adapter is not attached to a tab.",
+        ),
+      };
+    }
+
     try {
-      const tabId = await this.tabs.getActiveTabId();
-
-      if (tabId === undefined) {
-        return {
-          success: false,
-          error: new PortalUnavailableError(
-            "No active tab is available for the portal.",
-          ),
-        };
-      }
-
       const response = await this.tabs.sendMessage(tabId, command);
 
       return this.parse<T>(response);

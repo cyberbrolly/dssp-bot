@@ -22,6 +22,11 @@ export class TaskQueue<T> {
     return this.tasks[0];
   }
 
+  /** Ids of everything still queued, in dequeue order. */
+  ids(): string[] {
+    return this.tasks.map((task) => task.id);
+  }
+
   get size(): number {
     return this.tasks.length;
   }

@@ -1,6 +1,8 @@
 import { MessageBus } from "../core/infrastructure/messaging/MessageBus";
 import { ChromiumBrowserAdapter } from "../core/infrastructure/browser/ChromiumBrowserAdapter";
 import { isActive } from "../core/automation/AutomationState";
+import { unreconciled } from "../core/automation/BatchCheckpoint";
+import type { BatchCheckpoint } from "../core/automation/BatchCheckpoint";
 import type {
   BatchProgress,
   Message,
@@ -40,6 +42,8 @@ const ui = {
   resume: element<HTMLButtonElement>("resume"),
   stop: element<HTMLButtonElement>("stop"),
   status: element<HTMLParagraphElement>("status"),
+  recoverySection: element<HTMLElement>("recovery-section"),
+  recovery: element<HTMLParagraphElement>("recovery"),
   reportSection: element<HTMLElement>("report-section"),
   report: element<HTMLParagraphElement>("report"),
 };
@@ -121,6 +125,44 @@ async function send(message: Message): Promise<unknown> {
   }
 }
 
+/**
+ * Warn about a batch that died with the service worker.
+ *
+ * Only `interrupted` is shown. A finished batch is already covered by the
+ * report, and a live one is covered by the progress counters — but an
+ * interrupted one is the only case where records may exist on the portal that
+ * nothing in this UI would otherwise account for.
+ */
+function renderRecovery(checkpoint: BatchCheckpoint | null): void {
+  if (!checkpoint || checkpoint.status !== "interrupted") {
+    ui.recoverySection.hidden = true;
+
+    return;
+  }
+
+  const { indeterminate, unprocessed } = unreconciled(checkpoint);
+
+  const parts = [
+    `A batch started ${checkpoint.startedAt.slice(0, 16).replace("T", " ")} did not finish.`,
+    `${checkpoint.results.length} of ${checkpoint.total} trainees were processed.`,
+  ];
+
+  if (indeterminate.length > 0) {
+    parts.push(
+      `${indeterminate.length} were submitted without confirmation (${indeterminate
+        .map((entry) => entry.traineeName)
+        .join(", ")}) — check these on the portal before re-running them.`,
+    );
+  }
+
+  if (unprocessed.length > 0) {
+    parts.push(`${unprocessed.length} were never attempted.`);
+  }
+
+  ui.recovery.textContent = parts.join(" ");
+  ui.recoverySection.hidden = false;
+}
+
 async function refresh(): Promise<void> {
   const progress = await send({ type: "GET_STATUS" });
 
@@ -131,6 +173,10 @@ async function refresh(): Promise<void> {
   const report = await send({ type: "GET_REPORT" });
 
   renderReport((report as BatchReport | null) ?? null);
+
+  const checkpoint = await send({ type: "GET_CHECKPOINT" });
+
+  renderRecovery((checkpoint as BatchCheckpoint | null) ?? null);
 }
 
 function onClick(

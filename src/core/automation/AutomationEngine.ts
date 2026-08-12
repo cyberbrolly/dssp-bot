@@ -15,11 +15,13 @@ import {
 import type { Result } from "../shared/Result";
 import type { Trainee } from "../domain/Trainee";
 import type { TrainingSession } from "../domain/TrainingSession";
-import type {
-  TrainingOutcome,
-  TrainingResult,
-} from "../domain/TrainingResult";
+import type { TrainingOutcome, TrainingResult } from "../domain/TrainingResult";
 import { buildBatchReport, type BatchReport } from "../domain/BatchReport";
+import type {
+  BatchCheckpoint,
+  BatchCheckpointStatus,
+  CheckpointWriter,
+} from "./BatchCheckpoint";
 import type {
   PortalAdapter,
   SubmissionOutcome,
@@ -31,6 +33,13 @@ export interface AutomationEngineOptions {
   logger?: TrainingLogger;
   retryPolicy?: RetryPolicy;
   interTaskDelayMs?: number;
+  /**
+   * Persists progress after every settled trainee. Optional: without it the
+   * engine behaves exactly as before, which is what the unit tests want, but
+   * the service worker must supply one or a batch lost to worker termination
+   * leaves no record of what it already submitted.
+   */
+  checkpoint?: CheckpointWriter;
 }
 
 export interface BatchTask {
@@ -55,12 +64,43 @@ export class AutomationEngine {
   private batchStartedAt = "";
   private report: BatchReport | null = null;
   private totalQueued = 0;
+  private readonly checkpoint: CheckpointWriter | undefined;
 
   constructor(options: AutomationEngineOptions) {
     this.portal = options.portal;
     this.logger = options.logger ?? new TrainingLogger();
     this.retryPolicy = options.retryPolicy ?? new RetryPolicy();
     this.interTaskDelayMs = options.interTaskDelayMs ?? 750;
+    this.checkpoint = options.checkpoint;
+  }
+
+  /**
+   * Write the current position to durable storage.
+   *
+   * Failures are swallowed on purpose. A storage error must not abort a batch
+   * that is otherwise succeeding — aborting would strand a trainee mid-flow,
+   * which is worse than a missing checkpoint. Reporting is the writer's job;
+   * it has the logger and knows why its own write failed.
+   */
+  private async saveCheckpoint(status: BatchCheckpointStatus): Promise<void> {
+    if (!this.checkpoint) {
+      return;
+    }
+
+    const snapshot: BatchCheckpoint = {
+      status,
+      startedAt: this.batchStartedAt,
+      updatedAt: new Date().toISOString(),
+      total: this.totalQueued,
+      results: [...this.results],
+      pending: this.queue.ids(),
+    };
+
+    try {
+      await this.checkpoint(snapshot);
+    } catch {
+      // Intentionally ignored — see above.
+    }
   }
 
   getState(): AutomationState {
@@ -153,6 +193,7 @@ export class AutomationEngine {
         const result = await this.processTask(task.payload);
 
         this.results.push(result);
+        await this.saveCheckpoint("running");
 
         if (this.shouldAbortBatch(result)) {
           this.drainQueueAsSkipped(
@@ -172,13 +213,13 @@ export class AutomationEngine {
         this.drainQueueAsSkipped("Batch stopped by the administrator.");
       }
 
-      return this.finish(this.stopRequested ? "stopped" : "complete");
+      return await this.finish(this.stopRequested ? "stopped" : "complete");
     } catch (error) {
       const automationError = toAutomationError(error);
 
       this.logger.record("batch_complete", "failed", {}, automationError);
 
-      this.finish("stopped");
+      await this.finish("stopped");
 
       return { success: false, error: automationError };
     } finally {
@@ -220,7 +261,9 @@ export class AutomationEngine {
     this.logger.record("stop", "started");
   }
 
-  private finish(finalState: "stopped" | "complete"): Result<BatchReport> {
+  private async finish(
+    finalState: "stopped" | "complete",
+  ): Promise<Result<BatchReport>> {
     this.currentTrainee = null;
 
     if (this.machine.canTransitionTo(finalState)) {
@@ -232,6 +275,11 @@ export class AutomationEngine {
       this.batchStartedAt,
       new Date().toISOString(),
     );
+
+    // Terminal either way: a stopped or crashed batch is as final as a complete
+    // one, and its results are the ones most worth keeping, since they say what
+    // reached the portal before things went wrong.
+    await this.saveCheckpoint("finished");
 
     if (finalState === "complete") {
       this.logger.record("batch_complete", "succeeded");
@@ -284,14 +332,21 @@ export class AutomationEngine {
     }
   }
 
-  private waitWhilePaused(): Promise<void> {
+  private async waitWhilePaused(): Promise<void> {
     if (!this.pauseRequested) {
-      return Promise.resolve();
+      return;
     }
 
     if (this.machine.canTransitionTo("paused")) {
       this.machine.transitionTo("paused");
     }
+
+    // The riskiest moment in the batch. A paused engine makes no extension API
+    // calls, so nothing holds the service worker open and it is collected after
+    // roughly 30 seconds — taking the queue and every result with it. Flushing
+    // here means a batch that never wakes up still leaves a record of what it
+    // had already written to the portal.
+    await this.saveCheckpoint("paused");
 
     return new Promise<void>((resolve) => {
       this.resumeSignal = resolve;
@@ -445,7 +500,10 @@ export class AutomationEngine {
       attempt,
     };
 
-    if (!this.portal.isPortalPage()) {
+    // Re-checked for every trainee and on every retry, not once per batch. The
+    // session can lapse mid-run, and the check is worthless if it cannot catch
+    // that — a lapsed session is also why a retry would otherwise keep failing.
+    if (!(await this.portal.isPortalPage())) {
       throw new SessionExpiredError();
     }
 

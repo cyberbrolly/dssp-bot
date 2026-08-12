@@ -35,16 +35,23 @@ export function createManifest(portalMatches: string[]) {
       default_title: "DSSP Training Logger",
     },
 
-    background: {
-      service_worker: "src/background/index.ts",
+     background: {
+      service_worker: "src/background/service-worker.ts",
       type: "module",
     },
 
     content_scripts: [
       {
         matches: portalMatches,
-        js: ["src/content/index.ts"],
+        js: ["src/content/main-world.ts"],
+        run_at: "document_start",
+        world: "MAIN",
+      },
+      {
+        matches: portalMatches,
+        js: ["src/content/content-script.ts"],
         run_at: "document_idle",
+        world: "ISOLATED",
       },
     ],
 

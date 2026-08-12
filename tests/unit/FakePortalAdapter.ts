@@ -14,7 +14,11 @@ export interface FakePortalOptions {
   trainees?: Trainee[];
   outcomeFor?: (traineeId: string) => SubmissionOutcome;
   failOpenTrainee?: (traineeId: string, attempt: number) => Error | null;
-  isPortalPage?: boolean;
+  /**
+   * A fixed answer, or a hook receiving the 1-based check count so a test can
+   * let the session lapse partway through a batch.
+   */
+  isPortalPage?: boolean | ((check: number) => boolean);
   onOpenTrainee?: (trainee: Trainee) => void;
   /** Fail the submit call itself. `call` counts every submit on the adapter. */
   failSubmit?: (traineeId: string, call: number) => Error | null;
@@ -34,13 +38,20 @@ export class FakePortalAdapter implements PortalAdapter {
   private readonly attempts = new Map<string, number>();
   private readonly confirmCalls = new Map<string, number>();
   private current: Trainee | null = null;
+  private portalPageChecks = 0;
 
   constructor(options: FakePortalOptions = {}) {
     this.options = options;
   }
 
-  isPortalPage(): boolean {
-    return this.options.isPortalPage ?? true;
+  isPortalPage(): Promise<boolean> {
+    this.portalPageChecks += 1;
+
+    if (typeof this.options.isPortalPage === "function") {
+      return Promise.resolve(this.options.isPortalPage(this.portalPageChecks));
+    }
+
+    return Promise.resolve(this.options.isPortalPage ?? true);
   }
 
   getTrainees(): Promise<Result<Trainee[]>> {

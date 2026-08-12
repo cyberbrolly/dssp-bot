@@ -12,8 +12,8 @@ function unmapped<T>(operation: string): Result<T> {
 }
 
 export class UnmappedPortalAdapter implements PortalAdapter {
-  isPortalPage(): boolean {
-    return false;
+  isPortalPage(): Promise<boolean> {
+    return Promise.resolve(false);
   }
 
   getTrainees(): Promise<Result<Trainee[]>> {
