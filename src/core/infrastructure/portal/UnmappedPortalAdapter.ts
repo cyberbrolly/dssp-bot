@@ -1,6 +1,7 @@
 import type { Result } from "../../shared/Result";
 import type { Trainee } from "../../domain/Trainee";
 import type { TrainingSession } from "../../domain/TrainingSession";
+import type { TrainingFormOptions } from "../../domain/TrainingFormOptions";
 import type { PortalAdapter, SubmissionOutcome } from "./PortalAdapter";
 import { PortalNotMappedError } from "../../shared/errors";
 
@@ -18,6 +19,10 @@ export class UnmappedPortalAdapter implements PortalAdapter {
 
   getTrainees(): Promise<Result<Trainee[]>> {
     return Promise.resolve(unmapped<Trainee[]>("getTrainees"));
+  }
+
+  getFormOptions(): Promise<Result<TrainingFormOptions>> {
+    return Promise.resolve(unmapped<TrainingFormOptions>("getFormOptions"));
   }
 
   openTrainee(): Promise<Result<void>> {

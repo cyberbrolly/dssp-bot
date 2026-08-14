@@ -4,6 +4,7 @@ import type {
 } from "../../src/core/infrastructure/portal/PortalAdapter";
 import type { Result } from "../../src/core/shared/Result";
 import type { Trainee } from "../../src/core/domain/Trainee";
+import type { TrainingFormOptions } from "../../src/core/domain/TrainingFormOptions";
 
 const ok: Result<void> = {
   success: true,
@@ -12,6 +13,7 @@ const ok: Result<void> = {
 
 export interface FakePortalOptions {
   trainees?: Trainee[];
+  formOptions?: TrainingFormOptions;
   outcomeFor?: (traineeId: string) => SubmissionOutcome;
   failOpenTrainee?: (traineeId: string, attempt: number) => Error | null;
   /**
@@ -58,6 +60,13 @@ export class FakePortalAdapter implements PortalAdapter {
     return Promise.resolve({
       success: true,
       data: this.options.trainees ?? [],
+    });
+  }
+
+  getFormOptions(): Promise<Result<TrainingFormOptions>> {
+    return Promise.resolve({
+      success: true,
+      data: this.options.formOptions ?? { instructors: [], trainingTypes: [] },
     });
   }
 
@@ -142,7 +151,18 @@ export class FakePortalAdapter implements PortalAdapter {
 export function trainee(id: string): Trainee {
   return {
     id,
+    traineeId: id,
+    sn: id,
+    applicationDate: "",
     name: `Trainee ${id}`,
+    dob: "",
+    course: "",
+    phone: "",
+    email: "",
+    trainingSessions: "",
+    assessmentScore: "",
+    lastModified: "",
+    modifiedBy: "",
     profileUrl: `https://portal.invalid/trainees/${id}`,
   };
 }

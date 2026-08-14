@@ -21,6 +21,7 @@ const browser = new ChromiumBrowserAdapter();
 const logger = new Logger("DSSP:background");
 const storage = new Storage(browser.storage);
 const portal = new RemotePortalAdapter(browser.tabs);
+const formOptionsPortal = new RemotePortalAdapter(browser.tabs);
 const trainingLogger = new TrainingLogger(logger);
 
 const LAST_REPORT_KEY = "dssp.lastReport";
@@ -144,6 +145,31 @@ async function startBatch(
   }
 }
 
+async function getFormOptions(): Promise<MessageResponse> {
+  const attached = await formOptionsPortal.attach();
+
+  if (!attached.success) {
+    return { success: false, error: attached.error.message };
+  }
+
+  try {
+    if (!(await formOptionsPortal.isPortalPage())) {
+      return {
+        success: false,
+        error: "Open an authenticated DSSP trainee page to load form options.",
+      };
+    }
+
+    const result = await formOptionsPortal.getFormOptions();
+
+    return result.success
+      ? { success: true, data: result.data }
+      : { success: false, error: result.error.message };
+  } finally {
+    formOptionsPortal.detach();
+  }
+}
+
 async function handle(message: Message): Promise<MessageResponse> {
   switch (message.type) {
     case "GET_STATUS":
@@ -151,6 +177,9 @@ async function handle(message: Message): Promise<MessageResponse> {
         success: true,
         data: engine.getProgress(),
       };
+
+    case "GET_FORM_OPTIONS":
+      return getFormOptions();
 
     case "START_AUTOMATION":
       return startBatch(message);

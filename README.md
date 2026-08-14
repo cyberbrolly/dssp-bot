@@ -11,20 +11,17 @@ an administrator would use by hand.
 
 ## Current Status
 
-Phase 2 — Foundation.
+Phase 4 — Portal integration.
 
 - Phase 1 — Planning: complete
 - Phase 2 — Foundation: complete
 - Phase 3 — Browser layer: complete
-- Phase 4 — Portal discovery: not started
+- Phase 4 — Portal discovery and training form integration: in progress
 
-The automation engine, batch runner, state machine, retry policy, logging, and
-reporting are implemented and unit tested against a fake portal.
-
-No real portal selectors exist yet. `UnmappedPortalAdapter` is wired in as the
-content-script implementation and fails every operation with `PORTAL_NOT_MAPPED`
-until Phase 4 discovery produces the integration specification. The extension
-loads and the UI runs, but no submissions can be made.
+The trainee list and Log New Training form are mapped. Instructor and training
+type choices are scraped from the authenticated portal form, dates are
+normalized to `YYYY-MM-DD`, and submissions reuse the form's real field names,
+hidden values, action, and method.
 
 ## Architecture
 

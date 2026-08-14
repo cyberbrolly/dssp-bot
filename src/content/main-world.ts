@@ -221,9 +221,8 @@ function interceptXhr(): void {
 /**
  * Bridge commands this world can answer.
  *
- * Only the world-dependent work lives here. Form filling and submission still
- * need the portal's real selectors, which are not confirmed yet, so those
- * commands are reported as unmapped rather than guessed at.
+ * Only the page-global dialog and XHR interception lives here. Form discovery
+ * and submission are handled by the isolated-world portal adapter.
  */
 function handle(command: unknown): unknown {
   const type =

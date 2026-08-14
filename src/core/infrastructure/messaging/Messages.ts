@@ -2,6 +2,7 @@ import type { BatchReport } from "../../domain/BatchReport";
 import type { BatchCheckpoint } from "../../automation/BatchCheckpoint";
 import type { TrainingSession } from "../../domain/TrainingSession";
 import type { AutomationState } from "../../automation/AutomationState";
+import type { TrainingFormOptions } from "../../domain/TrainingFormOptions";
 
 export interface BatchProgress {
   state: AutomationState;
@@ -18,6 +19,7 @@ export interface BatchProgress {
 
 export type Message =
   | { type: "GET_STATUS" }
+  | { type: "GET_FORM_OPTIONS" }
   | {
       type: "START_AUTOMATION";
       traineeIds: string[];
@@ -47,4 +49,9 @@ export interface ReportResponse {
 export interface CheckpointResponse {
   success: true;
   data: BatchCheckpoint | null;
+}
+
+export interface FormOptionsResponse {
+  success: true;
+  data: TrainingFormOptions;
 }

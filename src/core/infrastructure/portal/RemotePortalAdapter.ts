@@ -3,6 +3,7 @@ import type { PortalCommand } from "./PortalCommands";
 import type { Result } from "../../shared/Result";
 import type { Trainee } from "../../domain/Trainee";
 import type { TrainingSession } from "../../domain/TrainingSession";
+import type { TrainingFormOptions } from "../../domain/TrainingFormOptions";
 import type { BrowserTabs } from "../browser/BrowserAdapter";
 import {
   AutomationError,
@@ -72,6 +73,12 @@ export class RemotePortalAdapter implements PortalAdapter {
   getTrainees(): Promise<Result<Trainee[]>> {
     return this.dispatch<Trainee[]>({
       type: "PORTAL_GET_TRAINEES",
+    });
+  }
+
+  getFormOptions(): Promise<Result<TrainingFormOptions>> {
+    return this.dispatch<TrainingFormOptions>({
+      type: "PORTAL_GET_FORM_OPTIONS",
     });
   }
 

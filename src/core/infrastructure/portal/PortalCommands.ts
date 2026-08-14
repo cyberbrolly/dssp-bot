@@ -1,10 +1,12 @@
 import type { Result } from "../../shared/Result";
 import type { Trainee } from "../../domain/Trainee";
 import type { TrainingSession } from "../../domain/TrainingSession";
+import type { TrainingFormOptions } from "../../domain/TrainingFormOptions";
 
 export type PortalCommand =
   | { type: "PORTAL_IS_PAGE" }
   | { type: "PORTAL_GET_TRAINEES" }
+  | { type: "PORTAL_GET_FORM_OPTIONS" }
   | { type: "PORTAL_OPEN_TRAINEE"; trainee: Trainee }
   | { type: "PORTAL_OPEN_FORM" }
   | { type: "PORTAL_FILL_FORM"; session: TrainingSession }
@@ -29,4 +31,8 @@ export function isPortalCommand(message: unknown): message is PortalCommand {
 }
 
 export type PortalResultOf<T extends PortalCommandType> =
-  T extends "PORTAL_GET_TRAINEES" ? Result<Trainee[]> : Result<unknown>;
+  T extends "PORTAL_GET_TRAINEES"
+    ? Result<Trainee[]>
+    : T extends "PORTAL_GET_FORM_OPTIONS"
+      ? Result<TrainingFormOptions>
+      : Result<unknown>;

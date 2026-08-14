@@ -9,6 +9,11 @@ import type {
 } from "../core/infrastructure/messaging/Messages";
 import type { BatchReport } from "../core/domain/BatchReport";
 import type { AutomationState } from "../core/automation/AutomationState";
+import type {
+  TrainingFormOption,
+  TrainingFormOptions,
+} from "../core/domain/TrainingFormOptions";
+import { formatTrainingDate } from "../core/shared/trainingDate";
 
 const browser = new ChromiumBrowserAdapter();
 const messageBus = new MessageBus(browser.runtime);
@@ -25,8 +30,8 @@ function element<T extends HTMLElement>(id: string): T {
 
 const ui = {
   state: element<HTMLSpanElement>("state"),
-  instructor: element<HTMLInputElement>("instructor"),
-  trainingType: element<HTMLInputElement>("training-type"),
+  instructor: element<HTMLSelectElement>("instructor"),
+  trainingType: element<HTMLSelectElement>("training-type"),
   trainingDate: element<HTMLInputElement>("training-date"),
   trainees: element<HTMLTextAreaElement>("trainees"),
   current: element<HTMLParagraphElement>("current"),
@@ -48,25 +53,43 @@ const ui = {
   report: element<HTMLParagraphElement>("report"),
 };
 
+let formOptionsReady = false;
+let cachedFormOptions: TrainingFormOptions | null = null;
+let currentState: AutomationState = "idle";
+
 function setStatus(text: string, tone: "info" | "error" = "info"): void {
   ui.status.textContent = text;
   ui.status.dataset.tone = tone;
 }
 
 function parseTraineeIds(): string[] {
-  return ui.trainees.value
+  const raw = ui.trainees.value;
+  const parsed = raw
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
+  console.debug("[DSSP:popup] Trainee IDs textarea read", {
+    rawValue: raw,
+    parsedValues: parsed,
+    rawCodePoints: Array.from(raw, (char) => char.codePointAt(0)),
+  });
+  return parsed;
 }
 
 function renderControls(state: AutomationState): void {
   const running = isActive(state);
+  const sessionLocked = running || state === "paused";
 
-  ui.start.disabled = running || state === "paused";
+  currentState = state;
+
+  ui.start.disabled = sessionLocked || !formOptionsReady;
   ui.pause.disabled = !running;
   ui.resume.disabled = state !== "paused";
   ui.stop.disabled = !running && state !== "paused";
+  ui.instructor.disabled = sessionLocked || !formOptionsReady;
+  ui.trainingType.disabled = sessionLocked || !formOptionsReady;
+  ui.trainingDate.disabled = sessionLocked;
+  ui.trainees.disabled = sessionLocked;
 }
 
 function renderProgress(progress: BatchProgress): void {
@@ -123,6 +146,91 @@ async function send(message: Message): Promise<unknown> {
 
     return null;
   }
+}
+
+function isTrainingFormOption(value: unknown): value is TrainingFormOption {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "value" in value &&
+    typeof value.value === "string" &&
+    "label" in value &&
+    typeof value.label === "string"
+  );
+}
+
+function isTrainingFormOptions(value: unknown): value is TrainingFormOptions {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "instructors" in value &&
+    Array.isArray(value.instructors) &&
+    value.instructors.every(isTrainingFormOption) &&
+    "trainingTypes" in value &&
+    Array.isArray(value.trainingTypes) &&
+    value.trainingTypes.every(isTrainingFormOption)
+  );
+}
+
+function renderSelectOptions(
+  select: HTMLSelectElement,
+  options: TrainingFormOption[],
+  placeholder: string,
+): void {
+  select.replaceChildren();
+
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = placeholder;
+  empty.disabled = true;
+  empty.selected = true;
+  select.append(empty);
+
+  for (const option of options) {
+    const element = document.createElement("option");
+    element.value = option.value;
+    element.textContent = option.label;
+    select.append(element);
+  }
+}
+
+async function loadFormOptions(): Promise<void> {
+  if (cachedFormOptions) {
+    renderSelectOptions(
+      ui.instructor,
+      cachedFormOptions.instructors,
+      "Choose instructor",
+    );
+    renderSelectOptions(
+      ui.trainingType,
+      cachedFormOptions.trainingTypes,
+      "Choose training type",
+    );
+    formOptionsReady = true;
+    renderControls(currentState);
+    return;
+  }
+
+  formOptionsReady = false;
+  renderControls(currentState);
+  setStatus("Loading form options.");
+
+  const data = await send({ type: "GET_FORM_OPTIONS" });
+
+  if (!isTrainingFormOptions(data)) {
+    return;
+  }
+
+  cachedFormOptions = data;
+  renderSelectOptions(ui.instructor, data.instructors, "Choose instructor");
+  renderSelectOptions(
+    ui.trainingType,
+    data.trainingTypes,
+    "Choose training type",
+  );
+  formOptionsReady = true;
+  renderControls(currentState);
+  setStatus("Form options loaded.");
 }
 
 /**
@@ -198,11 +306,33 @@ onClick(ui.start, async () => {
   }
 
   if (
-    !ui.instructor.value.trim() ||
-    !ui.trainingType.value.trim() ||
+    !ui.instructor.value ||
+    !ui.trainingType.value ||
     !ui.trainingDate.value
   ) {
     setStatus("Instructor, training type, and date are required.", "error");
+
+    return;
+  }
+
+  const instructor = ui.instructor.selectedOptions[0];
+  const trainingType = ui.trainingType.selectedOptions[0];
+
+  if (!instructor || !trainingType) {
+    setStatus("Choose an instructor and training type.", "error");
+
+    return;
+  }
+
+  let trainingDate: string;
+
+  try {
+    trainingDate = formatTrainingDate(ui.trainingDate.value);
+  } catch (error) {
+    setStatus(
+      error instanceof Error ? error.message : "Training date is invalid.",
+      "error",
+    );
 
     return;
   }
@@ -213,9 +343,11 @@ onClick(ui.start, async () => {
     type: "START_AUTOMATION",
     traineeIds,
     session: {
-      instructorId: ui.instructor.value.trim(),
-      trainingTypeId: ui.trainingType.value.trim(),
-      trainingDate: ui.trainingDate.value,
+      instructorId: ui.instructor.value,
+      instructorLabel: instructor.textContent ?? "",
+      trainingTypeId: ui.trainingType.value,
+      trainingTypeLabel: trainingType.textContent ?? "",
+      trainingDate,
     },
   });
 
@@ -253,4 +385,4 @@ window.addEventListener("unload", () => {
   window.clearInterval(pollTimer);
 });
 
-void refresh();
+void Promise.all([refresh(), loadFormOptions()]);

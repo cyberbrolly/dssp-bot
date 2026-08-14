@@ -1,4 +1,4 @@
-import { UnmappedPortalAdapter } from "../core/infrastructure/portal/UnmappedPortalAdapter";
+import { DSSPPortalAdapter } from "../core/infrastructure/portal/DSSPPortalAdapter";
 import {
   isPortalCommand,
   type PortalCommand,
@@ -11,7 +11,7 @@ import { toAutomationError, type AutomationError } from "../core/shared/errors";
 import type { Result } from "../core/shared/Result";
 
 const logger = new Logger("DSSP:content");
-const portal: PortalAdapter = new UnmappedPortalAdapter();
+const portal: PortalAdapter = new DSSPPortalAdapter(document, location);
 
 /**
  * Channel to the MAIN-world script, which owns the page's real `alert` and
@@ -21,8 +21,8 @@ const bridge = new BridgeClient(window);
 
 bridge.start();
 
-// The portal signals success and failure through alerts and an XHR whose body
-// is not yet characterised. Logging both is what makes that observable.
+// Keep manually-triggered portal alerts and XHR responses observable alongside
+// the adapter's direct form response handling.
 bridge.onEvent((event) => {
   if (event.type === "ALERT") {
     logger.info("Portal alert intercepted", { message: event.message });
@@ -95,19 +95,16 @@ async function dispatch(
 ): Promise<PortalCommandResponse> {
   switch (command.type) {
     case "PORTAL_IS_PAGE":
-      // This script only injects on hosts matching host_permissions, so its own
-      // execution proves the origin. Requiring the MAIN half too means a broken
-      // bridge is reported here rather than as a confusing failure mid-batch.
-      //
-      // Deliberately origin-level only: which page this is (trainee list vs
-      // training log) is a separate question, still open pending page roles.
       return {
         success: true,
-        data: await bridge.isReady(),
+        data: await portal.isPortalPage(),
       };
 
     case "PORTAL_GET_TRAINEES":
       return toResponse(await portal.getTrainees());
+
+    case "PORTAL_GET_FORM_OPTIONS":
+      return toResponse(await portal.getFormOptions());
 
     case "PORTAL_OPEN_TRAINEE":
       return toResponse(await portal.openTrainee(command.trainee));

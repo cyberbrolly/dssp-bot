@@ -1,6 +1,7 @@
 import type { Result } from "../../shared/Result";
 import type { Trainee } from "../../domain/Trainee";
 import type { TrainingSession } from "../../domain/TrainingSession";
+import type { TrainingFormOptions } from "../../domain/TrainingFormOptions";
 
 export type SubmissionOutcome =
   | { status: "confirmed"; reference?: string }
@@ -18,6 +19,8 @@ export interface PortalAdapter {
   isPortalPage(): Promise<boolean>;
 
   getTrainees(): Promise<Result<Trainee[]>>;
+
+  getFormOptions(): Promise<Result<TrainingFormOptions>>;
 
   openTrainee(trainee: Trainee): Promise<Result<void>>;
 
