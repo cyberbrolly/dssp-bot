@@ -13,6 +13,8 @@ import sys
 from typing import Any, Callable
 
 from . import protocol as p
+from .portal.client import PortalClient
+from .portal.errors import PortalError
 
 log = logging.getLogger("dssp.worker")
 
@@ -34,8 +36,10 @@ class Worker:
     """
 
     def __init__(self) -> None:
+        self.portal = PortalClient()
         self._handlers: dict[str, Handler] = {
             p.OP_PING: self._ping,
+            p.OP_ENSURE_SESSION: self._ensure_session,
         }
 
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -53,12 +57,24 @@ class Worker:
 
         try:
             return handler(req)
+        except PortalError as exc:
+            log.warning("op %s failed: %s (%s)", op, exc.message, exc.error_code)
+            return p.error_response(job_id, op, exc.error_code, exc.message)
         except Exception as exc:  # noqa: BLE001 - report, never crash the loop
             log.exception("op %s failed", op)
             return p.error_response(job_id, op, p.ERR_SUBMISSION_FAILED, str(exc))
 
     def _ping(self, req: dict[str, Any]) -> dict[str, Any]:
         return p.ok_response(req.get("job_id", ""), p.OP_PING, pong=True)
+
+    def _ensure_session(self, req: dict[str, Any]) -> dict[str, Any]:
+        self.portal.ensure_session()
+        return p.ok_response(
+            req.get("job_id", ""), p.OP_ENSURE_SESSION, authenticated=True
+        )
+
+    def close(self) -> None:
+        self.portal.close()
 
 
 def main() -> int:
@@ -69,27 +85,32 @@ def main() -> int:
     p.write_line(sys.stdout, p.ready_line())
     log.info("worker ready")
 
-    while True:
-        line = sys.stdin.readline()
-        if not line:  # EOF: Rust closed the pipe.
-            break
+    try:
+        while True:
+            line = sys.stdin.readline()
+            if not line:  # EOF: Rust closed the pipe.
+                break
 
-        line = line.strip()
-        if not line:
-            continue
+            line = line.strip()
+            if not line:
+                continue
 
-        try:
-            req = json.loads(line)
-            if not isinstance(req, dict):
-                raise ValueError("request must be a JSON object")
-        except (ValueError, json.JSONDecodeError) as exc:
-            p.write_line(
-                sys.stdout,
-                p.error_response("", "", p.ERR_BAD_REQUEST, f"invalid JSON: {exc}"),
-            )
-            continue
+            try:
+                req = json.loads(line)
+                if not isinstance(req, dict):
+                    raise ValueError("request must be a JSON object")
+            except (ValueError, json.JSONDecodeError) as exc:
+                p.write_line(
+                    sys.stdout,
+                    p.error_response(
+                        "", "", p.ERR_BAD_REQUEST, f"invalid JSON: {exc}"
+                    ),
+                )
+                continue
 
-        p.write_line(sys.stdout, worker.handle(req))
+            p.write_line(sys.stdout, worker.handle(req))
+    finally:
+        worker.close()
 
     log.info("worker stdin closed; exiting")
     return 0
