@@ -22,6 +22,8 @@ export interface BrowserRuntime {
 
 export interface BrowserTabs {
   getActiveTabId(): Promise<number | undefined>;
+  getActiveTab(): Promise<{ id?: number; url?: string; status?: string } | undefined>;
+  findDsspTraineeTab(): Promise<{ id?: number; url?: string; status?: string } | undefined>;
   sendMessage(tabId: number, message: unknown): Promise<unknown>;
 }
 

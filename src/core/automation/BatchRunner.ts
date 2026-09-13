@@ -38,6 +38,12 @@ export class BatchRunner {
       return { success: false, error: toAutomationError(error) };
     }
 
+    const prepared = await this.portal.openTraineeLogs();
+
+    if (!prepared.success) {
+      return prepared;
+    }
+
     const trainees = await this.portal.getTrainees();
 
     if (!trainees.success) {
@@ -83,6 +89,8 @@ export class BatchRunner {
 
     const tasks: BatchTask[] = [];
 
+    const missing: string[] = [];
+    const queued = new Set<string>();
     for (const traineeInput of request.traineeIds) {
       const input = traineeInput.trim();
       const normalizedInput = normalizeName(input);
@@ -103,11 +111,16 @@ export class BatchRunner {
       });
 
       if (!trainee && !/^\d+$/.test(input)) {
-        return {
-          success: false,
-          error: new TraineeNotFoundError(traineeInput),
-        };
+        missing.push(traineeInput);
+        continue;
       }
+      const resolvedId = trainee?.id ?? input;
+
+      if (queued.has(resolvedId)) {
+        continue;
+      }
+
+      queued.add(resolvedId);
 
       tasks.push({
         trainee: trainee ?? {
@@ -128,6 +141,13 @@ export class BatchRunner {
         },
         session: request.session,
       });
+    }
+
+    if (missing.length > 0) {
+      return {
+        success: false,
+        error: new TraineeNotFoundError(missing.join(", ")),
+      };
     }
 
     return { success: true, data: tasks };

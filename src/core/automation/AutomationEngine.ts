@@ -177,6 +177,9 @@ export class AutomationEngine {
     this.logger.record("batch_start", "started");
 
     try {
+      // Once per batch. A failure here aborts before any record is written.
+      unwrap(await this.portal.initializeTrainingSession());
+
       while (!this.queue.isEmpty && !this.stopRequested) {
         await this.waitWhilePaused();
 
@@ -509,13 +512,17 @@ export class AutomationEngine {
 
     this.transition("loading_trainee");
     this.logger.record("load_trainee", "started", context);
-    unwrap(await this.portal.openTrainee(trainee));
-    this.logger.record("load_trainee", "succeeded", context);
 
-    this.transition("opening_form");
-    this.logger.record("open_form", "started", context);
-    unwrap(await this.portal.openTrainingForm());
-    this.logger.record("open_form", "succeeded", context);
+    // Called unconditionally: the session operations are required members of
+    // PortalAdapter, so there is no adapter to feature-detect for. Guarding
+    // these would silently reinstate the fallback path that failed every
+    // trainee when RemotePortalAdapter was missing them.
+    if (!(await this.portal.isTrainingSessionReady())) {
+      unwrap(await this.portal.initializeTrainingSession());
+    }
+
+    unwrap(await this.portal.prepareTrainee(trainee));
+    this.logger.record("load_trainee", "succeeded", context);
 
     this.transition("filling_form");
     this.logger.record("fill_form", "started", context);

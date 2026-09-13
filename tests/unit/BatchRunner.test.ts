@@ -30,6 +30,15 @@ function harness(name: string) {
 }
 
 describe("BatchRunner trainee resolution", () => {
+  it("prepares Trainee Logs before resolving and running the batch", async () => {
+    const { runner } = harness("John Doe");
+    const portal = (runner as unknown as { portal: FakePortalAdapter }).portal;
+
+    await runner.start({ traineeIds: ["John Doe"], session });
+
+    expect(portal.calls.slice(0, 2)).toEqual(["openTraineeLogs", "getTrainees"]);
+  });
+
   it("resolves a known trainee ID", async () => {
     const { runner, addTasks, record } = harness("ogbonna Victor chinoso");
 
@@ -78,6 +87,29 @@ describe("BatchRunner trainee resolution", () => {
 
       expect(firstTask.session?.trainingDate).toBe("2026-08-14");
     }
+  });
+
+  it("does not queue the same resolved trainee twice", async () => {
+    const { runner, addTasks } = harness("John Doe");
+
+    await runner.start({ traineeIds: ["John Doe", " john   doe "], session });
+
+    expect(addTasks.mock.calls[0]?.[0]).toHaveLength(1);
+  });
+
+  it("keeps the configured instructor, type, and date for the whole batch", async () => {
+    const portal = new FakePortalAdapter({ trainees: [trainee("1"), trainee("2")] });
+    const addTasks = vi.fn();
+    const engine = {
+      clearQueue: vi.fn(),
+      addTasks,
+      run: vi.fn().mockResolvedValue({ success: true, data: {} }),
+    } as unknown as AutomationEngineType;
+
+    await new BatchRunner(portal, engine).start({ traineeIds: ["1", "2"], session });
+
+    const queued = addTasks.mock.calls[0]?.[0] as Array<{ session: typeof session }>;
+    expect(queued.map((task) => task.session)).toEqual([session, session]);
   });
 
   it("reports an invalid numeric ID without aborting valid trainees", async () => {

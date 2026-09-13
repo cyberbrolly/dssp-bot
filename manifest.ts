@@ -1,6 +1,6 @@
 import { defineManifest } from "@crxjs/vite-plugin";
 
-const FALLBACK_PORTAL_MATCH = "https://portal.dssp.invalid/*";
+const FALLBACK_PORTAL_MATCH = "https://dssp.frsc.gov.ng/*";
 
 export function parsePortalMatches(value: string | undefined): string[] {
   const patterns = (value ?? "")

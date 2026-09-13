@@ -49,17 +49,32 @@ class ChromiumRuntime implements BrowserRuntime {
 }
 
 class ChromiumTabs implements BrowserTabs {
-  async getActiveTabId(): Promise<number | undefined> {
-    const [tab] = await chrome.tabs.query({
-      active: true,
-      currentWindow: true,
-    });
+  async findDsspTraineeTab(): Promise<{ id?: number; url?: string; status?: string } | undefined> {
+    const tabs = await chrome.tabs.query({ url: "https://dssp.frsc.gov.ng/Trainee*" });
+    const tab = tabs.find((candidate) => candidate.active) ?? tabs[0];
+    return tab ? { id: tab.id, url: tab.url, status: tab.status } : undefined;
+  }
 
-    return tab?.id;
+  async getActiveTab(): Promise<{ id?: number; url?: string; status?: string } | undefined> {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return tab ? { id: tab.id, url: tab.url, status: tab.status } : undefined;
+  }
+
+  async getActiveTabId(): Promise<number | undefined> {
+    return (await this.getActiveTab())?.id;
   }
 
   sendMessage(tabId: number, message: unknown): Promise<unknown> {
-    return chrome.tabs.sendMessage(tabId, message);
+    return new Promise((resolve, reject) => {
+      chrome.tabs.sendMessage(tabId, message, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message ?? "Content script did not respond"));
+          return;
+        }
+        resolve(response);
+      });
+    });
   }
 }
 

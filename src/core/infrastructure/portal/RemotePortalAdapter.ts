@@ -13,6 +13,7 @@ import {
 } from "../../shared/errors";
 
 export class RemotePortalAdapter implements PortalAdapter {
+  private static readonly COMMAND_TIMEOUT_MS = 15_000;
   private readonly tabs: BrowserTabs;
 
   /**
@@ -36,6 +37,24 @@ export class RemotePortalAdapter implements PortalAdapter {
     return result.success && result.data === true;
   }
 
+  initializeTrainingSession(): Promise<Result<void>> {
+    return this.dispatch<void>({ type: "PORTAL_INITIALIZE_SESSION" });
+  }
+
+  /**
+   * Collapses a dispatch failure to `false`, because the caller's question is
+   * "can I submit against this session?" and an unreachable content script
+   * answers no. The engine's response either way is to reinitialise, which
+   * surfaces the underlying error properly.
+   */
+  async isTrainingSessionReady(): Promise<boolean> {
+    const result = await this.dispatch<boolean>({
+      type: "PORTAL_SESSION_READY",
+    });
+
+    return result.success && result.data === true;
+  }
+
   /**
    * Bind to the currently active tab for the duration of a batch.
    *
@@ -43,7 +62,14 @@ export class RemotePortalAdapter implements PortalAdapter {
    * unattached fail rather than guessing at a target.
    */
   async attach(): Promise<Result<number>> {
-    const tabId = await this.tabs.getActiveTabId();
+    const tab = await this.tabs.findDsspTraineeTab();
+    console.debug("[DSSP-DEBUG][BACKGROUND] DSSP trainee tab", {
+      ...tab,
+      consideredDsspTab: Boolean(
+        tab?.url?.startsWith("https://dssp.frsc.gov.ng/Trainee"),
+      ),
+    });
+    const tabId = tab?.id;
 
     if (tabId === undefined) {
       this.tabId = null;
@@ -82,9 +108,20 @@ export class RemotePortalAdapter implements PortalAdapter {
     });
   }
 
+  openTraineeLogs(): Promise<Result<void>> {
+    return this.dispatch<void>({ type: "PORTAL_OPEN_TRAINEE_LOGS" });
+  }
+
   openTrainee(trainee: Trainee): Promise<Result<void>> {
     return this.dispatch<void>({
       type: "PORTAL_OPEN_TRAINEE",
+      trainee,
+    });
+  }
+
+  prepareTrainee(trainee: Trainee): Promise<Result<void>> {
+    return this.dispatch<void>({
+      type: "PORTAL_PREPARE_TRAINEE",
       trainee,
     });
   }
@@ -133,10 +170,32 @@ export class RemotePortalAdapter implements PortalAdapter {
     }
 
     try {
-      const response = await this.tabs.sendMessage(tabId, command);
+      console.debug("[DSSP-DEBUG][BACKGROUND] sending message", {
+        tabId,
+        action: command.type,
+      });
+      const response = await Promise.race([
+        this.tabs.sendMessage(tabId, command),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`Timed out waiting for content script response (${command.type})`)),
+            RemotePortalAdapter.COMMAND_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+      console.debug("[DSSP-DEBUG][BACKGROUND] message response", {
+        tabId,
+        action: command.type,
+        response,
+      });
 
       return this.parse<T>(response);
     } catch (error) {
+      console.error("[DSSP-DEBUG][BACKGROUND] message failed", {
+        tabId,
+        action: command.type,
+        error,
+      });
       return {
         success: false,
         error: new PortalUnavailableError(toAutomationError(error).message),
