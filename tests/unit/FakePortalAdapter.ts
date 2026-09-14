@@ -35,12 +35,28 @@ export class FakePortalAdapter implements PortalAdapter {
   readonly opened: string[] = [];
   readonly submitted: string[] = [];
   readonly confirmed: string[] = [];
+  readonly calls: string[] = [];
 
   private readonly options: FakePortalOptions;
   private readonly attempts = new Map<string, number>();
   private readonly confirmCalls = new Map<string, number>();
   private current: Trainee | null = null;
   private portalPageChecks = 0;
+  sessionInitializations = 0;
+  trainingFormOpens = 0;
+  sessionReady = true;
+
+  initializeTrainingSession(): Promise<Result<void>> {
+    this.sessionInitializations += 1;
+    this.calls.push("initializeTrainingSession");
+    this.sessionReady = true;
+    return Promise.resolve(ok);
+  }
+
+  isTrainingSessionReady(): Promise<boolean> {
+    this.calls.push("isTrainingSessionReady");
+    return Promise.resolve(this.sessionReady);
+  }
 
   constructor(options: FakePortalOptions = {}) {
     this.options = options;
@@ -57,6 +73,7 @@ export class FakePortalAdapter implements PortalAdapter {
   }
 
   getTrainees(): Promise<Result<Trainee[]>> {
+    this.calls.push("getTrainees");
     return Promise.resolve({
       success: true,
       data: this.options.trainees ?? [],
@@ -64,10 +81,16 @@ export class FakePortalAdapter implements PortalAdapter {
   }
 
   getFormOptions(): Promise<Result<TrainingFormOptions>> {
+    this.calls.push("getFormOptions");
     return Promise.resolve({
       success: true,
       data: this.options.formOptions ?? { instructors: [], trainingTypes: [] },
     });
+  }
+
+  openTraineeLogs(): Promise<Result<void>> {
+    this.calls.push("openTraineeLogs");
+    return Promise.resolve(ok);
   }
 
   openTrainee(trainee: Trainee): Promise<Result<void>> {
@@ -90,7 +113,13 @@ export class FakePortalAdapter implements PortalAdapter {
     return Promise.resolve(ok);
   }
 
+  prepareTrainee(trainee: Trainee): Promise<Result<void>> {
+    this.calls.push("prepareTrainee");
+    return this.openTrainee(trainee);
+  }
+
   openTrainingForm(): Promise<Result<void>> {
+    this.trainingFormOpens += 1;
     return Promise.resolve(ok);
   }
 

@@ -146,6 +146,7 @@ async function startBatch(
 }
 
 async function getFormOptions(): Promise<MessageResponse> {
+  console.debug("[DSSP-DEBUG][BACKGROUND] GET_FORM_OPTIONS begin");
   const attached = await formOptionsPortal.attach();
 
   if (!attached.success) {
@@ -153,14 +154,8 @@ async function getFormOptions(): Promise<MessageResponse> {
   }
 
   try {
-    if (!(await formOptionsPortal.isPortalPage())) {
-      return {
-        success: false,
-        error: "Open an authenticated DSSP trainee page to load form options.",
-      };
-    }
-
     const result = await formOptionsPortal.getFormOptions();
+    console.debug("[DSSP-DEBUG][BACKGROUND] GET_FORM_OPTIONS complete", result);
 
     return result.success
       ? { success: true, data: result.data }

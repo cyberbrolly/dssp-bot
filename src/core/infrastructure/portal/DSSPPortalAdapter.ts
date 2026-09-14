@@ -33,6 +33,7 @@ const TRAINING_FORM_PATH = "/Trainee/TrainingLog/TraineeId=";
 const DSSP_ORIGIN = "https://dssp.frsc.gov.ng";
 const TRAINEE_LIST_URL = `${DSSP_ORIGIN}/Trainee?pgsize=10000&page=1&keywords=`;
 const TABLE_READY_TIMEOUT_MS = 10_000;
+const FORM_OPTIONS_READY_TIMEOUT_MS = 10_000;
 
 const TRAINING_DATE_SELECTORS = [
   "#TrainingDate",
@@ -119,12 +120,9 @@ export function isSupportedTraineePage(href: string): boolean {
 export function isSupportedPortalPage(href: string): boolean {
   try {
     const url = new URL(href);
-    const pathname = normalizedPath(url);
-
     return (
       url.origin === DSSP_ORIGIN &&
-      (pathname === TRAINEE_PAGE_PATH ||
-        pathname.startsWith(`${TRAINEE_PAGE_PATH}/`))
+      !normalizedPath(url).startsWith("/Account/Login")
     );
   } catch {
     return false;
@@ -301,6 +299,45 @@ function trainingTypeSelect(document: Document): HTMLSelectElement | null {
   );
 }
 
+function describeElement(element: Element | null): Record<string, string> | null {
+  if (!element) return null;
+  const attribute = (name: string): string =>
+    typeof element.getAttribute === "function"
+      ? element.getAttribute(name) ?? ""
+      : "";
+  return {
+    tagName: element.tagName ?? "",
+    id: element.id ?? "",
+    name: attribute("name"),
+    type: attribute("type"),
+    role: attribute("role"),
+    ariaLabel: attribute("aria-label"),
+    placeholder: attribute("placeholder"),
+    textContent: (element.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 200),
+  };
+}
+
+function logFormDomDiagnostics(document: Document, url: string): void {
+  const labels = Array.from(document.querySelectorAll<HTMLLabelElement>("label"))
+    .filter((label) => /instructor|training|type|date/i.test(label.textContent ?? ""))
+    .map((label) => ({
+      text: (label.textContent ?? "").replace(/\s+/g, " ").trim(),
+      for: label.htmlFor,
+      control: describeElement(
+        label.htmlFor ? document.getElementById(label.htmlFor) : label.querySelector("input,select,button,[role]")
+      ),
+    }));
+  console.debug("[DSSP-DEBUG][PORTAL] form DOM diagnostic", {
+    url,
+    title: document.title,
+    forms: document.querySelectorAll("form").length,
+    selects: document.querySelectorAll("select").length,
+    inputs: document.querySelectorAll("input").length,
+    buttons: document.querySelectorAll("button").length,
+    labels,
+  });
+}
+
 function trainingDateInput(document: Document): HTMLInputElement | null {
   return (
     queryFirst<HTMLInputElement>(document, TRAINING_DATE_SELECTORS) ??
@@ -334,8 +371,12 @@ export function getSelectOptions(
 }
 
 export function getFormOptions(document: Document): TrainingFormOptions {
+  console.debug("[DSSP-DEBUG][PORTAL] searching instructor selector");
   const instructor = instructorSelect(document);
+  console.debug("[DSSP-DEBUG][PORTAL] instructor selector result", describeElement(instructor));
+  console.debug("[DSSP-DEBUG][PORTAL] searching training type selector");
   const trainingType = trainingTypeSelect(document);
+  console.debug("[DSSP-DEBUG][PORTAL] training type selector result", describeElement(trainingType));
 
   if (!instructor) {
     throw new PortalElementNotFoundError("Instructor select");
@@ -496,6 +537,69 @@ function isLoginPage(document: Document, href: string): boolean {
   return document.querySelector(LOGIN_FORM_SELECTOR) !== null;
 }
 
+function hasAuthenticatedPortalMarker(document: Document): boolean {
+  if (document.querySelector(TRAINEE_TABLE_SELECTOR)) return true;
+  if (
+    document.querySelector(
+      'a[href*="/Account/Logout"], form[action*="/Account/Logout"]',
+    )
+  ) {
+    return true;
+  }
+
+  return Array.from(
+    document.querySelectorAll<HTMLElement>("h1, h2, .page-title"),
+  ).some((element) =>
+    /enrolled\s+trainees/i.test(element.textContent ?? ""),
+  );
+}
+
+export function isAuthenticatedTraineePage(
+  document: Document,
+  href: string,
+): boolean {
+  if (!isSupportedTraineePage(href)) return false;
+  return !isLoginPage(document, href) && hasAuthenticatedPortalMarker(document);
+}
+
+export async function waitForAuthenticatedTraineePage(
+  document: Document,
+  href: string,
+  timeoutMs = FORM_OPTIONS_READY_TIMEOUT_MS,
+): Promise<boolean> {
+  if (!isSupportedTraineePage(href) || isLoginPage(document, href)) {
+    return false;
+  }
+
+  if (hasAuthenticatedPortalMarker(document)) return true;
+
+  return new Promise<boolean>((resolve) => {
+    const finish = (authenticated: boolean): void => {
+      clearTimeout(timeoutId);
+      clearInterval(intervalId);
+      observer.disconnect();
+      document.removeEventListener("readystatechange", check);
+      resolve(authenticated);
+    };
+    const check = (): void => {
+      if (isLoginPage(document, href)) {
+        finish(false);
+      } else if (hasAuthenticatedPortalMarker(document)) {
+        finish(true);
+      }
+    };
+    const observer = new MutationObserver(check);
+    const intervalId = setInterval(check, 100);
+    const timeoutId = setTimeout(() => finish(false), timeoutMs);
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+    document.addEventListener("readystatechange", check);
+    check();
+  });
+}
+
 function validationMessage(document: Document): string | null {
   const messages = Array.from(
     document.querySelectorAll<HTMLElement>(VALIDATION_MESSAGE_SELECTOR),
@@ -585,6 +689,7 @@ function submissionOutcome(
 }
 
 export class DSSPPortalAdapter implements PortalAdapter {
+  private preparedTrainees: Trainee[] | null = null;
   private readonly document: Document;
   private readonly location: Location;
   private readonly fetcher: PortalFetch;
@@ -592,6 +697,7 @@ export class DSSPPortalAdapter implements PortalAdapter {
 
   private currentTrainee: Trainee | null = null;
   private preparedForm: PreparedTrainingForm | null = null;
+  private preparedFormTraineeId: string | null = null;
   private submission: SubmissionSnapshot | null = null;
 
   constructor(
@@ -607,14 +713,23 @@ export class DSSPPortalAdapter implements PortalAdapter {
     this.parseHtml = parseHtml;
   }
 
-  isPortalPage(): Promise<boolean> {
-    return Promise.resolve(
-      isSupportedPortalPage(this.location.href) &&
-        !isLoginPage(this.document, this.location.href),
-    );
+  async isPortalPage(): Promise<boolean> {
+    if (!isSupportedPortalPage(this.location.href)) return false;
+    if (isSupportedTraineePage(this.location.href)) {
+      return waitForAuthenticatedTraineePage(
+        this.document,
+        this.location.href,
+      );
+    }
+    return !isLoginPage(this.document, this.location.href);
   }
 
   async getTrainees(): Promise<Result<Trainee[]>> {
+    if (this.preparedTrainees) {
+      const trainees = this.preparedTrainees;
+      this.preparedTrainees = null;
+      return ok(trainees);
+    }
     if (isSupportedTraineePage(this.location.href)) {
       if (!(await waitForTraineeTable(this.document))) {
         return failed(
@@ -634,6 +749,15 @@ export class DSSPPortalAdapter implements PortalAdapter {
   }
 
   async getFormOptions(): Promise<Result<TrainingFormOptions>> {
+    console.debug("[DSSP-DEBUG][PORTAL] getFormOptions begin", {
+      href: this.location.href,
+      readyState: this.document.readyState,
+    });
+    if (!(await this.isPortalPage())) {
+      console.error("[DSSP-DEBUG][PORTAL] authenticated /Trainee marker missing");
+      return failed(new SessionExpiredError());
+    }
+
     const trainees = await this.getTrainees();
 
     if (!trainees.success) {
@@ -641,27 +765,96 @@ export class DSSPPortalAdapter implements PortalAdapter {
     }
 
     const first = trainees.data[0];
+    console.debug("[DSSP-DEBUG][PORTAL] trainee count", trainees.data.length);
 
     if (!first) {
+      console.error("[DSSP-DEBUG][PORTAL] trainee list empty");
       return failed(new MissingDataError("a trainee to load form options"));
     }
 
+    console.debug("[DSSP-DEBUG][PORTAL] selected first trainee", first);
+    console.debug("[DSSP-DEBUG][PORTAL] opening trainee", {
+      traineeId: first.id,
+      url: trainingFormUrl(first.id),
+    });
     const loaded = await this.loadDocument(trainingFormUrl(first.id));
 
     if (!loaded.success) {
       return loaded;
     }
 
+    console.debug("[DSSP-DEBUG][PORTAL] after opening form URL", loaded.data.url);
+    console.debug("[DSSP-DEBUG][PORTAL] form DOM ready");
+    logFormDomDiagnostics(loaded.data.document, loaded.data.url);
+
     try {
-      return ok(getFormOptions(loaded.data.document));
+      const options = getFormOptions(loaded.data.document);
+      console.debug("[DSSP-DEBUG][PORTAL] training form detected; options extracted", {
+        instructors: options.instructors.length,
+        trainingTypes: options.trainingTypes.length,
+      });
+      return ok(options);
     } catch (error) {
       return failed(error);
     }
   }
 
+  async openTraineeLogs(): Promise<Result<void>> {
+    const trainees = await this.getTrainees();
+    if (!trainees.success) {
+      return trainees;
+    }
+
+    if (trainees.data.length === 0) {
+      return failed(new MissingDataError("trainees on the Trainee Logs page"));
+    }
+
+    this.preparedTrainees = trainees.data;
+    return ok(undefined);
+  }
+
+  async initializeTrainingSession(): Promise<Result<void>> {
+    const opened = await this.openTraineeLogs();
+    if (!opened.success) return opened;
+
+    const trainees = await this.getTrainees();
+    if (!trainees.success) return trainees;
+    const first = trainees.data[0];
+    if (!first) return failed(new MissingDataError("a trainee for the training session"));
+
+    this.currentTrainee = first;
+    return this.openTrainingForm();
+  }
+
+  async isTrainingSessionReady(): Promise<boolean> {
+    if (!this.preparedForm) return false;
+    try {
+      if (isLoginPage(this.preparedForm.document, this.preparedForm.url)) {
+        return false;
+      }
+      getTrainingFormFields(this.preparedForm.document);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async prepareTrainee(trainee: Trainee): Promise<Result<void>> {
+    const opened = await this.openTrainee(trainee);
+    if (!opened.success) return opened;
+
+    if (
+      this.preparedFormTraineeId === trainee.id &&
+      (await this.isTrainingSessionReady())
+    ) {
+      return ok(undefined);
+    }
+
+    return this.openTrainingForm();
+  }
+
   openTrainee(trainee: Trainee): Promise<Result<void>> {
     this.currentTrainee = trainee;
-    this.preparedForm = null;
     this.submission = null;
 
     return Promise.resolve(ok(undefined));
@@ -685,6 +878,7 @@ export class DSSPPortalAdapter implements PortalAdapter {
         ...loaded.data,
         fields: getTrainingFormFields(loaded.data.document),
       };
+      this.preparedFormTraineeId = trainee.id;
 
       return ok(undefined);
     } catch (error) {
@@ -698,6 +892,15 @@ export class DSSPPortalAdapter implements PortalAdapter {
     }
 
     try {
+      if (
+        !this.currentTrainee ||
+        this.currentTrainee.id !== session.traineeId ||
+        this.preparedFormTraineeId !== session.traineeId
+      ) {
+        throw new PortalStructureError(
+          "The prepared training form does not belong to the selected trainee.",
+        );
+      }
       this.preparedForm.fields = fillTrainingFormFields(
         this.preparedForm.document,
         session,

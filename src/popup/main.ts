@@ -14,6 +14,7 @@ import type {
   TrainingFormOptions,
 } from "../core/domain/TrainingFormOptions";
 import { formatTrainingDate } from "../core/shared/trainingDate";
+import { parseTraineeInput } from "../core/shared/parseTraineeInput";
 
 const browser = new ChromiumBrowserAdapter();
 const messageBus = new MessageBus(browser.runtime);
@@ -58,16 +59,14 @@ let cachedFormOptions: TrainingFormOptions | null = null;
 let currentState: AutomationState = "idle";
 
 function setStatus(text: string, tone: "info" | "error" = "info"): void {
+  console.debug("[DSSP-DEBUG][POPUP] state transition", { text, tone });
   ui.status.textContent = text;
   ui.status.dataset.tone = tone;
 }
 
 function parseTraineeIds(): string[] {
   const raw = ui.trainees.value;
-  const parsed = raw
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+  const parsed = parseTraineeInput(raw);
   console.debug("[DSSP:popup] Trainee IDs textarea read", {
     rawValue: raw,
     parsedValues: parsed,
@@ -214,10 +213,42 @@ async function loadFormOptions(): Promise<void> {
   formOptionsReady = false;
   renderControls(currentState);
   setStatus("Loading form options.");
+  console.debug("[DSSP-DEBUG][POPUP] requesting GET_FORM_OPTIONS");
 
-  const data = await send({ type: "GET_FORM_OPTIONS" });
+  let response: Awaited<ReturnType<typeof messageBus.send>>;
+  try {
+    response = await Promise.race([
+      messageBus.send({ type: "GET_FORM_OPTIONS" }),
+      new Promise<never>((_, reject) =>
+        window.setTimeout(
+          () => reject(new Error("Form options request timed out after 15 seconds.")),
+          15_000,
+        ),
+      ),
+    ]);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.error("[DSSP-DEBUG][POPUP] GET_FORM_OPTIONS failed", { reason });
+    renderSelectOptions(ui.instructor, [], "Instructors unavailable");
+    renderSelectOptions(ui.trainingType, [], "Training types unavailable");
+    formOptionsReady = false;
+    renderControls(currentState);
+    setStatus(`Form options failed: ${reason}`, "error");
+    return;
+  }
+
+  console.debug("[DSSP-DEBUG][POPUP] GET_FORM_OPTIONS response", response);
+  const data = response.success ? response.data ?? null : null;
 
   if (!isTrainingFormOptions(data)) {
+    renderSelectOptions(ui.instructor, [], "Instructors unavailable");
+    renderSelectOptions(ui.trainingType, [], "Training types unavailable");
+    formOptionsReady = false;
+    renderControls(currentState);
+    setStatus(
+      `Form options failed: ${response.success ? "invalid response from DSSP page" : response.error}`,
+      "error",
+    );
     return;
   }
 

@@ -13,6 +13,14 @@ function unmapped<T>(operation: string): Result<T> {
 }
 
 export class UnmappedPortalAdapter implements PortalAdapter {
+  initializeTrainingSession(): Promise<Result<void>> {
+    return Promise.resolve(unmapped<void>("initializeTrainingSession"));
+  }
+
+  isTrainingSessionReady(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+
   isPortalPage(): Promise<boolean> {
     return Promise.resolve(false);
   }
@@ -25,8 +33,16 @@ export class UnmappedPortalAdapter implements PortalAdapter {
     return Promise.resolve(unmapped<TrainingFormOptions>("getFormOptions"));
   }
 
+  openTraineeLogs(): Promise<Result<void>> {
+    return Promise.resolve(unmapped<void>("openTraineeLogs"));
+  }
+
   openTrainee(): Promise<Result<void>> {
     return Promise.resolve(unmapped<void>("openTrainee"));
+  }
+
+  prepareTrainee(): Promise<Result<void>> {
+    return Promise.resolve(unmapped<void>("prepareTrainee"));
   }
 
   openTrainingForm(): Promise<Result<void>> {

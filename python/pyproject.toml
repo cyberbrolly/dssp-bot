@@ -1,0 +1,13 @@
+[project]
+name = "dssp-bot-worker"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.40",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"

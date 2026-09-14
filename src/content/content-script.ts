@@ -100,14 +100,29 @@ async function dispatch(
         data: await portal.isPortalPage(),
       };
 
+    case "PORTAL_INITIALIZE_SESSION":
+      return toResponse(await portal.initializeTrainingSession());
+
+    case "PORTAL_SESSION_READY":
+      return {
+        success: true,
+        data: await portal.isTrainingSessionReady(),
+      };
+
     case "PORTAL_GET_TRAINEES":
       return toResponse(await portal.getTrainees());
 
     case "PORTAL_GET_FORM_OPTIONS":
       return toResponse(await portal.getFormOptions());
 
+    case "PORTAL_OPEN_TRAINEE_LOGS":
+      return toResponse(await portal.openTraineeLogs());
+
     case "PORTAL_OPEN_TRAINEE":
       return toResponse(await portal.openTrainee(command.trainee));
+
+    case "PORTAL_PREPARE_TRAINEE":
+      return toResponse(await portal.prepareTrainee(command.trainee));
 
     case "PORTAL_OPEN_FORM":
       return toResponse(await portal.openTrainingForm());
@@ -139,13 +154,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  console.debug("[DSSP-DEBUG][CONTENT] received", {
+    action: message.type,
+    href: location.href,
+    readyState: document.readyState,
+  });
+
   execute(message)
-    .then(sendResponse)
+    .then((response) => {
+      console.debug("[DSSP-DEBUG][CONTENT] responding", {
+        action: message.type,
+        response,
+      });
+      sendResponse(response);
+    })
     .catch((error: unknown) => {
       const automationError = toAutomationError(error);
 
       logger.error("Portal command failed", {
         type: message.type,
+        error: automationError.message,
+      });
+      console.error("[DSSP-DEBUG][CONTENT] failed", {
+        action: message.type,
+        href: location.href,
         error: automationError.message,
       });
 

@@ -23,7 +23,7 @@ class FakeTabs implements BrowserTabs {
     this.activeTabIds = [...activeTabIds];
   }
 
-  getActiveTabId(): Promise<number | undefined> {
+  private nextActiveTabId(): number | undefined {
     // Hold the final value once the script has run out, so a batch that issues
     // more commands than there are focus changes still resolves something.
     const next =
@@ -31,7 +31,24 @@ class FakeTabs implements BrowserTabs {
         ? this.activeTabIds.shift()
         : this.activeTabIds[0];
 
-    return Promise.resolve(next);
+    return next;
+  }
+
+  getActiveTabId(): Promise<number | undefined> {
+    return Promise.resolve(this.nextActiveTabId());
+  }
+
+  getActiveTab(): Promise<{ id?: number; url?: string; status?: string } | undefined> {
+    const id = this.nextActiveTabId();
+    return Promise.resolve(
+      id === undefined
+        ? undefined
+        : { id, url: "https://dssp.frsc.gov.ng/Trainee", status: "complete" },
+    );
+  }
+
+  findDsspTraineeTab(): Promise<{ id?: number; url?: string; status?: string } | undefined> {
+    return this.getActiveTab();
   }
 
   sendMessage(tabId: number, command: unknown): Promise<unknown> {
@@ -159,5 +176,23 @@ describe("RemotePortalAdapter", () => {
 
       expect(await portal.isPortalPage()).toBe(false);
     });
+  });
+
+  it("surfaces content-script errors while loading form options", async () => {
+    const tabs = new FakeTabs([1]);
+    tabs.respondWith({
+      success: false,
+      error: "Could not establish connection. Receiving end does not exist.",
+      code: "PORTAL_UNAVAILABLE",
+    });
+    const portal = new RemotePortalAdapter(tabs);
+    await portal.attach();
+
+    const result = await portal.getFormOptions();
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toMatch(/receiving end/i);
+    }
   });
 });

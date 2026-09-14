@@ -55,6 +55,8 @@ describe("AutomationEngine", () => {
     expect(result.success).toBe(true);
     expect(portal.opened).toEqual(["1", "2", "3"]);
     expect(portal.submitted).toEqual(["1", "2", "3"]);
+    expect(portal.sessionInitializations).toBe(1);
+    expect(portal.trainingFormOpens).toBe(0);
 
     if (result.success) {
       expect(result.data.total).toBe(3);
@@ -63,6 +65,22 @@ describe("AutomationEngine", () => {
     }
 
     expect(engine.getState()).toBe("complete");
+  });
+
+  it("reinitializes a lost session without replaying submission", async () => {
+    const { engine, portal } = engineWith();
+    let checks = 0;
+    portal.isTrainingSessionReady = async () => {
+      checks += 1;
+      return checks !== 2;
+    };
+    engine.addTasks(tasks("1", "2"));
+
+    const result = await engine.run();
+
+    expect(result.success).toBe(true);
+    expect(portal.sessionInitializations).toBe(2);
+    expect(portal.submitted).toEqual(["1", "2"]);
   });
 
   it("refuses to start a second concurrent run", async () => {
