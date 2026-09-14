@@ -40,6 +40,8 @@ class Worker:
         self._handlers: dict[str, Handler] = {
             p.OP_PING: self._ping,
             p.OP_ENSURE_SESSION: self._ensure_session,
+            p.OP_LIST_TRAINEES: self._list_trainees,
+            p.OP_GET_FORM_OPTIONS: self._get_form_options,
         }
 
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -71,6 +73,30 @@ class Worker:
         self.portal.ensure_session()
         return p.ok_response(
             req.get("job_id", ""), p.OP_ENSURE_SESSION, authenticated=True
+        )
+
+    def _list_trainees(self, req: dict[str, Any]) -> dict[str, Any]:
+        trainees = self.portal.list_trainees()
+        projected = [
+            {k: t[k] for k in ("id", "name", "sn", "course", "training_sessions")}
+            for t in trainees
+        ]
+        return p.ok_response(
+            req.get("job_id", ""),
+            p.OP_LIST_TRAINEES,
+            count=len(projected),
+            trainees=projected,
+        )
+
+    def _get_form_options(self, req: dict[str, Any]) -> dict[str, Any]:
+        trainee_id = req.get("trainee_id")
+        opts = self.portal.get_form_options(trainee_id)
+        return p.ok_response(
+            req.get("job_id", ""),
+            p.OP_GET_FORM_OPTIONS,
+            trainee_id=opts.get("trainee_id"),
+            instructors=opts["instructors"],
+            training_types=opts["training_types"],
         )
 
     def close(self) -> None:
