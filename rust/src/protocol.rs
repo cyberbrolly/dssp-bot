@@ -18,17 +18,17 @@ pub mod op {
 
 /// Trainee selector: by id when given, else by name. An ambiguous name match
 /// is rejected by the worker — we must then supply the id, never guess.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraineeRef {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
 /// Training details for one submission. `instructor`/`training_type` may be a
 /// portal value or its label; the worker resolves either.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInput {
     pub training_date: String,
     pub instructor: String,

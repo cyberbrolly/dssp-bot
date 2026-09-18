@@ -1,0 +1,8 @@
+{
+  "trainee": { "id": "REPLACE_WITH_REAL_TRAINEE_ID" },
+  "session": {
+    "training_date": "2026-09-14",
+    "instructor": "REPLACE_WITH_INSTRUCTOR_NAME_OR_ID",
+    "training_type": "REPLACE_WITH_TRAINING_TYPE_NAME_OR_ID"
+  }
+}
