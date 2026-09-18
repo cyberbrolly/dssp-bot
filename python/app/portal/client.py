@@ -15,6 +15,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode, urljoin
 
 from playwright.sync_api import Page, Playwright, sync_playwright
 from playwright.sync_api import Error as PlaywrightError
@@ -151,3 +152,80 @@ class PortalClient:
 
         soup, _url, _body, _status = self._get(c.training_form_url(trainee_id))
         return {"trainee_id": trainee_id, **parse.get_form_options(soup)}
+
+    # -- submit -------------------------------------------------------------
+    def _resolve_trainee(self, trainee: dict) -> dict:
+        """Resolve a trainee safely. By id when given, else by normalized name.
+        Never guesses: an ambiguous name match stops the job."""
+        trainee_id = str(trainee.get("id") or "").strip()
+        if trainee_id:
+            for candidate in self.list_trainees():
+                if candidate["id"] == trainee_id:
+                    return candidate
+            raise e.trainee_not_found(
+                f"No trainee with id {trainee_id} on the portal."
+            )
+
+        name = str(trainee.get("name") or "").strip()
+        if not name:
+            raise e.missing_data("trainee id or name")
+
+        target = parse.normalize_name(name)
+        matches = [
+            t
+            for t in self.list_trainees()
+            if parse.normalize_name(t["name"]) == target
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise e.trainee_not_found(f"No trainee named {name!r} on the portal.")
+        raise e.trainee_not_found(
+            f"Ambiguous trainee match: {len(matches)} trainees named {name!r}. "
+            "Provide the trainee id."
+        )
+
+    def submit_training(self, trainee: dict, session: dict) -> dict:
+        """Prepare, commit exactly once, then classify. Never re-POST."""
+        resolved = self._resolve_trainee(trainee)
+
+        soup, form_url, _body, _status = self._get(
+            c.training_form_url(resolved["id"])
+        )
+        form, payload = parse.build_form_payload(soup, session)
+
+        action = urljoin(form_url, form.get("action") or form_url)
+        data = urlencode(payload)
+
+        self.start()
+        assert self._context is not None
+        try:
+            resp = self._context.request.post(
+                action,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=c.NAV_TIMEOUT_MS,
+            )
+        except PlaywrightError as exc:
+            raise e.network(
+                f"submitting training for trainee {resolved['id']} failed: {exc}"
+            ) from exc
+
+        body = resp.text()
+        redirected = resp.url != action
+        outcome = parse.submission_outcome(body, resp.url, resp.status, redirected)
+
+        log.info(
+            "submit trainee=%s name=%r outcome=%s",
+            resolved["id"],
+            resolved["name"],
+            outcome.get("outcome"),
+        )
+        return {
+            "trainee": {"id": resolved["id"], "name": resolved["name"]},
+            "attempts": 1,
+            **outcome,
+        }

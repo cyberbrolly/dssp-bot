@@ -42,6 +42,7 @@ class Worker:
             p.OP_ENSURE_SESSION: self._ensure_session,
             p.OP_LIST_TRAINEES: self._list_trainees,
             p.OP_GET_FORM_OPTIONS: self._get_form_options,
+            p.OP_SUBMIT_TRAINING: self._submit_training,
         }
 
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -98,6 +99,31 @@ class Worker:
             instructors=opts["instructors"],
             training_types=opts["training_types"],
         )
+
+    def _submit_training(self, req: dict[str, Any]) -> dict[str, Any]:
+        job_id = req.get("job_id", "")
+        trainee = req.get("trainee")
+        session = req.get("session")
+
+        if not isinstance(trainee, dict) or not isinstance(session, dict):
+            return p.error_response(
+                job_id,
+                p.OP_SUBMIT_TRAINING,
+                p.ERR_BAD_REQUEST,
+                "'trainee' and 'session' objects are required",
+            )
+
+        for field in ("training_date", "instructor", "training_type"):
+            if not str(session.get(field) or "").strip():
+                return p.error_response(
+                    job_id,
+                    p.OP_SUBMIT_TRAINING,
+                    p.ERR_BAD_REQUEST,
+                    f"session.{field} is required",
+                )
+
+        result = self.portal.submit_training(trainee, session)
+        return p.ok_response(job_id, p.OP_SUBMIT_TRAINING, **result)
 
     def close(self) -> None:
         self.portal.close()
