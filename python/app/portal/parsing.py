@@ -106,6 +106,8 @@ def get_trainees(soup: BeautifulSoup) -> list[dict[str, Any]]:
                 "profile_url": (
                     log_link.get("href")
                     if log_link
+                    else id_link.get("href")
+                    if id_link
                     else c.training_form_url(trainee_id)
                 ),
             }
