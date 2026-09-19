@@ -13,6 +13,7 @@
 //! members are expected while later stages land.
 #![allow(dead_code)]
 
+mod checkpoint;
 mod decision;
 mod engine;
 mod protocol;
