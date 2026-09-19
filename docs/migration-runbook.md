@@ -47,7 +47,7 @@ run).
 | 22 | Protocol validation       | 🟢 Passed     | invalid-message tests           | bad JSON / unknown op / job_id echo |
 | 23 | Rust → Python connection  | 🟢 Passed     | IPC test                        | spawn + ready + ping |
 | 24 | Real Rust → Python → DSSP | 🟡 Blocked    | one-trainee test                | **Gate 2** — awaiting operator |
-| 25 | Rust coordinator          | 🔵 In Progress | coordinator tests              | engine done; **batch CLI pending (decision 5)** |
+| 25 | Rust coordinator          | 🟢 Passed     | `cargo test` (47)               | batch CLI + pre-flight dedupe; `2d2fcf9` |
 | 26 | Retry policy              | 🟢 Passed     | retry tests                     | `decision.rs` + E2E backoff |
 | 27 | Checkpointing             | ⬜ Not Started | checkpoint tests               | port TS `BatchCheckpoint.ts` |
 | 28 | Recovery                  | ⬜ Not Started | crash/recovery tests            | **Gate 3** |
@@ -134,11 +134,40 @@ Next:
 Remain on Stage 14.
 ```
 
+## Stage Records
+
+```text
+Stage: 25 — Rust Coordinator
+Status: 🟢 Passed
+
+Changes:
+- Batch CLI: a job file with a "trainees" array runs BatchEngine over one
+  portal session; a "trainee" key still runs the single-trainee path.
+- Pre-flight resolution against list_trainees, then dedupe on the resolved
+  canonical id — mirrors PortalClient._resolve_trainee, so the CLI and the
+  worker agree on what a valid batch is.
+- Direct decision.rs coverage (24 tests over decide_submit + settle_submit);
+  11 more in main.rs over resolution and dedupe.
+- rust/README.md documents the batch exit codes, incl. exit 4 meaning
+  "already logged" as well as "rejected".
+
+Verification:
+- cargo test — 47 passed, 0 failed
+  (24 decision, 11 resolution/dedupe, 6 engine, 4 state, 2 queue)
+- commit 2d2fcf9
+
+Errors:
+- None
+
+Next:
+Stage 27 — Checkpointing
+```
+
 ## Migration Progress Summary
 
 ```text
-Completed:  22 / 40
-In Progress: 2   (25, 38)
+Completed:  23 / 40
+In Progress: 1   (38)
 Failed:      0
 Blocked:     3   (10, 15, 24)
 Skipped:     0
