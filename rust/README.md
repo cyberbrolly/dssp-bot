@@ -1,7 +1,8 @@
 # DSSP-Bot Core (Rust coordinator)
 
-First-milestone coordinator: spawns the Python Playwright worker, drives one
-trainee end to end, and owns every retry/stop decision.
+Coordinator: spawns the Python Playwright worker and owns every retry/stop
+decision. Drives one trainee end to end (the live gates), or a whole batch
+through a single session.
 
 ```
 Rust (this crate) → Python worker (stdio JSON) → Playwright → DSSP → result
@@ -50,6 +51,43 @@ cargo run -- job.json               # (defaults to ./job.json if no arg given)
 The first run opens a real Chromium window and **waits for you to sign in** to
 DSSP manually. The session is stored in `../python/.pw-profile/` (gitignored),
 so later runs reuse it. Run headless once logged in with `DSSP_HEADLESS=1`.
+
+## Run a batch
+
+Give the job file a `trainees` array instead of a single `trainee`:
+
+```json
+{
+  "trainees": [{ "id": "12345" }, { "name": "Jane Roe" }],
+  "session": {
+    "training_date": "2026-09-14",
+    "instructor": "Jane Smith",
+    "training_type": "Practical"
+  }
+}
+```
+
+```bash
+cargo run -- job.json
+```
+
+Every entry is resolved against the portal's trainee list **before anything is
+submitted**: an explicit `id` must exist, a `name` must match exactly one
+trainee, and an ambiguous name stops the whole batch with the offending entries
+listed. Entries resolving to the same trainee collapse into one submission.
+Progress goes to stderr; the JSON `BatchReport` goes to stdout.
+
+| exit | meaning |
+| ---: | ------- |
+| 0 | every trainee recorded |
+| 2 | the batch could not be resolved — nothing was submitted |
+| 3 | needs a human: an indeterminate submission, or a batch aborted mid-run |
+| 4 | definitive failures, safe to re-run |
+
+In a batch, exit 4 also covers **already-logged** trainees: a `duplicate` is
+recorded against that row as a failure, so exit 4 means "something needed
+attention", not necessarily "the portal refused a record". A single-trainee run
+still reports a duplicate as `RESULT: duplicate` and exits 0.
 
 ## Configuration (environment)
 
