@@ -41,6 +41,26 @@ pub struct BatchCheckpoint {
     pub pending: Vec<String>,
 }
 
+/// Receives each checkpoint the engine produces.
+///
+/// Ports `CheckpointWriter` from BatchCheckpoint.ts, which the original port
+/// left out because nothing consumed it yet; the engine now wires a sink, so
+/// the trait belongs here rather than in the store that happens to implement
+/// it. Injected rather than owned so the engine stays free of storage concerns
+/// and remains testable without a filesystem — the unit tests pass a recorder,
+/// the CLI passes [`crate::store::CheckpointStore`].
+///
+/// Implementations own their own error reporting. The engine drops the error on
+/// purpose: a storage fault must not abort a batch that is otherwise submitting
+/// successfully, so the sink is the only place a failed write becomes visible.
+///
+/// The TS signature is `(checkpoint) => void | Promise<void>`; there is no
+/// async here, so a write is an ordinary call that returns its outcome rather
+/// than rejecting.
+pub trait CheckpointWriter {
+    fn write(&mut self, checkpoint: &BatchCheckpoint) -> Result<(), String>;
+}
+
 impl BatchCheckpoint {
     /// True while the batch that wrote this checkpoint was still expected to
     /// run.

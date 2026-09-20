@@ -20,10 +20,12 @@ mod protocol;
 mod queue;
 mod report;
 mod state;
+mod store;
 mod worker;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 use std::process::exit;
 
 use decision::{decide_submit, Decision, RetryPolicy};
@@ -31,6 +33,7 @@ use engine::BatchEngine;
 use protocol::{Request, SessionInput, Status, TraineeInfo, TraineeRef};
 use report::BatchReport;
 use serde::Deserialize;
+use store::CheckpointStore;
 use worker::WorkerClient;
 
 #[derive(Deserialize)]
@@ -257,7 +260,7 @@ fn main() {
 
     let code = match plan(&job) {
         Ok(Plan::Single(trainee)) => run_single(trainee, &job.session),
-        Ok(Plan::Batch(trainees)) => run_batch(&trainees, &job.session),
+        Ok(Plan::Batch(trainees)) => run_batch(&trainees, &job.session, &path),
         Err(e) => {
             eprintln!("dssp-bot: {e}");
             exit(2);
@@ -345,7 +348,12 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
 /// Many trainees, one session. The engine aborts the whole batch — draining
 /// whatever is still queued as skipped — the moment a result cannot be
 /// accounted for.
-fn run_batch(trainees: &[TraineeRef], session: &SessionInput) -> i32 {
+///
+/// Unlike the single-trainee path, a batch always checkpoints: it is the run
+/// most likely to be interrupted, and the one where an interrupted run has real
+/// records on the portal to account for. A single submission that dies leaves
+/// one line of terminal output and nothing ambiguous behind it.
+fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) -> i32 {
     let mut client = match connect() {
         Ok(client) => client,
         Err(e) => {
@@ -382,7 +390,12 @@ fn run_batch(trainees: &[TraineeRef], session: &SessionInput) -> i32 {
 
     eprintln!("dssp-bot: batch of {} trainee(s)", resolved.len());
 
-    let mut engine = BatchEngine::default();
+    // Where a killed batch leaves its record. Named on stderr because the file
+    // is the operator's only account of a run that never printed a report.
+    let checkpoint = CheckpointStore::for_job(Path::new(job_path));
+    eprintln!("dssp-bot: checkpoint → {}", checkpoint.path().display());
+
+    let mut engine = BatchEngine::default().with_checkpoint(Box::new(checkpoint));
     let report = match engine.run(&mut client, session, resolved) {
         Ok(report) => report,
         Err(e) => {

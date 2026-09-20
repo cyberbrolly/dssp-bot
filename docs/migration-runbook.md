@@ -49,7 +49,7 @@ run).
 | 24 | Real Rust → Python → DSSP | 🟡 Blocked    | one-trainee test                | **Gate 2** — awaiting operator |
 | 25 | Rust coordinator          | 🟢 Passed     | `cargo test` (47)               | batch CLI + pre-flight dedupe; `2d2fcf9` |
 | 26 | Retry policy              | 🟢 Passed     | retry tests                     | `decision.rs` + E2E backoff |
-| 27 | Checkpointing             | ⬜ Not Started | checkpoint tests               | port TS `BatchCheckpoint.ts` |
+| 27 | Checkpointing             | 🟢 Passed     | `cargo test` (79) + clippy      | port TS `BatchCheckpoint.ts` + store + engine wiring; Gate 3 items → Stage 28 |
 | 28 | Recovery                  | ⬜ Not Started | crash/recovery tests            | **Gate 3** |
 | 29 | Extension → Rust          | ⬜ Not Started | API integration                 | TS still at repo root |
 | 30 | Pause                     | ⬜ Not Started | pause test                      | state exists; no engine API |
@@ -163,10 +163,82 @@ Next:
 Stage 27 — Checkpointing
 ```
 
+```text
+Stage: 27 — Checkpointing
+Status: 🟢 Passed
+
+Changes:
+- `rust/src/store.rs`: the durable write path. One file, rewritten in full after
+  every settled trainee, through a temp file + rename — `fs::write` truncates in
+  place, so a kill mid-write would leave JSON that cannot be parsed, and that is
+  the one state recovery must never read as "nothing was submitted". The write is
+  atomic; the read side returns `Err` for a corrupt file rather than `Ok(None)`.
+  `DSSP_CHECKPOINT` overrides the location, otherwise `dssp.checkpoint.json`
+  beside the job file (gitignored: it holds trainee ids and names).
+- `checkpoint.rs` gains `CheckpointWriter`, the trait the port deliberately left
+  out until the engine had a sink to hand it.
+- `BatchEngine` now emits `running` after each settled trainee — after the push
+  and before the abort drain, matching AutomationEngine.ts:198-201 — plus one
+  terminal `finished`. The sink is optional and the write's `Result` is dropped,
+  so a storage fault cannot abort a batch that is otherwise submitting.
+- `run_batch` wires the store in; the single-trainee path does not checkpoint,
+  mirroring the TS engine, which only ever checkpoints batches.
+- 18 new tests (11 store, 7 engine). The store's are a real disk round trip, and
+  one of them pins the on-disk field names against a stray serde rename.
+- Review pass (the four defects a design review found in the first draft):
+  `save` now fsyncs the parent directory after the rename, because without it a
+  power loss can take the rename itself and leave recovery reading the *previous*
+  checkpoint — one whose `pending` may still name a trainee this batch already
+  submitted; the temp file is `<name>.<pid>.tmp` rather than a fixed `<name>.tmp`,
+  so two runs in one directory cannot rename each other's half-written file;
+  `resolve_path(job, override)` is split out of `for_job` so the default location
+  is testable without depending on whether the process happens to export
+  `DSSP_CHECKPOINT`; and one engine+store test proves the two halves are actually
+  wired together, which the earlier suite would not have noticed if they were not.
+
+Verification:
+- cargo test — 79 passed, 0 failed
+  (24 decision, 14 checkpoint, 13 engine, 11 resolution/dedupe, 11 store,
+  4 state, 2 queue)
+- cargo clippy --all-targets — clean
+- `cargo fmt --check` is NOT clean, but neither is the committed tree
+  (`decision.rs`, `checkpoint.rs::is_live`), there is no `rustfmt.toml` and no CI
+  workflow — so the project keeps a hand-maintained ~100-column style and this
+  stage did not change that.
+
+Errors:
+- None
+
+Open for Stage 28 (found in review, deliberately not fixed here):
+- **The commit window.** `run` dequeues at `engine.rs:149` and only pushes the
+  result after `process_trainee` returns, so from dequeue until then the trainee
+  is in neither `results` nor `pending`. A crash in that window — spanning the
+  portal round trip and every retry backoff — makes `unreconciled()` report it in
+  neither group, and recovery would requeue nothing for a submission that may
+  have reached the portal. Fixing it means recording the trainee *before*
+  `worker.send` (a `in_flight: Option<String>` field on `BatchCheckpoint`, added
+  additively so older files still parse). That is Gate 3's own criterion, which
+  is why it is Stage 28's, not this stage's.
+- **Nothing refuses to start over a live checkpoint.** `for_job` resolves one
+  fixed slot and the first write of a new batch overwrites whatever was there, so
+  a predecessor's indeterminate record can be destroyed before the new batch has
+  submitted anything — and the loss is invisible, because the new file looks
+  clean. Stage 28 must gate the start on a live, unreconciled checkpoint.
+- Two things are *not* gaps, and Stage 28 should not rebuild them: the portal
+  itself refuses a same-key replay (`python/app/portal/parsing.py` matches
+  "duplicate|already logged", which `decision.rs` turns into
+  `DUPLICATE_RECORD` without aborting), so a crash-window replay is a spurious
+  `Failed` line rather than a second record; and `run_single` deliberately does
+  not checkpoint, because one submission that dies leaves one unambiguous line.
+
+Next:
+Stage 28 — Recovery (Gate 3)
+```
+
 ## Migration Progress Summary
 
 ```text
-Completed:  23 / 40
+Completed:  24 / 40
 In Progress: 1   (38)
 Failed:      0
 Blocked:     3   (10, 15, 24)
