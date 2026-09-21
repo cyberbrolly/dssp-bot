@@ -26,6 +26,22 @@ pub struct CheckpointStore {
     path: PathBuf,
 }
 
+/// A checkpoint as it was on disk, plus what the file itself testifies to.
+pub struct StoredCheckpoint {
+    pub checkpoint: BatchCheckpoint,
+    /// Whether the build that wrote this file recorded the trainee it was
+    /// submitting.
+    ///
+    /// Load-bearing, and not the same question as `checkpoint.in_flight.is_none()`:
+    /// `#[serde(default)]` makes an absent key and a null one identical once the
+    /// struct exists. A build without the field wrote only at settle points, so a
+    /// crash mid-submission leaves the trainee it was working on at the head of
+    /// `pending` — where a reader with no marker to consult would take it for
+    /// never-sent and submit it a second time. The key's *presence* is the only
+    /// thing that separates those files from current ones.
+    pub tracks_in_flight: bool,
+}
+
 impl CheckpointStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -48,15 +64,39 @@ impl CheckpointStore {
     /// one conclusion recovery must never draw from a corrupt checkpoint is that
     /// nothing was submitted.
     pub fn load(&self) -> Result<Option<BatchCheckpoint>, String> {
+        Ok(self.load_with_provenance()?.map(|stored| stored.checkpoint))
+    }
+
+    /// Read the last checkpoint together with what the *file* can testify to.
+    ///
+    /// [`Self::load`] wraps this, so call sites that do not care about
+    /// provenance are unchanged. Recovery is the one that does: whether the
+    /// build that wrote a file could record a submission in flight decides
+    /// whether its queue is evidence that those trainees were never sent.
+    pub fn load_with_provenance(&self) -> Result<Option<StoredCheckpoint>, String> {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("{}: {e}", self.path.display())),
         };
 
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|e| format!("{}: unreadable checkpoint: {e}", self.path.display()))
+        let unreadable = |e: serde_json::Error| format!("{}: unreadable checkpoint: {e}", self.path.display());
+
+        // Parsed once as loose JSON, because the typed parse below cannot answer
+        // the question: `#[serde(default)]` makes an absent `in_flight` key and a
+        // null one identical once the struct exists, and telling those apart is
+        // the whole point of asking.
+        let raw: serde_json::Value = serde_json::from_str(&text).map_err(unreadable)?;
+        let tracks_in_flight = raw
+            .as_object()
+            .is_some_and(|object| object.contains_key("in_flight"));
+
+        let checkpoint = serde_json::from_str(&text).map_err(unreadable)?;
+
+        Ok(Some(StoredCheckpoint {
+            checkpoint,
+            tracks_in_flight,
+        }))
     }
 
     /// Rewrite the checkpoint file in one step.
@@ -222,6 +262,7 @@ mod tests {
                 },
             ],
             pending: vec!["3".to_string()],
+            in_flight: None,
         }
     }
 
@@ -272,6 +313,77 @@ mod tests {
         let restored = store.load().expect("reads").expect("still there");
 
         assert_eq!(restored.status, CheckpointStatus::Finished);
+    }
+
+    /// A checkpoint written by a build before `in_flight` existed is still the
+    /// only account of what that batch submitted, so the read side has to accept
+    /// it — and must still find the record it cannot account for.
+    #[test]
+    fn a_checkpoint_from_an_older_build_still_loads() {
+        let scratch = Scratch::new("older-build");
+        let path = scratch.file("dssp.checkpoint.json");
+        fs::write(
+            &path,
+            r#"{
+  "status": "running",
+  "started_at": "1758285600000",
+  "updated_at": "1758285900000",
+  "total": 2,
+  "results": [
+    {
+      "trainee_id": "1",
+      "trainee_name": "Trainee 1",
+      "outcome": "indeterminate",
+      "attempts": 1,
+      "error_code": "NETWORK"
+    }
+  ],
+  "pending": []
+}"#,
+        )
+        .expect("write an older checkpoint");
+
+        let restored = CheckpointStore::new(&path)
+            .load()
+            .expect("reads")
+            .expect("the file is there");
+
+        assert_eq!(restored.in_flight, None);
+        assert!(restored.is_live(), "so the start gate still refuses");
+        assert_eq!(restored.unreconciled().indeterminate.len(), 1);
+    }
+
+    /// The one thing the typed parse cannot answer, and the reason provenance is
+    /// read off the raw JSON: an absent `in_flight` and a `null` one are the same
+    /// snapshot, but only the second was written by a build that could record a
+    /// submission in flight.
+    #[test]
+    fn a_file_written_before_in_flight_existed_says_so() {
+        let scratch = Scratch::new("provenance");
+        let path = scratch.file("dssp.checkpoint.json");
+        let store = CheckpointStore::new(&path);
+
+        store.save(&checkpoint(CheckpointStatus::Running)).expect("saves");
+        assert!(
+            store
+                .load_with_provenance()
+                .expect("reads")
+                .expect("there")
+                .tracks_in_flight,
+            "a file this build wrote"
+        );
+
+        fs::write(
+            &path,
+            r#"{"status":"running","started_at":"1758285600000","updated_at":"1758285900000",
+                "total":1,"results":[],"pending":["1"]}"#,
+        )
+        .expect("write an older checkpoint");
+
+        let stored = store.load_with_provenance().expect("reads").expect("there");
+
+        assert!(!stored.tracks_in_flight);
+        assert_eq!(stored.checkpoint.pending, vec!["1"]);
     }
 
     /// A corrupt checkpoint is the one thing that must not read as "no
@@ -347,6 +459,7 @@ mod tests {
             "\"total\"",
             "\"results\"",
             "\"pending\"",
+            "\"in_flight\"",
             "\"trainee_id\"",
             "\"trainee_name\"",
             "\"outcome\"",
@@ -358,7 +471,7 @@ mod tests {
 
         // The TS original's camelCase must not leak in: a reader keyed on
         // `startedAt` would find nothing and call a real batch a first run.
-        for camel in ["\"startedAt\"", "\"traineeId\"", "\"errorCode\""] {
+        for camel in ["\"startedAt\"", "\"traineeId\"", "\"errorCode\"", "\"inFlight\""] {
             assert!(!text.contains(camel), "leaked {camel} in {text}");
         }
 

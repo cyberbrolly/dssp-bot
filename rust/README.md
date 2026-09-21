@@ -81,13 +81,46 @@ Progress goes to stderr; the JSON `BatchReport` goes to stdout.
 | ---: | ------- |
 | 0 | every trainee recorded |
 | 2 | the batch could not be resolved — nothing was submitted |
-| 3 | needs a human: an indeterminate submission, or a batch aborted mid-run |
+| 3 | needs a human: a start refused over an unfinished batch, an indeterminate submission, or a batch aborted mid-run |
 | 4 | definitive failures, safe to re-run |
 
 In a batch, exit 4 also covers **already-logged** trainees: a `duplicate` is
 recorded against that row as a failure, so exit 4 means "something needed
 attention", not necessarily "the portal refused a record". A single-trainee run
 still reports a duplicate as `RESULT: duplicate` and exits 0.
+
+## Recovery
+
+A batch keeps its state in a checkpoint file (see `DSSP_CHECKPOINT`). It is
+written before each submission, not only after: the file **names the trainee
+being submitted before the submit is issued**, so a file that does not name a
+trainee is a file for which no submit was sent. That write is fatal if it fails —
+the batch stops *before* submitting rather than submitting unrecorded.
+
+So a crash can only ever leave the file claiming a submission that was never
+issued, never the reverse. That is the safe direction to be wrong in: the cost
+is a human checking the portal, not a second record.
+
+The next start reads that file first, before it connects to anything:
+
+- **Still owes an answer** — a submission that was in flight, was never
+  confirmed, or the file was left mid-run. The start is refused with the counts
+  and the two ways forward (exit 3), and the file is marked interrupted so the
+  next attempt is ordinary.
+- **`DSSP_RESUME=1`** — continue it instead. The never-attempted trainees run;
+  everything the predecessor recorded is carried forward into the new file so it
+  stays whole. Nothing whose submission may already be on the portal is ever
+  submitted again — those are reported and left for you. If there is nothing left
+  to attempt, the run exits 0 when every loose end is settled and 3 when a human
+  is still owed.
+- **Unreadable** — a corrupt file is not a file that says nothing ran. Refused,
+  never treated as an empty slot.
+- **Nothing to reconcile** — the batch runs normally.
+
+A checkpoint written by a build older than this stage has no record of what was
+in flight (older builds only wrote after a submission settled), so its first
+unattempted trainee is *presumed* to have reached the portal and is left for you
+rather than resumed.
 
 ## Configuration (environment)
 
@@ -99,6 +132,8 @@ still reports a duplicate as `RESULT: duplicate` and exits 0.
 | `DSSP_LOGIN_TIMEOUT_MS` | `300000` | how long to wait for manual login |
 | `DSSP_NAV_TIMEOUT_MS` | `30000` | per-request timeout |
 | `DSSP_WORKER_PY` | `../python/.venv/bin/python` | worker interpreter |
+| `DSSP_CHECKPOINT` | `dssp.checkpoint.json` beside the job | where batch state is written |
+| `DSSP_RESUME` | unset | `1` = continue an interrupted batch instead of refusing |
 
 ## Result & exit codes
 
@@ -115,5 +150,7 @@ The coordinator prints one line to stdout (progress/logs go to stderr):
 
 - An **indeterminate** submission is never retried automatically.
 - An **ambiguous** trainee name never resolves to a guess.
+- A batch **never starts over** an unfinished one without you saying so: the
+  record of a submission that may have landed is refused over, not overwritten.
 - No credentials are stored — auth lives only in the browser profile; nothing
   sensitive is logged.

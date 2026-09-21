@@ -18,6 +18,7 @@ mod decision;
 mod engine;
 mod protocol;
 mod queue;
+mod recovery;
 mod report;
 mod state;
 mod store;
@@ -31,6 +32,7 @@ use std::process::exit;
 use decision::{decide_submit, Decision, RetryPolicy};
 use engine::BatchEngine;
 use protocol::{Request, SessionInput, Status, TraineeInfo, TraineeRef};
+use recovery::Start;
 use report::BatchReport;
 use serde::Deserialize;
 use store::CheckpointStore;
@@ -353,7 +355,52 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
 /// most likely to be interrupted, and the one where an interrupted run has real
 /// records on the portal to account for. A single submission that dies leaves
 /// one line of terminal output and nothing ambiguous behind it.
+///
+/// The checkpoint is reconciled *before* the worker is spawned, so a start that
+/// has to be refused opens no browser and submits nothing.
 fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) -> i32 {
+    // Where a killed batch leaves its record. Named on stderr because the file
+    // is the operator's only account of a run that never printed a report.
+    let checkpoint = CheckpointStore::for_job(Path::new(job_path));
+    eprintln!("dssp-bot: checkpoint → {}", checkpoint.path().display());
+
+    let start = match recovery::guard(&checkpoint, recovery::resume_requested()) {
+        Ok(start) => start,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return 3;
+        }
+    };
+
+    // `recovery::Plan` is qualified: `Plan` here already names the job file's
+    // shape, which is a different question ("single or batch?") from this one.
+    let (wanted, carried) = match start.plan {
+        recovery::Plan::Fresh => {
+            // Only on this path, where the counts are exactly the file's own: a
+            // resume reports the same records itself, one line each, and a
+            // resume of a file old enough to have an untracked suspect would
+            // otherwise be described here by a count that does not include it.
+            if start.recovered
+                && let Some(previous) = &start.previous
+            {
+                eprintln!("{}", recovery::recovered_line(checkpoint.path(), previous));
+            }
+
+            announce_fresh(&start);
+            (trainees.to_vec(), Vec::new())
+        }
+        recovery::Plan::Resume {
+            roster,
+            carried,
+            owed,
+        } => {
+            if let Some(code) = announce_resume(&checkpoint, &roster, &carried, owed) {
+                return code;
+            }
+            (roster, carried)
+        }
+    };
+
     let mut client = match connect() {
         Ok(client) => client,
         Err(e) => {
@@ -379,7 +426,7 @@ fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) ->
         }
     }
 
-    let resolved = match resolve_trainees(&mut client, trainees) {
+    let resolved = match resolve_trainees(&mut client, &wanted) {
         Ok(resolved) => resolved,
         Err(failure) => {
             eprintln!("dssp-bot: {}", failure.message());
@@ -390,12 +437,9 @@ fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) ->
 
     eprintln!("dssp-bot: batch of {} trainee(s)", resolved.len());
 
-    // Where a killed batch leaves its record. Named on stderr because the file
-    // is the operator's only account of a run that never printed a report.
-    let checkpoint = CheckpointStore::for_job(Path::new(job_path));
-    eprintln!("dssp-bot: checkpoint → {}", checkpoint.path().display());
-
-    let mut engine = BatchEngine::default().with_checkpoint(Box::new(checkpoint));
+    let mut engine = BatchEngine::default()
+        .with_checkpoint(Box::new(checkpoint))
+        .with_carried(carried);
     let report = match engine.run(&mut client, session, resolved) {
         Ok(report) => report,
         Err(e) => {
@@ -411,14 +455,116 @@ fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) ->
     batch_exit_code(&report)
 }
 
+/// Says out loud what a predecessor left un-attempted, so a fresh start does not
+/// drop it in silence.
+///
+/// Those trainees are deliberately not carried into the new batch — the job file
+/// decides what runs — but a batch that quietly leaves five people unsubmitted,
+/// because an earlier run aborted before reaching them, is the kind of gap an
+/// operator finds out about from the portal.
+fn announce_fresh(start: &Start) {
+    let Some(previous) = &start.previous else {
+        return;
+    };
+
+    let stale = previous.never_attempted();
+
+    if !stale.is_empty() {
+        eprintln!(
+            "dssp-bot: note: the previous checkpoint left {} trainee(s) never attempted ({}) — \
+             this batch runs what the job file names",
+            stale.len(),
+            preview(&stale),
+        );
+    }
+}
+
+/// The resume header, and the one case that is not a batch at all. Returns the
+/// exit code when there is nothing to submit.
+///
+/// `owed` is what decides that code, not the whole carried set: the rows that
+/// landed are carried so the file stays whole, and a batch whose only loose ends
+/// are its own successes is finished, not blocked.
+fn announce_resume(
+    checkpoint: &CheckpointStore,
+    roster: &[TraineeRef],
+    carried: &[crate::report::TrainingResult],
+    owed: usize,
+) -> Option<i32> {
+    eprintln!(
+        "dssp-bot: resuming the batch checkpointed at {}",
+        checkpoint.path().display()
+    );
+
+    if !carried.is_empty() {
+        eprintln!(
+            "dssp-bot:   carrying {} result(s) forward into this batch — {} of them unconfirmed \
+             and never replayed",
+            carried.len(),
+            owed
+        );
+    }
+
+    // Printed before anything is submitted, so the ids are on screen while the
+    // operator can still stop the run — and printed whether or not there is
+    // anything left to run, because this list is the only place the crash-window
+    // trainee is named.
+    for result in carried
+        .iter()
+        .filter(|r| r.outcome == crate::report::Outcome::Indeterminate)
+    {
+        eprintln!(
+            "dssp-bot:   unconfirmed {}: {}",
+            label(&result.trainee_id, &result.trainee_name),
+            result.message.as_deref().unwrap_or("")
+        );
+    }
+
+    if roster.is_empty() {
+        eprintln!(
+            "dssp-bot: nothing to resume — every trainee in {} was either recorded or left \
+             unconfirmed",
+            checkpoint.path().display()
+        );
+
+        // Exit 3 only while a human is still owed: those records may exist on
+        // the portal, and this run has nothing to submit. A batch whose loose
+        // ends are all settled is simply already done.
+        return Some(if owed == 0 { 0 } else { 3 });
+    }
+
+    eprintln!(
+        "dssp-bot:   continuing {} trainee(s) that were never attempted",
+        roster.len()
+    );
+
+    None
+}
+
+/// Up to five ids, then a count — enough to recognise the list without turning
+/// one line into a wall.
+fn preview(ids: &[String]) -> String {
+    let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+
+    match ids.len().checked_sub(5) {
+        Some(rest) if rest > 0 => format!("{shown}, +{rest} more"),
+        _ => shown,
+    }
+}
+
+/// The name when there is one, else the id: what the operator would look up.
+fn label<'a>(id: &'a str, name: &'a str) -> &'a str {
+    if name.is_empty() {
+        id
+    } else {
+        name
+    }
+}
+
 /// Progress on stderr; the machine-readable report alone on stdout.
 fn print_report(report: &BatchReport) {
     for result in &report.results {
-        let who = if result.trainee_name.is_empty() {
-            &result.trainee_id
-        } else {
-            &result.trainee_name
-        };
+        let who = label(&result.trainee_id, &result.trainee_name);
         eprintln!(
             "dssp-bot: {:?} {who} (attempts={}) {}",
             result.outcome,

@@ -50,7 +50,7 @@ run).
 | 25 | Rust coordinator          | 🟢 Passed     | `cargo test` (47)               | batch CLI + pre-flight dedupe; `2d2fcf9` |
 | 26 | Retry policy              | 🟢 Passed     | retry tests                     | `decision.rs` + E2E backoff |
 | 27 | Checkpointing             | 🟢 Passed     | `cargo test` (79) + clippy      | port TS `BatchCheckpoint.ts` + store + engine wiring; Gate 3 items → Stage 28 |
-| 28 | Recovery                  | ⬜ Not Started | crash/recovery tests            | **Gate 3** |
+| 28 | Recovery                  | 🟢 Passed     | `cargo test` (133) + clippy     | **Gate 3** — in-flight record + start gate; `recovery.rs` |
 | 29 | Extension → Rust          | ⬜ Not Started | API integration                 | TS still at repo root |
 | 30 | Pause                     | ⬜ Not Started | pause test                      | state exists; no engine API |
 | 31 | Stop                      | ⬜ Not Started | stop test                       | abort path exists |
@@ -235,10 +235,107 @@ Next:
 Stage 28 — Recovery (Gate 3)
 ```
 
+```text
+Stage: 28 — Recovery
+Status: 🟢 Passed
+
+Changes:
+- **The commit window** — the first of the two gaps Stage 27 left open. The
+  engine now records the trainee it is about to submit: `in_flight:
+  Option<String>` on `BatchCheckpoint`, written by a `running` checkpoint
+  immediately before `worker.send`, rather than a result pushed after
+  `process_trainee` returns. That one write is the only checkpoint write whose
+  failure stops the batch — everywhere else a storage error is survivable
+  because a later write follows it, but here no later write can undo the send
+  that would come next. The trainee goes back on the queue first
+  (`TaskQueue::put_back`) so the abort drain records it `Skipped` — never sent,
+  and so safe to run again — instead of dropping it into no group at all. The
+  field is `#[serde(default)]` and always serialized, so a file written by an
+  older build still parses.
+- **The start gate** — the second gap. `rust/src/recovery.rs` is the reading
+  half the port deliberately left for this stage: `guard(&store, resume)` runs
+  in `run_batch` BEFORE the worker is spawned. A live file, an in-flight
+  trainee, or an unconfirmed record refuses the start with exit 3 and prints
+  the counts, the reason and the two ways forward; the refusal records the
+  interruption, so the next start is ordinary. A file that cannot be read
+  refuses too — a checkpoint that cannot be read is not a checkpoint that says
+  nothing ran.
+- **`DSSP_RESUME=1`** continues instead of refusing: the never-attempted
+  trainees run, and everything the predecessor recorded is carried into the new
+  batch through `BatchEngine::with_carried`, so the engine's first full rewrite
+  of the file cannot drop the only record of a submission that may already
+  exist. Nothing whose submission may already be on the portal is ever
+  submitted again.
+- **Legacy provenance.** A pre-Stage-28 build wrote only at settle points, so
+  its head-of-`pending` may already be on the portal. `#[serde(default)]` erases
+  the difference between an absent `in_flight` key and an explicit null, so
+  `CheckpointStore::load_with_provenance` inspects the raw JSON for key
+  PRESENCE, and `BatchCheckpoint::untracked_suspect` synthesizes that head as an
+  unconfirmed record — carried, excluded from the roster, never replayed.
+- Supporting: `mark_interrupted`, `never_attempted`, `blocks_start`,
+  `in_flight_record` and the in-flight synthesis in `unreconciled` in
+  `checkpoint.rs`; `put_back` in `queue.rs`; `recovered_line` and the refusal
+  text, which are the operator's whole interface to this.
+
+The crash instants this closes — what the durable file says if the process dies
+at each point, and what the next start does with it:
+
+| instant | file says | next start |
+| --- | --- | --- |
+| before the pre-send write | trainee still `pending` | never sent — safe to run |
+| after the pre-send write, before the send | trainee `in_flight` | refused / carried, never replayed — **over-reports, deliberately** |
+| during the portal round trip | trainee `in_flight` | as above |
+| during a retry backoff | trainee `in_flight` | as above |
+| result in hand, before the settle write | trainee `in_flight` | as above — the outcome is lost, the id is not |
+| during the abort drain | drained rows in `results`, remainder in `pending` | `never_attempted` restores batch order |
+| after the last settle, before the terminal write | status still `running` | refused once, then clean |
+
+So the file can only ever claim a submission that was never issued, never the
+reverse. That is the safe direction to be wrong in: the cost is a human checking
+the portal, not a second record.
+
+Verification:
+- cargo test — 133 passed, 0 failed
+  (30 checkpoint, 25 engine, 24 decision, 23 recovery, 13 store,
+  11 resolution/dedupe, 4 state, 3 queue)
+- cargo clippy --all-targets — clean
+- The end-to-end one:
+  `a_crash_on_disk_is_refused_and_its_trainee_is_never_requeued` drives a real
+  `CheckpointStore` through a batch that dies on its second submit, then reads
+  the file back through a second store and puts it through `recovery::guard`
+  both ways — the crash-window trainee is named, refused, and in no roster.
+- README.md: `DSSP_RESUME` and `DSSP_CHECKPOINT` in the env table, the exit-3
+  row, and a Recovery section.
+
+Errors:
+- None
+
+Deliberately not done (and why):
+- **A batch-scoped acknowledgement** (resume *this* batch, not whatever is in
+  the slot). `DSSP_RESUME` is an environment variable and so is process-wide;
+  the checkpoint path is per-job. Tying them together is a CLI-argument change,
+  and the gate's job is duplicates, not authority.
+- **Intersecting the resume roster with the job file.** A resume currently runs
+  every never-attempted trainee the checkpoint knows about, whether or not the
+  job file still lists them. Narrowing it would be a UX choice; carrying them
+  is strictly more useful than the alternative of writing them off, and the
+  partition invariant is what makes it safe.
+- **Archiving the predecessor file before a fresh start.** The carried records
+  already keep the information in the new file, which is more useful than a
+  write-only archive nothing reads.
+- The portal's own `duplicate|already logged` match remains a SECOND layer. It
+  is not what makes the crash window safe, and Stage 27 said so explicitly.
+
+Next:
+Stage 29 — Extension → Rust. Its bridge is a second start path: it must call
+`recovery::guard` before its own start, or it becomes the one way into the
+engine that skips this gate.
+```
+
 ## Migration Progress Summary
 
 ```text
-Completed:  24 / 40
+Completed:  25 / 40
 In Progress: 1   (38)
 Failed:      0
 Blocked:     3   (10, 15, 24)
