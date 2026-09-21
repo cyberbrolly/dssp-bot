@@ -133,9 +133,17 @@ impl CheckpointStore {
         // already submitted, which is a licence to submit it twice. Ignored
         // because a directory cannot be opened as a file everywhere, and the
         // rename has succeeded either way.
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
-        }
+        //
+        // `Path::parent` answers `Some("")` for a bare file name, and opening
+        // `""` fails — which the ignored error would hide, dropping this leg
+        // exactly when the CLI was handed a plain `job.json`. That is the
+        // invocation the README documents, so the path it produces is the one
+        // that most needs the sync. An empty parent means the working directory.
+        let parent = match self.path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
 
         Ok(())
     }

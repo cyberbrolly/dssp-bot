@@ -288,15 +288,15 @@ at each point, and what the next start does with it:
 | during a retry backoff | trainee `in_flight` | as above |
 | result in hand, before the settle write | trainee `in_flight` | as above — the outcome is lost, the id is not |
 | during the abort drain | drained rows in `results`, remainder in `pending` | `never_attempted` restores batch order |
-| after the last settle, before the terminal write | status still `running` | refused once, then clean |
+| after the last settle, before the terminal write | status still `running`, nothing in flight | starts clean, and reports what it recovered |
 
 So the file can only ever claim a submission that was never issued, never the
 reverse. That is the safe direction to be wrong in: the cost is a human checking
 the portal, not a second record.
 
 Verification:
-- cargo test — 133 passed, 0 failed
-  (30 checkpoint, 25 engine, 24 decision, 23 recovery, 13 store,
+- cargo test — 143 passed, 0 failed
+  (36 checkpoint, 27 engine, 25 recovery, 24 decision, 13 store,
   11 resolution/dedupe, 4 state, 3 queue)
 - cargo clippy --all-targets — clean
 - The end-to-end one:
@@ -307,8 +307,70 @@ Verification:
 - README.md: `DSSP_RESUME` and `DSSP_CHECKPOINT` in the env table, the exit-3
   row, and a Recovery section.
 
+Review pass (an adversarial panel — five independent lenses over the module,
+each finding then given to two skeptics told to refute it). It found one
+**critical** hole in the first draft of this stage's own gate, plus four smaller
+defects. They are listed first because they are the reason to trust the rest:
+
+- **The refusal erased the suspicion it refused over** (critical). `guard`
+  recorded the interruption by *saving* the file — and this build always
+  serializes `in_flight`, while provenance is the key's **presence**. So the
+  first refusal turned a legacy file into one that looked current. The follow-up
+  run the refusal itself recommends (`DSSP_RESUME=1`) then found no suspect and
+  put back into the roster the very trainee the dead build may already have sent.
+  Recording the kill destroyed the evidence for the refusal that recorded it.
+  Fixed by `promote_suspect`: the suspicion is moved into `in_flight` (and out of
+  `pending`, keeping the partition) *before* any write, so it is expressed in the
+  file's own fields and survives being rewritten. The regression test is
+  `refusing_a_legacy_file_does_not_erase_the_suspicion_it_refused_over`.
+- **A file that lost a trainee read as complete** (major). `untracked_suspect`
+  can only name the head of `pending`, so a legacy file killed on its last
+  trainee had nothing to suspect and nothing to carry — the trainee was in no
+  group at all, and `guard` never checked the one contradiction the file can
+  still testify to. Fixed by `unaccounted()`: `total` minus the three groups, and
+  a non-zero count blocks the start. It is a `saturating_sub` in the safe
+  direction — over-counting reads as zero, and a negative is not a trainee count.
+- **Liveness was doing work it no longer needed to** (major). `blocks_start`
+  blocked on `is_live()`, which was the right proxy before `in_flight` existed
+  but is now a false alarm on every ordinary kill-and-retry — and a gate an
+  operator learns to answer with `DSSP_RESUME=1` is one that stops being read.
+  It now blocks on what can actually be missing: an unconfirmed record, or counts
+  that do not add up. See the "removed safety net" note below.
+- **The refusal's counts did not add up** (minor, found twice). `settled()`
+  counted `Skipped` rows — never sent, and already counted as never-attempted —
+  so one row landed in two groups and the breakdown exceeded `total`, telling an
+  operator more submissions reached the portal than were attempted. `settled()`
+  now counts `Success | Failed` only.
+- **A deliberate "no" read as "yes"** (minor). `is_affirmative` treated
+  everything except `0`/`false`/`no` as consent, so `DSSP_RESUME=off` — and a
+  bare `DSSP_RESUME=`, which is what `DSSP_RESUME=$UNSET` produces — resumed.
+  Only an explicit `1`/`true`/`yes`/`on` resumes now. The asymmetry decides it: a
+  false yes can submit a trainee twice, a false no costs a re-run.
+- **The parent-directory fsync was skipped for a bare path** (major). `save`'s
+  durability leg opened `path.parent()`, which is `Some("")` for a directory-less
+  name; opening `""` fails and the ignored error hid it. That is exactly the
+  README's own invocation, `cargo run -- job.json` from the job's directory — so
+  the commit window's durability leg was missing where it is most used. An empty
+  parent now means the working directory.
+
+The net the liveness check used to be: removing it is only sound because the
+engine writes `in_flight` before `worker.send` on every path, and that write is
+fatal if it fails. If a future change ever issues a submit without a preceding
+in-flight write, this gate stops being sufficient — which is why that ordering is
+the thing Stage 33's integration test should assert, not just exercise.
+
 Errors:
-- None
+- The first adversarial pass found the critical hole above. Fixed, with a
+  regression test for each defect, rather than recorded and carried.
+
+Open for whoever reviews this stage:
+- **The removal of the liveness check is the one claim here that has not been
+  independently re-checked.** It rests on "every submit is preceded by a durable
+  in-flight write", which the round-one pass verified against the *pre-fix* tree.
+  A second adversarial pass over the fixed code was started and stopped before it
+  returned, so the fixes above are covered by tests and by reading, not by a
+  second panel. That pass should be run before Stage 33's gate, and its highest
+  value target is `blocks_start` no longer consulting `is_live()`.
 
 Deliberately not done (and why):
 - **A batch-scoped acknowledgement** (resume *this* batch, not whatever is in
@@ -320,9 +382,18 @@ Deliberately not done (and why):
   job file still lists them. Narrowing it would be a UX choice; carrying them
   is strictly more useful than the alternative of writing them off, and the
   partition invariant is what makes it safe.
-- **Archiving the predecessor file before a fresh start.** The carried records
-  already keep the information in the new file, which is more useful than a
-  write-only archive nothing reads.
+- **Carrying a predecessor's settled history into a fresh start.** A `Fresh`
+  start does discard the previous file's rows — that is what "fresh" means, and
+  carrying them would inflate the new batch's `total` with trainees it never ran
+  and report them as its own results. What the gate owes the operator instead is
+  the recovered line, which now prints and reports those counts before the
+  overwrite. The archive idea is declined on the same ground: the records worth
+  keeping are the unconfirmed ones, and those are carried, not archived.
+- **Making the parent-directory fsync fatal.** It is best-effort because a
+  directory cannot be opened as a file on every platform, and a fatal version
+  would stop every batch on one. The path bug above is fixed; the residual is
+  that on such a platform the rename's durability is not guaranteed, which is a
+  property of the platform rather than of this design.
 - The portal's own `duplicate|already logged` match remains a SECOND layer. It
   is not what makes the crash window safe, and Stage 27 said so explicitly.
 

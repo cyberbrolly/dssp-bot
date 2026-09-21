@@ -103,10 +103,10 @@ is a human checking the portal, not a second record.
 
 The next start reads that file first, before it connects to anything:
 
-- **Still owes an answer** — a submission that was in flight, was never
-  confirmed, or the file was left mid-run. The start is refused with the counts
-  and the two ways forward (exit 3), and the file is marked interrupted so the
-  next attempt is ordinary.
+- **May be missing a submission** — a submission that was in flight, a record
+  that was never confirmed, or counts that do not add up. The start is refused
+  with the counts and the ways forward (exit 3), and the file is marked
+  interrupted so the next attempt is ordinary.
 - **`DSSP_RESUME=1`** — continue it instead. The never-attempted trainees run;
   everything the predecessor recorded is carried forward into the new file so it
   stays whole. Nothing whose submission may already be on the portal is ever
@@ -115,7 +115,9 @@ The next start reads that file first, before it connects to anything:
   is still owed.
 - **Unreadable** — a corrupt file is not a file that says nothing ran. Refused,
   never treated as an empty slot.
-- **Nothing to reconcile** — the batch runs normally.
+- **Killed, but owing nothing** — a run that died between its last result and
+  its final write. Nothing is in doubt, so it starts clean and reports what it
+  recovered. Being killed is not by itself a reason to refuse.
 
 A checkpoint written by a build older than this stage has no record of what was
 in flight (older builds only wrote after a submission settled), so its first
@@ -133,7 +135,7 @@ rather than resumed.
 | `DSSP_NAV_TIMEOUT_MS` | `30000` | per-request timeout |
 | `DSSP_WORKER_PY` | `../python/.venv/bin/python` | worker interpreter |
 | `DSSP_CHECKPOINT` | `dssp.checkpoint.json` beside the job | where batch state is written |
-| `DSSP_RESUME` | unset | `1` = continue an interrupted batch instead of refusing |
+| `DSSP_RESUME` | unset | `1`/`true`/`yes`/`on` = continue an interrupted batch; anything else means no |
 
 ## Result & exit codes
 

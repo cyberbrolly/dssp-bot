@@ -178,13 +178,22 @@ pub fn resume_requested() -> bool {
     std::env::var(RESUME_ENV).is_ok_and(|value| is_affirmative(&value))
 }
 
-/// Set-but-empty counts as on — `DSSP_RESUME= ` is a person meaning yes — while
-/// an explicit `0`/`false`/`no` is the way to say no to a wrapper script that
-/// exports it.
+/// Whether a value of [`RESUME_ENV`] is the operator saying yes.
+///
+/// Only an explicit affirmative counts. The gate exists to stop a run that could
+/// resubmit a trainee, so an unrecognised value has to mean no: `DSSP_RESUME=off`
+/// and a bare `DSSP_RESUME=` — which is what `DSSP_RESUME=$SOMETHING_UNSET`
+/// produces — are each far more likely to be somebody declining, or a wrapper's
+/// empty variable, than a considered yes. Reading either as consent is the one
+/// mistake this module cannot afford, and the cost of the stricter reading is
+/// only that a run is refused that would have been safe.
+///
+/// The asymmetry is the whole argument: a false yes can put a trainee on the
+/// portal twice, a false no costs a re-run.
 pub fn is_affirmative(value: &str) -> bool {
-    !matches!(
+    matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "no"
+        "1" | "true" | "yes" | "on"
     )
 }
 
@@ -212,7 +221,7 @@ fn by_id(id: &str) -> TraineeRef {
 ///
 /// The never-attempted rows are deliberately absent: those are the roster, and a
 /// trainee in both groups would be queued twice and reported twice.
-fn carried(previous: &BatchCheckpoint, suspect: Option<TrainingResult>) -> Vec<TrainingResult> {
+fn carried(previous: &BatchCheckpoint) -> Vec<TrainingResult> {
     let mut records: Vec<TrainingResult> = previous
         .results
         .iter()
@@ -220,22 +229,31 @@ fn carried(previous: &BatchCheckpoint, suspect: Option<TrainingResult>) -> Vec<T
         .cloned()
         .collect();
 
+    // The suspect needs no separate argument: `guard` promotes it into
+    // `in_flight` before calling, precisely so that there is one answer to "what
+    // was left in the air?" rather than two that can disagree.
     records.extend(previous.in_flight_record());
-    records.extend(suspect);
 
     records
 }
 
-/// Records in `results` that are not unconfirmed.
+/// Records in `results` that were submitted and reached a conclusion.
 ///
-/// Not `results.len() - unconfirmed.len()`: the in-flight trainee is synthesized
-/// into the unconfirmed group without ever being in `results`, so subtracting
-/// that count would under-report what actually settled — sometimes to zero, for
-/// a batch whose only result landed.
+/// Not "everything that is not unconfirmed". A `Skipped` row was drained after
+/// an abort, so it was never sent — and [`BatchCheckpoint::never_attempted`]
+/// already counts it as work still to do. Counting it here as well would put one
+/// row in two groups: the refusal's breakdown would exceed `total`, and it would
+/// tell an operator that more submissions reached the portal than were ever
+/// attempted, in the single message they base a portal check on.
+///
+/// Also not `results.len() - unconfirmed.len()`: the in-flight trainee is
+/// synthesized into the unconfirmed group without ever being in `results`, so
+/// subtracting that count would under-report what settled — sometimes to zero,
+/// for a batch whose only result landed.
 fn settled(cp: &BatchCheckpoint) -> usize {
     cp.results
         .iter()
-        .filter(|result| result.outcome != Outcome::Indeterminate)
+        .filter(|result| matches!(result.outcome, Outcome::Success | Outcome::Failed))
         .count()
 }
 
@@ -258,7 +276,16 @@ fn refusal(
         .count();
     let unconfirmed = unreconciled.indeterminate.len();
 
-    let action = if never > 0 {
+    let unaccounted = previous.unaccounted();
+
+    let action = if unaccounted > 0 {
+        // Not the resume advice: continuing would not tell the operator anything
+        // about whoever is missing, and the message must not imply it would.
+        format!(
+            "the counts are short by {unaccounted} — check the portal before deciding anything; \
+             a resume will not run them"
+        )
+    } else if never > 0 {
         format!(
             "re-run with {RESUME_ENV}=1 to continue the {never} never-attempted trainee(s); \
              nothing unconfirmed is replayed"
@@ -286,23 +313,20 @@ fn refusal(
     )
 }
 
-/// Why the file cannot simply be overwritten. Four cases, and the difference
-/// matters to whoever has to look: a named trainee is a lookup, a count is a
-/// search, a file too old to say who was in flight is a warning that its own
-/// queue is not the evidence it looks like, and a kill with nothing unconfirmed
-/// is a warning that the counts themselves may be short.
+/// Why the file cannot simply be overwritten. Each case matters differently to
+/// whoever has to look: a named trainee is a lookup, a count is a search, a file
+/// too old to say who was in flight is a warning that its own queue is not the
+/// evidence it looks like, and a file whose counts do not add up is a warning
+/// that something is missing that the file cannot even name.
 fn reason(
     previous: &BatchCheckpoint,
     unreconciled: &Unreconciled,
     suspect: Option<&TrainingResult>,
 ) -> String {
-    if let Some(id) = &previous.in_flight {
-        return format!(
-            "the process was killed while submitting {id} — that submission may have reached \
-             the portal"
-        );
-    }
-
+    // Ahead of the in-flight branch, because `guard` promotes the suspect into
+    // `in_flight` before this is called: without the ordering it would be
+    // described as an ordinary crash window, and the operator would lose the one
+    // fact that changes how much the rest of the file can be trusted.
     if let Some(record) = suspect {
         return format!(
             "the file was written by a build that could not record a submission in flight, so \
@@ -311,16 +335,37 @@ fn reason(
         );
     }
 
-    if !unreconciled.indeterminate.is_empty() {
+    if let Some(id) = &previous.in_flight {
         return format!(
-            "{} submission(s) may already exist on the portal — check them there before going on",
-            unreconciled.indeterminate.len()
+            "the process was killed while submitting {id} — that submission may have reached \
+             the portal"
         );
     }
 
-    "the process that wrote it was killed, so a trainee it had just taken from the queue may be \
-     missing from these counts"
-        .to_string()
+    if previous.unaccounted() > 0 {
+        return format!(
+            "it accounts for {} of its {} trainee(s), so {} cannot be placed at all — check the \
+             portal for whoever is missing",
+            previous.total - previous.unaccounted(),
+            previous.total,
+            previous.unaccounted(),
+        );
+    }
+
+    // Reachable only with an unconfirmed record that is not an in-flight one:
+    // `blocks_start` refuses over `has_unconfirmed` (an in-flight trainee, or an
+    // `Indeterminate` row, both handled above) or over a count that does not add
+    // up. Liveness alone no longer blocks, which is why the "the process was
+    // killed, so a trainee may be missing" wording this branch replaced is gone.
+    debug_assert!(
+        !unreconciled.indeterminate.is_empty(),
+        "a file with nothing unconfirmed and nothing unaccounted cannot be blocked"
+    );
+
+    format!(
+        "{} submission(s) may already exist on the portal — check them there before going on",
+        unreconciled.indeterminate.len()
+    )
 }
 
 /// A predecessor was found and reconciled: its records are all still there.
@@ -449,6 +494,7 @@ mod tests {
         let scratch = Scratch::new("settled");
         let store = scratch.store();
         let mut done = unfinished(CheckpointStatus::Finished);
+        done.total = 2;
         done.results = vec![result("1", Outcome::Success), result("2", Outcome::Failed)];
         done.pending = Vec::new();
         store.save(&done).expect("saves");
@@ -491,24 +537,128 @@ mod tests {
     }
 
     /// A file left live but owing nothing — the process died between its last
-    /// settle and the terminal write. Refusing once is right, because a live
-    /// file's own counts cannot be trusted until it is marked; the mark is what
-    /// keeps the next start from refusing for a reason that no longer holds.
+    /// settle and the terminal write. Nothing in it is in doubt: `in_flight` is
+    /// empty, so no submission was outstanding when it died. It therefore starts
+    /// clean, and says what it recovered rather than making the operator
+    /// acknowledge a file that has nothing to acknowledge.
+    ///
+    /// Liveness alone used to block this, which made the gate cry wolf on every
+    /// ordinary kill-and-retry — and a gate an operator learns to answer with
+    /// `DSSP_RESUME=1` is one that stops being read.
     #[test]
-    fn a_live_file_that_owes_nothing_is_refused_once_and_then_starts_clean() {
-        let scratch = Scratch::new("refuse-once");
+    fn a_live_file_that_owes_nothing_starts_clean_and_says_what_it_recovered() {
+        let scratch = Scratch::new("live-nothing-owed");
         let store = scratch.store();
         let mut cp = unfinished(CheckpointStatus::Running);
+        cp.total = 2;
         cp.results = vec![result("1", Outcome::Success), result("2", Outcome::Success)];
         cp.pending = Vec::new();
         store.save(&cp).expect("saves");
 
-        assert!(guard(&store, false).is_err(), "still live when it was read");
-
-        let start = guard(&store, false).expect("the mark is on disk now");
+        let start = guard(&store, false).expect("nothing is in doubt");
 
         assert_fresh(&start);
-        assert!(!start.recovered, "and there is no second mark to record");
+        assert!(start.recovered, "but the kill is still recorded and reported");
+
+        // And the mark is durable, so the next start is an ordinary one.
+        let after = CheckpointStore::new(store.path()).load().expect("reads").expect("there");
+        assert_eq!(after.status, CheckpointStatus::Interrupted);
+    }
+
+    /// The regression for the hole this gate had: the refusal's own write used
+    /// to erase the evidence it had just refused over.
+    ///
+    /// A file from a build without in-flight tracking says what it knows by
+    /// *omitting* the key, and every write from this build adds it. So the
+    /// refusal — which rewrites the file to record the interruption — turned a
+    /// legacy file into one that looked current, and the follow-up run the
+    /// refusal itself recommends then found no suspect and put the trainee the
+    /// dead build may already have sent back into the roster.
+    #[test]
+    fn refusing_a_legacy_file_does_not_erase_the_suspicion_it_refused_over() {
+        let scratch = Scratch::new("legacy-survives");
+        let store = scratch.store();
+        let mut cp = unfinished(CheckpointStatus::Running);
+        cp.total = 3;
+        cp.results = vec![result("1", Outcome::Success)];
+        cp.pending = vec!["2".to_string(), "3".to_string()];
+        cp.in_flight = None;
+        store.save(&cp).expect("saves");
+
+        // Written by this build, the file carries the key; strip it so the file
+        // is what a pre-Stage-28 build would have left.
+        let text = std::fs::read_to_string(store.path()).expect("reads");
+        let raw: serde_json::Value = serde_json::from_str(&text).expect("parses");
+        let mut object = raw.as_object().expect("an object").clone();
+        object.remove("in_flight");
+        std::fs::write(
+            store.path(),
+            serde_json::to_string(&serde_json::Value::Object(object)).expect("serializes"),
+        )
+        .expect("writes");
+
+        // Run 1: refused, and the refusal records the interruption.
+        let refusal = guard(&store, false).expect_err("a legacy file with a queue is refused");
+        assert!(refusal.contains("could not record a submission in flight"), "{refusal}");
+        assert!(refusal.contains('2'), "and it names the trainee: {refusal}");
+
+        // Run 2, exactly as the refusal advises: trainee 2 must not be run.
+        let start = guard(&store, true).expect("the override");
+        let Plan::Resume { roster, carried, owed } = start.plan else {
+            panic!("expected a resume");
+        };
+
+        let ids: Vec<&str> = roster.iter().filter_map(|r| r.id.as_deref()).collect();
+        assert_eq!(ids, vec!["3"], "only the trainee the dead build never reached");
+        assert!(carried.iter().any(|r| r.trainee_id == "2"), "2 is carried, not run");
+        assert_eq!(owed, 1, "and it is still owed an answer");
+    }
+
+    /// A file that lost a trainee outright — its counts do not add up, and
+    /// nothing in it says who is missing. That is reason enough to refuse on its
+    /// own, because the file cannot testify to its own completeness.
+    #[test]
+    fn a_file_that_lost_a_trainee_refuses_a_start() {
+        let scratch = Scratch::new("unaccounted");
+        let store = scratch.store();
+        let mut cp = unfinished(CheckpointStatus::Interrupted);
+        cp.total = 4;
+        cp.results = vec![result("1", Outcome::Success)];
+        cp.pending = Vec::new();
+        cp.in_flight = None;
+        store.save(&cp).expect("saves");
+
+        let refusal = guard(&store, false).expect_err("it accounts for 1 of 4");
+        assert!(refusal.contains("accounts for 1 of its 4"), "{refusal}");
+        assert!(refusal.contains("check the portal"), "{refusal}");
+
+        // A resume is still allowed — it runs nothing outside `never_attempted`,
+        // so it cannot resubmit whoever is missing — but it must not pretend the
+        // file is whole.
+        let start = guard(&store, true).expect("safe to continue what it does know");
+        let Plan::Resume { roster, .. } = start.plan else {
+            panic!("expected a resume");
+        };
+
+        assert!(roster.is_empty(), "there was nothing left to attempt");
+    }
+
+    /// `DSSP_RESUME` is set by hand, often from a shell history entry — and
+    /// often from a variable that turns out to be empty. Only an explicit yes
+    /// resumes, because a false yes can submit a trainee twice and a false no
+    /// only costs a re-run.
+    #[test]
+    fn only_an_explicit_yes_counts_as_yes() {
+        for on in ["1", "true", "yes", "on", "TRUE", " yes ", "On"] {
+            assert!(is_affirmative(on), "{on:?} should be on");
+        }
+
+        for off in [
+            "0", "false", "no", "FALSE", " 0 ", "No", // the documented negatives
+            "", "  ", "off", "disabled", "none", "n", "y", "2", "maybe",
+        ] {
+            assert!(!is_affirmative(off), "{off:?} should be off");
+        }
     }
 
     /// Lossless: the mark rewrites the status, never the record. Anything else
@@ -872,18 +1022,5 @@ mod tests {
         assert!(line.contains("1 unconfirmed"), "{line}");
         assert!(line.contains("2 never attempted"), "{line}");
         assert!(line.contains("of 4"), "{line}");
-    }
-
-    /// `DSSP_RESUME` is set by hand, often from a shell history entry, so an
-    /// explicit off has to work.
-    #[test]
-    fn only_an_explicit_off_counts_as_no() {
-        for on in ["1", "true", "yes", "on", "", " 1 "] {
-            assert!(is_affirmative(on), "{on:?} should be on");
-        }
-
-        for off in ["0", "false", "no", "FALSE", " 0 ", "No"] {
-            assert!(!is_affirmative(off), "{off:?} should be off");
-        }
     }
 }

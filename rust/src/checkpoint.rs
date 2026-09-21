@@ -573,7 +573,9 @@ mod tests {
     /// A reconciled batch whose records all landed owes nothing, so its slot may
     /// be reused without ceremony.
     #[test]
-    fn a_finished_batch_of_settled_records_does_not_block_a_start() {        let mut cp = checkpoint(CheckpointStatus::Finished);
+    fn a_finished_batch_of_settled_records_does_not_block_a_start() {
+        let mut cp = checkpoint(CheckpointStatus::Finished);
+        cp.total = 3;
         cp.results = vec![
             result("1", Outcome::Success),
             result("2", Outcome::Failed),
@@ -589,10 +591,91 @@ mod tests {
     #[test]
     fn never_attempted_trainees_alone_do_not_block_a_start() {
         let mut cp = checkpoint(CheckpointStatus::Interrupted);
+        cp.total = 3;
         cp.results = vec![result("1", Outcome::Success), result("2", Outcome::Skipped)];
         cp.pending = vec!["3".to_string()];
 
         assert!(!cp.blocks_start());
+    }
+
+    // -- counts that do not add up ------------------------------------------
+
+    /// Every trainee is in exactly one of `results`, `pending` and `in_flight`,
+    /// so anything less than `total` means one has gone missing — and a file
+    /// that cannot place a trainee cannot be trusted to be complete either.
+    #[test]
+    fn a_file_that_does_not_account_for_every_trainee_blocks_a_start() {
+        let mut cp = checkpoint(CheckpointStatus::Finished);
+        cp.results = vec![result("1", Outcome::Success), result("2", Outcome::Success)];
+        cp.pending = Vec::new();
+        cp.in_flight = None;
+
+        assert_eq!(cp.unaccounted(), 2);
+        assert!(cp.blocks_start(), "two of its four trainees are in no group");
+    }
+
+    /// The counterweight, so the check cannot be satisfied by blocking always.
+    #[test]
+    fn a_file_that_accounts_for_every_trainee_does_not_block_on_that_ground() {
+        assert_eq!(checkpoint(CheckpointStatus::Finished).unaccounted(), 0);
+        assert_eq!(interrupted_mid_submission().unaccounted(), 0);
+    }
+
+    /// Over-counting is as untrustworthy as under-counting, and a negative is
+    /// not a number of trainees.
+    #[test]
+    fn a_file_that_over_counts_reports_nothing_unaccounted() {
+        let mut cp = checkpoint(CheckpointStatus::Finished);
+        cp.total = 1;
+
+        assert_eq!(cp.unaccounted(), 0);
+    }
+
+    // -- promoting an untracked file's suspicion ----------------------------
+
+    /// The regression this exists for: recording the suspicion is a *write*, and
+    /// every write this build makes adds the `in_flight` key that a legacy
+    /// file's evidence consists of not having. Promoting puts the fact into the
+    /// file's own fields first, so it survives being rewritten.
+    #[test]
+    fn promoting_a_suspect_moves_it_out_of_the_queue_and_into_flight() {
+        let mut cp = checkpoint(CheckpointStatus::Running);
+        cp.in_flight = None;
+        let before = cp.unaccounted();
+
+        assert!(cp.promote_suspect("3"));
+
+        assert_eq!(cp.in_flight.as_deref(), Some("3"));
+        assert_eq!(cp.pending, vec!["4".to_string()], "and it left the queue");
+        assert_eq!(cp.unaccounted(), before, "the partition holds across it");
+        assert!(
+            !cp.never_attempted().contains(&"3".to_string()),
+            "so a resume cannot run it"
+        );
+    }
+
+    /// A real in-flight record is direct evidence; a suspicion inferred from a
+    /// queue is not, and must never displace it.
+    #[test]
+    fn promoting_a_suspect_never_displaces_a_real_in_flight_record() {
+        let mut cp = interrupted_mid_submission();
+
+        assert!(!cp.promote_suspect("3"));
+        assert_eq!(cp.in_flight.as_deref(), Some("2"));
+        assert_eq!(cp.pending, vec!["3".to_string(), "4".to_string()]);
+    }
+
+    /// Nothing to promote, nothing changes — the caller uses this to decide
+    /// whether a write is needed at all.
+    #[test]
+    fn promoting_a_trainee_that_is_not_queued_changes_nothing() {
+        let mut cp = checkpoint(CheckpointStatus::Running);
+        cp.in_flight = None;
+        let before = cp.clone();
+
+        assert!(!cp.promote_suspect("99"));
+        assert_eq!(cp.pending, before.pending);
+        assert_eq!(cp.in_flight, before.in_flight);
     }
 
     // -- files from a build without in-flight tracking ----------------------
