@@ -80,9 +80,15 @@ Progress goes to stderr; the JSON `BatchReport` goes to stdout.
 | exit | meaning |
 | ---: | ------- |
 | 0 | every trainee recorded |
+| 1 | the run never got as far as submitting: the worker would not launch, or the session gate failed |
 | 2 | the batch could not be resolved — nothing was submitted |
 | 3 | needs a human: a start refused over an unfinished batch, an indeterminate submission, or a batch aborted mid-run |
 | 4 | definitive failures, safe to re-run |
+
+Exit 1 is the coordinator failing to get going, and it prints no `RESULT:` line —
+only a `dssp-bot:` line on stderr. In a *batch* the same session-gate failure
+exits 3 rather than 1 (the batch path treats a lapsed session as something a
+human has to clear, not as a startup failure). Either way nothing was submitted.
 
 In a batch, exit 4 also covers **already-logged** trainees: a `duplicate` is
 recorded against that row as a failure, so exit 4 means "something needed
@@ -147,6 +153,11 @@ The coordinator prints one line to stdout (progress/logs go to stderr):
 | `HALT: indeterminate …` | 3 | **submitted but unconfirmed — verify on the portal, do not re-run blindly** |
 | `HALT: SESSION_EXPIRED …` | 3 | session lapsed / portal changed — stop |
 | `FAILED: rejected …` / `FAILED: TRAINEE_NOT_FOUND …` | 4 | definitive failure, no retry |
+
+No row here exits 1: that code means the coordinator never reached a submission
+(worker would not launch, or the session gate failed before the submit loop), so
+there is no classified line to print. A session that lapses *mid-run* is a
+`HALT: SESSION_EXPIRED` and exits 3, as above.
 
 ## Safety
 

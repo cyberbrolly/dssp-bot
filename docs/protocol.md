@@ -49,9 +49,10 @@ or
   never retries, never resubmits, never decides retryability.
 - `proves_nothing_submitted` is a hint computed from the error code (see table).
   When `true`, the failure occurred before anything could reach the portal, so
-  re-invoking the op is safe. When `false` (e.g. `NETWORK`, `TIMEOUT`), the
-  request may have landed — Rust must treat it like an indeterminate outcome,
-  not a clean failure.
+  re-invoking the op is safe. When `false` (e.g. `NETWORK`, `TIMEOUT`,
+  `PORTAL_UNAVAILABLE`), the request may have landed — Rust must treat it like an
+  indeterminate outcome, not a clean failure. "The portal did not answer" is not
+  the same as "the portal did not receive it".
 - `submit_training` commits **at most once** per invocation. It performs
   prepare (GET + parse) → commit (single POST) → classify, and reports the
   classified outcome. It is never re-invoked for the same trainee by Rust
@@ -133,7 +134,7 @@ Mirrors the legacy extension's `ErrorCode` taxonomy, plus protocol-level codes.
 | `ELEMENT_NOT_FOUND` | portal selector missing | true |
 | `TIMEOUT` | operation timed out (may have landed) | false |
 | `NETWORK` | transport failure (may have landed) | false |
-| `PORTAL_UNAVAILABLE` | portal unreachable | true |
+| `PORTAL_UNAVAILABLE` | portal unreachable | false |
 | `SESSION_EXPIRED` | login page / login timeout | true |
 | `TRAINEE_NOT_FOUND` | no match, or **ambiguous name** | true |
 | `MISSING_DATA` | required data absent | true |
@@ -145,6 +146,16 @@ Mirrors the legacy extension's `ErrorCode` taxonomy, plus protocol-level codes.
 | `SUBMISSION_FAILED` | unexpected worker failure | false |
 | `BAD_REQUEST` | malformed protocol request | true |
 | `UNKNOWN_OP` | unrecognized `op` | true |
+
+`BAD_REQUEST` and `UNKNOWN_OP` are protocol-level: they are raised before the
+op reaches the browser, so they can never have touched the portal.
+
+This table is the *contract*; the implementation is `_PROVES_NOTHING` in
+`python/app/protocol.py` (mirroring `provesNothingSubmitted` in
+`AutomationEngine.ts`). `PORTAL_UNAVAILABLE` reads `false` in both, and the table
+said `true` until Stage 38 — a doc bug in a safety-critical direction, since
+`decision.rs` retries only what proves nothing was submitted, so the documented
+value would have licensed a retry the code correctly refuses.
 
 ## Safety rules enforced by this protocol
 

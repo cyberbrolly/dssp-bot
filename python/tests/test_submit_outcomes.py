@@ -198,3 +198,25 @@ def test_bad_instructor_value_is_validation_error(client):
     with pytest.raises(e.PortalError) as info:
         client.submit_training({"id": "123"}, session(instructor="Charlie"))
     assert info.value.error_code == "VALIDATION_FAILED"
+
+
+# -- live-gate evidence dump (DSSP_DUMP_DIR) --------------------------------
+def test_a_read_dumps_the_raw_list_when_asked(client, tmp_path, monkeypatch):
+    """The Stage 10 diagnostic: the operator needs the portal's own HTML to see
+    whether the list came back whole and whether the rows parse as assumed."""
+    monkeypatch.setenv("DSSP_DUMP_DIR", str(tmp_path))
+
+    client.list_trainees()
+
+    assert "John Doe" in (tmp_path / "trainee-list.html").read_text()
+
+
+def test_a_submit_dumps_the_response_body_when_asked(client, tmp_path, monkeypatch):
+    """The classify-by-text path is the one a crash window leans on: "duplicate"
+    is a match on this body, so the real wording is worth capturing verbatim."""
+    monkeypatch.setenv("DSSP_DUMP_DIR", str(tmp_path))
+
+    client.submit_training({"id": "456"}, session())
+
+    dumped = (tmp_path / "submit-response-456.html").read_text()
+    assert "already logged" in dumped

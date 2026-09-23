@@ -110,11 +110,14 @@ class PortalClient:
             time.sleep(1.0)
 
     # -- reads --------------------------------------------------------------
-    def _get(self, url: str):
+    def _get(self, url: str, evidence: str = ""):
         """GET through the context request API so it carries the login cookies.
 
         Returns (soup, final_url, body, status). Raises SESSION_EXPIRED when the
-        portal answers with the login page, mirroring the old loadDocument."""
+        portal answers with the login page, mirroring the old loadDocument.
+
+        `evidence` names the raw body for a live-gate dump (see `_dump`); empty
+        means this read is not dumped."""
         self.start()
         assert self._context is not None
         try:
@@ -124,6 +127,10 @@ class PortalClient:
             raise e.network(f"GET {url} failed: {exc}") from exc
 
         final_url = resp.url
+        # Dumped before the checks below, not after: a login page or an error
+        # body is exactly what an operator needs to see when the run fails.
+        if evidence:
+            self._dump(evidence, body, final_url)
         soup = parse.parse_html(body)
 
         # Login check comes first: a lapsed session often 200s to the login page.
@@ -135,8 +142,41 @@ class PortalClient:
 
         return soup, final_url, body, resp.status
 
+    def _dump(self, name: str, body: str, source: str) -> None:
+        """Write a raw portal response to `DSSP_DUMP_DIR`, when set.
+
+        Off unless an operator asks for it, and never load-bearing: a dump that
+        fails logs and returns, because evidence gathering must not be able to
+        fail a submission.
+
+        The body is the portal's own bytes, unredacted — it can carry trainee
+        data and, on a form, the antiforgery token. It therefore goes to a
+        gitignored directory, never to stdout (protocol lines only) and never
+        into the log: the log gets the path, not the content.
+        """
+        target = c.dump_dir()
+        if not target:
+            return
+
+        try:
+            directory = Path(target)
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / name
+            # errors="replace": a body that is not valid UTF-8 (a lone surrogate
+            # from a mislabelled charset) must still be dumped rather than
+            # raising — UnicodeEncodeError is a ValueError, not an OSError, so it
+            # would slip past the handler below and fail the submission.
+            path.write_text(body, encoding="utf-8", errors="replace")
+        except (OSError, ValueError) as exc:
+            log.warning("could not dump %s: %s", source, exc)
+            return
+
+        log.info("dumped %s → %s", source, path)
+
     def list_trainees(self) -> list[dict]:
-        soup, _url, _body, _status = self._get(c.TRAINEE_LIST_URL)
+        soup, _url, _body, _status = self._get(
+            c.TRAINEE_LIST_URL, evidence="trainee-list.html"
+        )
         return parse.get_trainees(soup)
 
     def get_form_options(self, trainee_id: Optional[str] = None) -> dict:
@@ -150,7 +190,10 @@ class PortalClient:
                 raise e.missing_data("a trainee to load form options")
             trainee_id = trainees[0]["id"]
 
-        soup, _url, _body, _status = self._get(c.training_form_url(trainee_id))
+        soup, _url, _body, _status = self._get(
+            c.training_form_url(trainee_id),
+            evidence=f"training-form-{trainee_id}.html",
+        )
         return {"trainee_id": trainee_id, **parse.get_form_options(soup)}
 
     # -- submit -------------------------------------------------------------
@@ -190,7 +233,8 @@ class PortalClient:
         resolved = self._resolve_trainee(trainee)
 
         soup, form_url, _body, _status = self._get(
-            c.training_form_url(resolved["id"])
+            c.training_form_url(resolved["id"]),
+            evidence=f"training-form-{resolved['id']}.html",
         )
         form, payload = parse.build_form_payload(soup, session)
 
@@ -215,6 +259,10 @@ class PortalClient:
             ) from exc
 
         body = resp.text()
+        # The response to a real POST is the one piece of evidence worth having:
+        # "duplicate" is a text match on this body (see submission_outcome), and
+        # the crash-window safety argument leans on that match being right.
+        self._dump(f"submit-response-{resolved['id']}.html", body, resp.url)
         redirected = resp.url != action
         outcome = parse.submission_outcome(body, resp.url, resp.status, redirected)
 

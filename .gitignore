@@ -9,6 +9,9 @@ __pycache__/
 python/.pw-profile/
 python/.auth/
 
+# Live-gate evidence dumps (raw portal HTML: trainee data + antiforgery tokens)
+python/.evidence/
+
 # Rust
 rust/target/
 

@@ -75,3 +75,13 @@ PROFILE_DIR = os.environ.get("DSSP_PROFILE_DIR") or str(_PYTHON_ROOT / ".pw-prof
 HEADLESS = _flag("DSSP_HEADLESS", "0")
 LOGIN_TIMEOUT_MS = int(os.environ.get("DSSP_LOGIN_TIMEOUT_MS", "300000"))
 NAV_TIMEOUT_MS = int(os.environ.get("DSSP_NAV_TIMEOUT_MS", "30000"))
+
+
+def dump_dir() -> str | None:
+    """Where to write raw portal evidence, when ``DSSP_DUMP_DIR`` is set.
+
+    A live-run diagnostic and nothing else: unset is the normal case, and no
+    part of the run depends on it. Read per use rather than at import so one run
+    (or one test) can turn it on without re-importing the module.
+    """
+    return os.environ.get("DSSP_DUMP_DIR") or None

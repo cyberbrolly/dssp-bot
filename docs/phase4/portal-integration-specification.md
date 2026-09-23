@@ -2,9 +2,12 @@
 
 Status: **training form mapped**
 
-This document must be completed before `DSSPPortalAdapter` is implemented. Do
-not write selectors into code that are not recorded here first. Every entry
-needs a primary selector plus the evidence it was observed on a real page.
+This document is the record of what was mapped on the real portal. Where the
+implementation went beyond it, or where a section has not been observed at all,
+the gap is recorded here rather than left implicit — a rule that is silently
+ignored trains everyone to ignore the rest of the document. Every entry needs a
+primary selector plus the evidence it was observed on a real page; an entry that
+has not been observed says so.
 
 ## Selector rules
 
@@ -13,8 +16,8 @@ role, stable class, semantic relationship to a labelled element. Do not use
 positional selectors such as `nth-child` chains.
 
 Record every selector in this table and mirror it into
-`src/core/infrastructure/portal/` only. No selector may appear anywhere else in
-the codebase.
+`src/core/infrastructure/portal/` (legacy TypeScript) and `python/app/portal/`
+(the port) only. No selector may appear anywhere else in the codebase.
 
 ## 1. Portal identity
 
@@ -32,23 +35,45 @@ the codebase.
 | Item                    | Selector                         | Notes                                                    |
 | ----------------------- | -------------------------------- | -------------------------------------------------------- |
 | List container          | `table.table-checkable tbody`    | Server-rendered table body                               |
-| Trainee row             | `table.table-checkable tbody tr` | Current page only                                        |
+| Trainee row             | `table.table-checkable tbody tr` | The whole list, via the `pgsize` request in §3            |
 | Trainee ID within row   | `a[href*="TraineeId"]`           | Extract `TraineeId` query parameter from the delete link |
-| Trainee name within row | Third `td`                       | Column index 2                                           |
+| Trainee name within row | Third `td`                       | Column index 2 — see the exception below                 |
 | Link to trainee detail  |                                  | Delete URL is retained as the current row URL            |
-| Empty-list indicator    |                                  |                                                          |
+| Empty-list indicator    | —                                | none: zero parsed rows and "the portal has no trainees" are the same value, so an unrendered page reads as an empty list |
+
+Two behaviours of the row read are recorded here because they fail silently:
+
+- **A row the parser cannot identify is dropped, not reported.** `get_trainees`
+  skips any row whose link yields no numeric `TraineeId`
+  (`python/app/portal/parsing.py:88`). A changed href shape therefore removes a
+  trainee from the list entirely, and the batch reports `TRAINEE_NOT_FOUND` for
+  someone who is on the portal.
+- **The name is read positionally** (`cells[2]`), which the selector rules above
+  forbid. It is recorded rather than used quietly: the row offers no stable
+  per-cell hook, so the read breaks if the portal inserts a column.
+  `_cell_text` (`parsing.py:66`) returns an empty string for a missing index
+  rather than raising, so a shifted table yields a blank name — which surfaces as
+  `TRAINEE_NOT_FOUND` on a name match, not as a crash.
 
 ## 3. Pagination and navigation
 
 | Item                  | Selector | Notes                           |
 | --------------------- | -------- | ------------------------------- |
-| Next page control     |          |                                 |
-| Page indicator        |          |                                 |
-| Total count indicator |          |                                 |
-| Behaviour             |          | Full reload or in-place update? |
+| Next page control     | —        | not used; see decision below    |
+| Page indicator        | —        | not used                        |
+| Total count indicator | —        | taken from the response, not a selector: `list_trainees` returns `count` for the rows it parsed, while the portal's own page displays its total |
+| Behaviour             | —        | one authenticated GET of the list URL; the worker does not click through pages |
 
-TODO: `getTrainees` currently reads only the visible page. Decide whether to
-automate pagination or increase the portal's records-per-page setting.
+**Decision (taken in code; recorded here at Stage 38).** Pagination is avoided
+rather than implemented. `TRAINEE_LIST_URL` requests
+`/Trainee?pgsize=10000&page=1&keywords=` (`python/app/portal/constants.py:25`),
+so one request is expected to return the whole list.
+
+The failure this carries is silent: if the portal caps `pgsize`, the list comes
+back **truncated without an error**, and a trainee who plainly exists is reported
+as `TRAINEE_NOT_FOUND`. The check is to compare the parsed `count` against the
+total the portal displays on the same page — a mismatch is truncation. Capturing
+both counts is a required output of the Stage 10 read-only run.
 
 ## 4. Training form
 
@@ -81,9 +106,14 @@ clicked button is not confirmation.
 
 | Item                       | Selector or signal | Observed duration |
 | -------------------------- | ------------------ | ----------------- |
-| Page loading indicator     |                    |                   |
-| Form submission spinner    |                    |                   |
-| Slowest observed operation |                    |                   |
+| Page loading indicator     | none — the worker waits on Playwright navigations, not on a spinner selector | not observed |
+| Form submission spinner    | none — the submission is a `fetch` whose response is read directly, so no spinner is awaited | not observed |
+| Slowest observed operation | n/a | not observed; bounded by `DSSP_NAV_TIMEOUT_MS` (30 s) per navigation and `DSSP_LOGIN_TIMEOUT_MS` (300 s) for the manual login |
+
+Nothing here has been observed against the real portal — the live run
+(Stages 10/15/24) has not happened. Each row is recorded as "none / not observed"
+rather than left blank so the absence is a fact someone can act on: if the real
+portal does gate on a spinner, this is the section that says nobody has looked.
 
 ## 7. Open questions
 

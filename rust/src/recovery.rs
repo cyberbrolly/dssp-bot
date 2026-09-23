@@ -8,8 +8,11 @@
 //!
 //! The decision is a function rather than a rule inside `run_batch` so it can be
 //! tested without a worker, a portal or a batch. Stage 29's extension bridge is
-//! a second start path and must call [`guard`] before its own, or it will be the
-//! one way into the engine that skips this.
+//! a second start path and must call [`guard`] before its own — not because it
+//! would otherwise be the only way in that skips this (it would not: `run_single`
+//! is one already, deliberately — it submits once, keeps no durable state, and
+//! warns before it submits instead), but because any path that can *overwrite*
+//! the slot has to read it first, and the daemon can.
 
 use std::path::Path;
 

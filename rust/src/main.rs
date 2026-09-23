@@ -310,6 +310,18 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
     }
 
     // 3. Submit one trainee. Rust owns retry; the same job_id spans attempts.
+    //
+    // Said once, before the loop rather than on each attempt: nothing below this
+    // line is durable, so from the first send onward a death that reports no
+    // result is a death that cannot say whether the portal took the record. One
+    // line covers every attempt, and stderr is unbuffered — unlike a checkpoint,
+    // it cannot be lost by the crash it warns about. A batch needs no such line:
+    // it writes the window down before it opens it.
+    eprintln!(
+        "dssp-bot: submitting {} now — if this process dies before it reports a result, the \
+         submission may already be on the portal: check there before re-running this job",
+        key_of(&trainee).unwrap_or_else(|| "the trainee".to_string()),
+    );
     let policy = RetryPolicy::default();
     let job_id = new_id();
     let mut attempt = 0u32;
@@ -343,6 +355,14 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
     };
 
     client.shutdown();
+    // Discharge the warning above, or leave it standing. An operator who saw it
+    // and then a stop has to be able to tell "the portal answered" from "it did
+    // not" without knowing what each exit code means.
+    if code == 3 {
+        eprintln!("dssp-bot: the submission is not settled by this run — check the portal first");
+    } else {
+        eprintln!("dssp-bot: the submission settled — nothing is left in doubt");
+    }
     println!("{line}");
     code
 }
@@ -351,10 +371,11 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
 /// whatever is still queued as skipped — the moment a result cannot be
 /// accounted for.
 ///
-/// Unlike the single-trainee path, a batch always checkpoints: it is the run
-/// most likely to be interrupted, and the one where an interrupted run has real
-/// records on the portal to account for. A single submission that dies leaves
-/// one line of terminal output and nothing ambiguous behind it.
+/// Unlike the single-trainee path, a batch always checkpoints — the engine will
+/// not even build without a sink: it is the run most likely to be interrupted,
+/// and the one where an interrupted run has real records on the portal to
+/// account for. A single submission that dies changes nothing durable; all it
+/// can do is say so, which is what the warning before its submit loop is for.
 ///
 /// The checkpoint is reconciled *before* the worker is spawned, so a start that
 /// has to be refused opens no browser and submits nothing.
@@ -437,9 +458,7 @@ fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) ->
 
     eprintln!("dssp-bot: batch of {} trainee(s)", resolved.len());
 
-    let mut engine = BatchEngine::default()
-        .with_checkpoint(Box::new(checkpoint))
-        .with_carried(carried);
+    let mut engine = BatchEngine::new(Box::new(checkpoint)).with_carried(carried);
     let report = match engine.run(&mut client, session, resolved) {
         Ok(report) => report,
         Err(e) => {

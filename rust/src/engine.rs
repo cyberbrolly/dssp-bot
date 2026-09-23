@@ -7,6 +7,7 @@
 //! The worker is reached through the [`Transport`] trait so the engine is
 //! testable without a subprocess or a browser.
 
+use std::collections::HashSet;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,14 +40,69 @@ fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// The key a trainee is queued under, and the one written to `in_flight`.
+///
+/// One definition for both, because they have to agree: whatever `run` records
+/// as in flight is what a resume will look for in the queue. Id first, since a
+/// resume re-resolves what it finds in the file against the portal and a name is
+/// not an identity there. The positional fallback exists only so an entry
+/// carrying neither is still addressable in the queue; `resolve_against` gives
+/// the CLI an id before it reaches here, so it is a library-caller case.
+fn queue_key(trainee: &TraineeRef, index: usize) -> String {
+    trainee
+        .id
+        .clone()
+        .or_else(|| trainee.name.clone())
+        .unwrap_or_else(|| format!("#{index}"))
+}
+
+/// A roster is a set: collapse repeats, keep the first occurrence.
+///
+/// Two entries under one key would submit the same trainee twice, and after a
+/// crash the second copy is still in `pending` — where a resume would run it
+/// again and re-submit something already confirmed. `resolve_against` collapses
+/// repeats on the CLI path before the engine sees them; this is the same rule
+/// applied at the last point before a submit, so a caller that skips that
+/// pre-flight cannot reach the worker with a repeat either.
+///
+/// Later entries lose, matching `resolve_against`'s "already queued — skipping",
+/// and the caller must count the result rather than its input: a dropped repeat
+/// left inside `total` would put the file permanently one trainee short of its
+/// groups, which `blocks_start` reads as a submission that may have gone
+/// unrecorded and refuses on every start thereafter.
+fn dedupe(trainees: Vec<TraineeRef>) -> Vec<(String, TraineeRef)> {
+    let mut seen: HashSet<String> = HashSet::with_capacity(trainees.len());
+    let mut unique: Vec<(String, TraineeRef)> = Vec::with_capacity(trainees.len());
+
+    for (i, trainee) in trainees.into_iter().enumerate() {
+        let key = queue_key(&trainee, i);
+
+        if !seen.insert(key.clone()) {
+            eprintln!("dssp-bot: {key} is already queued — skipping the repeat");
+
+            continue;
+        }
+
+        unique.push((key, trainee));
+    }
+
+    unique
+}
+
 pub struct BatchEngine {
     policy: RetryPolicy,
     machine: StateMachine,
-    /// Absent by default, mirroring `AutomationEngineOptions.checkpoint`: the
-    /// unit tests want no storage, and a call site that forgets one gets a
-    /// working engine that merely survives nothing. A real batch must supply
-    /// one, or a run lost to a crash leaves no record of what it submitted.
-    checkpoint: Option<Box<dyn CheckpointWriter>>,
+    /// Where the durable record of this batch goes.
+    ///
+    /// Not an `Option`, and not a builder step, so it cannot be left out. A
+    /// batch that submits without a sink puts records on the portal that nothing
+    /// on disk names, and the next start reads that silence as "never sent" and
+    /// submits them again — the failure this stage exists to prevent.
+    /// `AutomationEngineOptions.checkpoint` is optional; this is deliberately
+    /// narrower, for the same reason Stage 28 narrows that engine's
+    /// swallow-everything `saveCheckpoint` rather than keeping it. The unit tests
+    /// pass a recorder; the CLI passes [`crate::store::CheckpointStore`].
+    checkpoint: Box<dyn CheckpointWriter>,
     /// Results a predecessor could not account for, carried into this batch.
     ///
     /// History, not work: they are never queued, never re-decided and never
@@ -56,33 +112,22 @@ pub struct BatchEngine {
     carried: Vec<TrainingResult>,
 }
 
-impl Default for BatchEngine {
-    fn default() -> Self {
-        Self::with_policy(RetryPolicy::default())
-    }
-}
-
 impl BatchEngine {
-    pub fn new() -> Self {
-        Self::default()
+    /// An engine with the default retry policy and the given sink.
+    pub fn new(checkpoint: Box<dyn CheckpointWriter>) -> Self {
+        Self::with_policy(RetryPolicy::default(), checkpoint)
     }
 
-    pub fn with_policy(policy: RetryPolicy) -> Self {
+    /// The full constructor: the policy this batch runs under, and where its
+    /// durable record goes. Both are required, which is the point — neither is
+    /// something a caller can usefully omit.
+    pub fn with_policy(policy: RetryPolicy, checkpoint: Box<dyn CheckpointWriter>) -> Self {
         Self {
             policy,
             machine: StateMachine::new(),
-            checkpoint: None,
+            checkpoint,
             carried: Vec::new(),
         }
-    }
-
-    /// Attach the durable sink. Optional, and deliberately so — the TS engine's
-    /// `checkpoint` option is optional for the same reason, and this is the
-    /// builder form of it.
-    pub fn with_checkpoint(mut self, checkpoint: Box<dyn CheckpointWriter>) -> Self {
-        self.checkpoint = Some(checkpoint);
-
-        self
     }
 
     /// Seed the run with records a previous batch could not settle.
@@ -112,10 +157,6 @@ impl BatchEngine {
         queue: &TaskQueue<TraineeRef>,
         in_flight: Option<&str>,
     ) -> Result<(), String> {
-        let Some(sink) = self.checkpoint.as_mut() else {
-            return Ok(());
-        };
-
         let snapshot = BatchCheckpoint {
             status,
             // The report's `started_at` for this batch, so the two agree about
@@ -128,7 +169,7 @@ impl BatchEngine {
             in_flight: in_flight.map(str::to_string),
         };
 
-        sink.write(&snapshot)
+        self.checkpoint.write(&snapshot)
     }
 
     /// Run a batch: one shared session, one training template, many trainees.
@@ -143,11 +184,15 @@ impl BatchEngine {
         // this file from its very first write, or the write that follows would
         // replace the only record of a submission that may already exist.
         let mut results: Vec<TrainingResult> = std::mem::take(&mut self.carried);
+        // Collapsed before the count is taken, never after: `total` has to agree
+        // with the groups a reader will sum, and a dropped repeat that was still
+        // counted would leave the file one trainee short of itself.
+        let queued = dedupe(trainees);
         // Taken from the queue as asked for, not from what survives the run:
         // `total` answers "how many trainees this file accounts for", so a later
         // skip-drain must not shrink it — and the carried records are part of
         // that accounting, which is what keeps each trainee in exactly one group.
-        let total = trainees.len() + results.len();
+        let total = queued.len() + results.len();
         self.machine.reset();
         let _ = self.machine.transition_to(AutomationState::Initializing);
 
@@ -162,13 +207,8 @@ impl BatchEngine {
         }
 
         let mut queue: TaskQueue<TraineeRef> = TaskQueue::new();
-        for (i, trainee) in trainees.into_iter().enumerate() {
-            let id = trainee
-                .id
-                .clone()
-                .or_else(|| trainee.name.clone())
-                .unwrap_or_else(|| format!("#{i}"));
-            queue.enqueue(id, trainee);
+        for (key, trainee) in queued {
+            queue.enqueue(key, trainee);
         }
 
         while let Some(task) = queue.dequeue() {
@@ -521,14 +561,27 @@ mod tests {
             .collect()
     }
 
-    fn fast_engine() -> BatchEngine {
-        // Zero delays keep retry tests instant.
-        BatchEngine::with_policy(RetryPolicy {
+    /// Zero delays keep retry tests instant.
+    fn fast_policy() -> RetryPolicy {
+        RetryPolicy {
             max_attempts: 3,
             initial_delay_ms: 0,
             max_delay_ms: 0,
             backoff_factor: 2,
-        })
+        }
+    }
+
+    /// An engine whose sink the test never reads back: the policy is what these
+    /// tests are about, so the writes land in a recorder nobody holds a handle
+    /// to. Every engine has somewhere to write — that is the constructor's whole
+    /// point — so "no sink" is no longer a state a test can ask for.
+    fn fast_engine() -> BatchEngine {
+        BatchEngine::with_policy(fast_policy(), Box::new(Recorder::default()))
+    }
+
+    /// The same, writing to a sink the test can read.
+    fn with_recorder(recorder: &Recorder) -> BatchEngine {
+        BatchEngine::with_policy(fast_policy(), Box::new(recorder.clone()))
     }
 
     #[test]
@@ -542,6 +595,31 @@ mod tests {
         assert_eq!(report.skipped, 0);
         assert_eq!(w.submit_calls, 3);
         assert_eq!(report.success_rate, 1.0);
+    }
+
+    /// A roster is a set. The same id twice would be two submissions, the second
+    /// of which the portal refuses as a duplicate and the report counts as a
+    /// failure — a batch that went fine reading as one that needed attention.
+    /// `resolve_against` collapses repeats before the CLI gets here; this is the
+    /// same rule at the last point before a submit.
+    #[test]
+    fn a_repeated_id_is_queued_and_submitted_once() {
+        // Three responses for three queued entries, so a run that submits the
+        // repeat reaches the assertions below rather than dying on an exhausted
+        // script: a regression here should say "three submits, not two", not
+        // "no scripted submit response left". The third goes unused.
+        let mut w = FakeTransport::new(
+            true,
+            vec![confirmed("1", "A"), confirmed("1", "A"), confirmed("2", "B")],
+        );
+
+        let report = fast_engine()
+            .run(&mut w, &session(), refs(&["1", "1", "2"]))
+            .unwrap();
+
+        assert_eq!(w.submit_calls, 2, "the repeat never reached the worker");
+        assert_eq!(report.total, 2, "and the file accounts for two, not three");
+        assert_eq!(report.successful, 2);
     }
 
     #[test]
@@ -684,8 +762,9 @@ mod tests {
         }
     }
 
-    fn with_recorder(recorder: &Recorder) -> BatchEngine {
-        fast_engine().with_checkpoint(Box::new(recorder.clone()))
+    /// The store-backed engine: the real sink, on a real path.
+    fn with_store(path: &std::path::Path) -> BatchEngine {
+        BatchEngine::with_policy(fast_policy(), Box::new(crate::store::CheckpointStore::new(path)))
     }
 
     /// One settled write per trainee, then a terminal one. A single write at the
@@ -851,8 +930,7 @@ mod tests {
         w.die_on_call = Some(2);
 
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fast_engine()
-                .with_checkpoint(Box::new(CheckpointStore::new(&path)))
+            with_store(&path)
                 .run(&mut w, &session(), refs(&["1", "2", "3"]))
         }));
 
@@ -996,8 +1074,7 @@ mod tests {
         let recorder = Recorder::default();
         let mut w = FakeTransport::new(true, vec![confirmed("2", "B")]);
 
-        fast_engine()
-            .with_checkpoint(Box::new(recorder.clone()))
+        with_recorder(&recorder)
             .with_carried(vec![indeterminate("1", "A")])
             .run(&mut w, &session(), refs(&["2"]))
             .unwrap();
@@ -1133,8 +1210,7 @@ mod tests {
         // guarantee is about.
         let sink = Filling::new(3);
 
-        let report = fast_engine()
-            .with_checkpoint(Box::new(sink.clone()))
+        let report = BatchEngine::with_policy(fast_policy(), Box::new(sink.clone()))
             .run(&mut w, &session(), refs(&["1", "2"]))
             .unwrap();
 
@@ -1155,8 +1231,7 @@ mod tests {
         let mut w = FakeTransport::new(true, vec![confirmed("1", "A"), confirmed("2", "B")]);
         let sink = Filling::new(0);
 
-        let report = fast_engine()
-            .with_checkpoint(Box::new(sink.clone()))
+        let report = BatchEngine::with_policy(fast_policy(), Box::new(sink.clone()))
             .run(&mut w, &session(), refs(&["1", "2"]))
             .unwrap();
 
@@ -1176,8 +1251,7 @@ mod tests {
         // in-flight write.
         let sink = Filling::new(2);
 
-        let report = fast_engine()
-            .with_checkpoint(Box::new(sink.clone()))
+        let report = BatchEngine::with_policy(fast_policy(), Box::new(sink.clone()))
             .run(&mut w, &session(), refs(&["1", "2", "3"]))
             .unwrap();
 
@@ -1200,15 +1274,6 @@ mod tests {
         assert!(!last.never_attempted().contains(&"1".to_string()));
     }
 
-    #[test]
-    fn a_batch_runs_without_a_checkpoint_writer() {
-        let mut w = FakeTransport::new(true, vec![confirmed("1", "A")]);
-
-        let report = fast_engine().run(&mut w, &session(), refs(&["1"])).unwrap();
-
-        assert_eq!(report.successful, 1);
-    }
-
     /// The one test that proves the halves are wired to each other: a real
     /// [`CheckpointStore`] on a real disk, driven by the engine, read back by a
     /// second store — which is exactly what recovery will do.
@@ -1226,8 +1291,7 @@ mod tests {
         let path = dir.join("dssp.checkpoint.json");
 
         let mut w = FakeTransport::new(true, vec![confirmed("1", "A"), confirmed("2", "B")]);
-        let report = fast_engine()
-            .with_checkpoint(Box::new(CheckpointStore::new(&path)))
+        let report = with_store(&path)
             .run(&mut w, &session(), refs(&["1", "2"]))
             .unwrap();
 
@@ -1339,8 +1403,7 @@ mod tests {
         };
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fast_engine()
-                .with_checkpoint(Box::new(sink))
+            BatchEngine::with_policy(fast_policy(), Box::new(sink))
                 .run(&mut transport, &session(), refs(trainees))
         }));
 
@@ -1350,6 +1413,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         (sent_ids, found)
+    }
+
+    /// The crash instant a repeated id does its damage in.
+    ///
+    /// Without the dedupe the repeat is still queued when the first copy is sent,
+    /// so a crash mid-submit leaves it in `pending` — and `never_attempted`,
+    /// which is exactly what a resume turns into work, would offer it back. The
+    /// trainee is then submitted a second time against a portal that already has
+    /// the first one.
+    #[test]
+    fn a_repeated_id_left_by_a_crash_is_not_queued_for_a_resume() {
+        let (sent, found) = probe_one(None, Some(1), &["1", "1", "2"]);
+
+        assert_eq!(sent, vec!["1"], "the repeat was never handed to the worker");
+
+        let found = found.expect("the crash left a file");
+
+        assert_eq!(found.total, 2, "the file accounts for two trainees, not three");
+        assert_eq!(found.unaccounted(), 0, "the partition still adds up");
+        assert!(
+            !found.never_attempted().contains(&"1".to_string()),
+            "the repeat must not survive into a resume's roster: {:?}",
+            found.never_attempted()
+        );
     }
 
     /// For every crash point the engine can be killed at, the file it leaves must
@@ -1473,8 +1560,7 @@ mod tests {
             };
 
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                fast_engine()
-                    .with_checkpoint(Box::new(sink))
+                BatchEngine::with_policy(fast_policy(), Box::new(sink))
                     .with_carried(carried.clone())
                     .run(&mut transport, &session(), roster.clone())
             }));

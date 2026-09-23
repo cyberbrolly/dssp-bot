@@ -50,8 +50,8 @@ run).
 | 25 | Rust coordinator          | 🟢 Passed     | `cargo test` (47)               | batch CLI + pre-flight dedupe; `2d2fcf9` |
 | 26 | Retry policy              | 🟢 Passed     | retry tests                     | `decision.rs` + E2E backoff |
 | 27 | Checkpointing             | 🟢 Passed     | `cargo test` (79) + clippy      | port TS `BatchCheckpoint.ts` + store + engine wiring; Gate 3 items → Stage 28 |
-| 28 | Recovery                  | 🟢 Passed     | `cargo test` (133) + clippy     | **Gate 3** — in-flight record + start gate; `recovery.rs` |
-| 29 | Extension → Rust          | ⬜ Not Started | API integration                 | TS still at repo root |
+| 28 | Recovery                  | 🟢 Passed     | `cargo test` (145) + clippy     | **Gate 3** — in-flight record + start gate; premise now enforced, not assumed |
+| 29 | Extension → Rust          | ⬜ Not Started | API integration                 | API designed → `docs/daemon-api.md`; TS still at repo root |
 | 30 | Pause                     | ⬜ Not Started | pause test                      | state exists; no engine API |
 | 31 | Stop                      | ⬜ Not Started | stop test                       | abort path exists |
 | 32 | Error testing             | ⬜ Not Started | failure scenarios               | many paths already covered |
@@ -60,7 +60,7 @@ run).
 | 35 | Security review           | ⬜ Not Started | credential scan                 | design measures already in place |
 | 36 | Final testing             | ⬜ Not Started | Rust + Python + extension       | **Gate 5** |
 | 37 | Firefox                   | ⬜ Not Started | Firefox E2E                     | new scope |
-| 38 | Documentation             | 🔵 In Progress | docs reviewed                   | README, protocol, rust README, runbook |
+| 38 | Documentation             | 🟢 Passed     | docs reviewed against code      | 6 contradictions found and fixed; see the Stage 38 record |
 | 39 | Final verification        | ⬜ Not Started | full verification               | **Gate 6** |
 | 40 | Migration complete        | ⬜ Not Started | Definition of Done              |       |
 
@@ -287,7 +287,7 @@ at each point, and what the next start does with it:
 | during the portal round trip | trainee `in_flight` | as above |
 | during a retry backoff | trainee `in_flight` | as above |
 | result in hand, before the settle write | trainee `in_flight` | as above — the outcome is lost, the id is not |
-| during the abort drain | drained rows in `results`, remainder in `pending` | `never_attempted` restores batch order |
+| during the abort drain | as at the settle write — the drain is in memory only, so every un-attempted trainee is still in `pending` | `never_attempted` restores batch order |
 | after the last settle, before the terminal write | status still `running`, nothing in flight | starts clean, and reports what it recovered |
 
 So the file can only ever claim a submission that was never issued, never the
@@ -295,9 +295,10 @@ reverse. That is the safe direction to be wrong in: the cost is a human checking
 the portal, not a second record.
 
 Verification:
-- cargo test — 143 passed, 0 failed
-  (36 checkpoint, 27 engine, 25 recovery, 24 decision, 13 store,
-  11 resolution/dedupe, 4 state, 3 queue)
+- cargo test — 145 passed, 0 failed
+  (37 checkpoint, 28 engine, 25 recovery, 24 decision, 13 store,
+  11 resolution/dedupe, 4 state, 3 queue) — re-measured after the second pass
+  below, which added three tests and deleted one
 - cargo clippy --all-targets — clean
 - The end-to-end one:
   `a_crash_on_disk_is_refused_and_its_trainee_is_never_requeued` drives a real
@@ -359,18 +360,91 @@ fatal if it fails. If a future change ever issues a submit without a preceding
 in-flight write, this gate stops being sufficient — which is why that ordering is
 the thing Stage 33's integration test should assert, not just exercise.
 
+Second pass — closing the one item this stage left open:
+
+- **The claim held, and it survives the retry loop.** Removing `is_live()` from
+  `blocks_start` rests on "every submit is preceded by a durable in-flight write,
+  and that write is fatal if it fails". Re-checked path by path against the fixed
+  tree, and it holds — including across retries, which is the part most worth
+  doubting: `process_trainee` writes no checkpoint between attempts, so the
+  marker taken before the first send stands for the whole loop rather than only
+  its first attempt. `ensure_session` is not a submit. The batch loop's pre-send
+  write is the only other path in, and its failure stops the run before
+  submitting, leaving the trainee in the group a resume picks up.
+- **It is now enforced instead of assumed.** `BatchEngine` cannot be constructed
+  without a checkpoint sink — it is a constructor argument, not a builder step —
+  so "a batch always checkpoints" is a compile-time fact rather than a rule each
+  new caller has to know. That premise is what the whole claim rests on, and a
+  future caller (Stage 29's bridge is the next one) can no longer opt out of it
+  by forgetting. The test that pinned the old hole, which asserted a batch could
+  run with no durable record at all, is deleted: the state it constructed no
+  longer compiles.
+- **A roster was not a set.** `TaskQueue::enqueue` does not dedupe, and the only
+  dedupe in the tree was the CLI's pre-flight resolution — so a caller reaching
+  `BatchEngine::run` directly could submit the same trainee twice, and after a
+  crash the repeat would still be in `pending`, where a resume would run it and
+  re-submit something already confirmed. `run` now collapses repeats before it
+  counts `total`; counting the input instead would leave the file permanently one
+  trainee short of its groups, which `blocks_start` reads as a submission gone
+  unrecorded and refuses on every start thereafter. Regression tests:
+  `a_repeated_id_is_queued_and_submitted_once`,
+  `a_repeated_id_left_by_a_crash_is_not_queued_for_a_resume`.
+- **A dead guard read as protection.** `promote_suspect`'s early return on
+  `in_flight.is_some()` cannot be reached from its one caller: a file whose
+  `in_flight` is `Some` is exactly a file carrying that key, which is exactly a
+  file `untracked_suspect` declines to suspect — so `guard` never has a suspect
+  to promote, and the branch never runs. It stays as a second line of defence,
+  with a comment that says so, and the test that pinned it is now labelled a
+  direct-call test instead of being left to read as the protection it is not.
+  What actually holds is the promotion plus `guard`'s `suspect_id` filter, and a
+  new test states the mutual exclusion where it lives
+  (`a_file_that_records_in_flight_has_no_suspect_to_promote`).
+- **Checked and found sound**, so a reviewer knows what was looked at and what
+  was not: `is_affirmative`; `load_with_provenance`'s key-presence test;
+  `mark_interrupted`; `put_back` and the abort drain; `with_carried`'s `total`
+  accounting; and `unaccounted`'s `saturating_sub`, which reads an over-count as
+  zero and so does not refuse — an over-count needs one trainee in two of the
+  groups, which the roster dedupe above now prevents, while the dangerous
+  direction (a trainee in no group) does refuse.
+- One table row was wrong and is corrected above: the abort drain writes nothing
+  to disk, so a process killed during it leaves the file as the settle write left
+  it, with every un-attempted trainee still in `pending` — not, as the row said,
+  the drained rows already in `results`.
+- **What this pass was not.** Round one's harness — five independent lenses, each
+  finding handed to two skeptics told to refute it — could not be run at all this
+  time; the tooling that hosts it was unavailable for the whole session. So this
+  is close reading of the fixed tree, by the same author as the fixes. It is
+  stronger than a reading usually is in exactly one way: the premise the claim
+  rests on is now enforced by the compiler rather than argued from convention.
+  It is weaker in another, and that is the item still open below.
+
 Errors:
 - The first adversarial pass found the critical hole above. Fixed, with a
   regression test for each defect, rather than recorded and carried.
+- The second pass found the three defects above. Same rule: fixed, with tests,
+  not recorded.
 
 Open for whoever reviews this stage:
-- **The removal of the liveness check is the one claim here that has not been
-  independently re-checked.** It rests on "every submit is preceded by a durable
-  in-flight write", which the round-one pass verified against the *pre-fix* tree.
-  A second adversarial pass over the fixed code was started and stopped before it
-  returned, so the fixes above are covered by tests and by reading, not by a
-  second panel. That pass should be run before Stage 33's gate, and its highest
-  value target is `blocks_start` no longer consulting `is_live()`.
+- **No independent lens has attacked the fixed tree.** The liveness-check claim
+  has now been re-checked against the fixed code and is enforced rather than
+  assumed (second pass above) — but re-checked by reading, by the same author as
+  the fixes. Round one's critical came from five independent lenses; nothing
+  equivalent has been pointed at what round one left behind. The highest-value
+  target for that panel is still `blocks_start` no longer consulting `is_live()`,
+  and behind it the resume roster's `suspect_id` filter in `guard`, which now
+  carries the weight the dead guard in `promote_suspect` was believed to carry.
+- **The dedupe key is a string space that input can also write into.**
+  `queue_key` (`engine.rs:51`) falls back to `format!("#{index}")` for an entry
+  with neither id nor name, and that fallback shares one `HashSet<String>` with
+  the ids and names it is compared against. So an entry whose id (or name) is
+  literally `#3`, listed alongside an entry at index 3 that has neither, collapses
+  as a repeat and is dropped with the "already queued" note. Unreachable on the
+  CLI path — `resolve_against` rejects an entry with no id and no name before the
+  engine sees it, and portal ids are numeric — but `BatchEngine::run` is `pub`,
+  and Stage 29's daemon is the next caller. The robust fix is a key enum
+  (`Id`/`Name`/`Position`) instead of a shared `String`; the cheaper one is for
+  the daemon to validate its roster at its own boundary, which is the same
+  boundary-versus-engine choice A2 was left as.
 
 Deliberately not done (and why):
 - **A batch-scoped acknowledgement** (resume *this* batch, not whatever is in
@@ -399,8 +473,96 @@ Deliberately not done (and why):
 
 Next:
 Stage 29 — Extension → Rust. Its bridge is a second start path: it must call
-`recovery::guard` before its own start, or it becomes the one way into the
-engine that skips this gate.
+`recovery::guard` before its own start. It would not be the *only* ungated way in
+— `run_single`, the path the live gates use, has no checkpoint and no guard — but
+that one is a deliberate trade rather than an oversight, and it now tells the
+operator so: one line to stderr before its submit loop, naming the trainee and
+stating that a death from there means checking the portal before re-running the
+job, plus a closing line saying whether the submission settled. A single
+trainee's outcome *is* its exit code, so there is nothing on disk for the next
+start to reconcile; what the warning buys is the one thing that reasoning needs,
+which is the operator knowing to look. `run_batch` needs no such line — it writes
+the window down before it opens it, and now cannot be built without somewhere to
+write it. The API for that bridge is designed in `docs/daemon-api.md`; it is not
+built until the live gates have run.
+```
+
+```text
+Stage: 38 — Documentation
+Status: 🟢 Passed
+
+Changes:
+Reviewed every claim in the docs against the code and corrected what the code
+contradicted. Six contradictions, all doc-side; no code changed to match a doc.
+
+- docs/protocol.md — `PORTAL_UNAVAILABLE` was listed as
+  `proves_nothing_submitted: true`. Both implementations say false
+  (`_PROVES_NOTHING` in python/app/protocol.py, `provesNothingSubmitted` in
+  AutomationEngine.ts). This was the unsafe direction: `decision.rs` retries only
+  what proves nothing was submitted and counts PORTAL_UNAVAILABLE as retryable,
+  so the documented value would have licensed exactly the retry the code refuses.
+  Fixed, with the reason written down.
+- rust/README.md — exit 1 was undocumented although two paths return it (the
+  worker failing to launch, and the session gate failing) on both the single and
+  batch paths. Added, along with the asymmetry an operator will otherwise
+  misread: the same session-gate failure exits 1 on `run_single` and 3 on
+  `run_batch`, and a session that lapses mid-run is `HALT: SESSION_EXPIRED` (3).
+- docs/phase4/portal-integration-specification.md §3 — carried a TODO asking
+  whether to paginate or raise the page size, while constants.py:25 had already
+  decided (`pgsize=10000&page=1&keywords=`). Recorded, with the failure it hides:
+  a capped page size truncates the list silently and a real trainee then reads as
+  TRAINEE_NOT_FOUND. The count comparison that catches it is now a required
+  output of the Stage 10 run.
+- Same spec §6 — blank, under a document whose first rule was "do not write
+  selectors into code that are not recorded here first". The code waits on no
+  spinner at all (only Playwright navigations and the 30s/300s timeouts), so the
+  rows now say "none / not observed" instead of being empty: the absence is a
+  fact, not an oversight.
+- Same spec §2 — "current page only" was stale, and two silent behaviours of the
+  row read were unrecorded: a row whose link yields no numeric TraineeId is
+  dropped from the list entirely (parsing.py:88), and the name is read
+  positionally at cells[2] (parsing.py:97), against the spec's own rule.
+- Same spec, mirror path — named src/core/infrastructure/portal/ as the only
+  place selectors may live, while the live implementation is python/app/portal/.
+- rust/src/recovery.rs:10 — its module doc still claimed Stage 29's bridge would
+  otherwise be "the one way into the engine that skips this" gate. That is the
+  claim A4 retired from the runbook; the code comment now carries the same
+  corrected reasoning rather than contradicting it.
+
+Checked and found accurate (no change needed):
+- The progress summary (25 Passed / 1 In Progress / 0 Failed / 3 Blocked /
+  11 Not Started = 40) re-derives exactly from the status table.
+- The env-var tables: all 8 variables documented across rust/README.md and
+  docs/protocol.md are read by the code (3 by Rust, 5 by the worker), no read
+  variable is undocumented, and every stated default matches.
+- ADR 0001's status: "proposed" is correct. None of its five decisions is
+  implemented — no createManifest, no FirefoxBrowserAdapter, armDialogs() is
+  still outside the try at BridgeClient.ts:135, and the origin is still hardcoded
+  in three files.
+
+Verification:
+- Every entry above was checked by reading the code it describes, with the file
+  and line recorded in the entry.
+- Test counts settled, previously 133 in the status table against 143 in the
+  Stage 28 record: both were right at different times, and the real number is
+  now 145, confirmed twice (cargo test, and `grep -c '#\[test\]'` per module:
+  37 checkpoint, 28 engine, 25 recovery, 24 decision, 13 store, 11
+  resolution/dedupe, 4 state, 3 queue).
+- NOT verified: the Python evidence dump added to the worker for the live gates
+  (DSSP_DUMP_DIR, python/app/portal/client.py) and its tests have not been run —
+  the Bash classifier was unavailable for the whole of this pass. `python -m
+  pytest` must be green before the live run; nothing else in this record depends
+  on it.
+
+Errors:
+- The Bash tool was refused for most of this pass ("deepseek-v4-flash is
+  temporarily unavailable"), so the doc review was done by reading. Re-checking a
+  claim against the code is exactly what reading is for; running the suite is
+  not, and that gap is recorded above rather than papered over.
+
+Next:
+Stages 10/15/24 need the operator (see the Live-Run Procedure). Stage 29 follows
+them, designed but deliberately unbuilt.
 ```
 
 ## Migration Progress Summary
@@ -426,6 +588,10 @@ Hard gates — do not continue past them until they pass.
 - **Gate 6 — Stage 39:** full verification sequence succeeds.
 
 ## Current Execution Order
+
+The order the work follows, not a list of what is outstanding: 25–28 are already
+Passed (see the status table above), and the entry point today is whatever is
+still Blocked — the live gates at 10, 15 and 24.
 
 ```text
 10  Real DSSP session
@@ -456,18 +622,33 @@ Hard gates — do not continue past them until they pass.
 First run is headed so the operator can sign in once; the session persists in
 `python/.pw-profile/` (gitignored). No credentials are ever stored.
 
-**Stage 10 — session + retrieval (no writes):**
+**These runs submit real records to the real portal.** Nothing below is a dry
+run. Do them in order and stop at the first failure rather than working around
+it — a worked-around failure is a gate that has not been proven.
+
+**Stage 10 — session + retrieval (read-only, writes nothing):**
 
 ```bash
 cd python
 printf '{"v":1,"job_id":"live1","op":"ensure_session"}\n{"v":1,"job_id":"live2","op":"list_trainees"}\n' \
-  | .venv/bin/python -m app.worker
+  | DSSP_DUMP_DIR=.evidence .venv/bin/python -m app.worker
 ```
 
 Log in to DSSP in the Chromium window; expect `authenticated:true` and a real
-trainee list.
+trainee list. Then check what the run captured in `python/.evidence/`
+(gitignored — it holds raw portal HTML including a form's antiforgery token, so
+it is never committed, pasted into an issue, or sent anywhere):
 
-**Stages 15 + 24 — one-trainee submit through the Rust chain:**
+- **`trainee-list.html`** — does the row shape match §2 of
+  `docs/phase4/portal-integration-specification.md`? Above all, compare the
+  `count` in the response with the total **the portal's own page displays**. A
+  mismatch means `pgsize=10000` is being capped, and every trainee past the cap
+  is invisible to the bot: they surface later as `TRAINEE_NOT_FOUND`, which reads
+  as "the portal has no such trainee" for someone who plainly exists.
+- the form HTML from one `get_form_options` call, if run — the POST shape and the
+  `__RequestVerificationToken` assumption can be checked against it.
+
+**Stages 15 + 24 — one trainee through the Rust chain (Gate 1, then Gate 2):**
 
 ```bash
 cp job.example.json job.json   # fill in a real trainee + instructor/type
@@ -476,9 +657,81 @@ cargo run -- ../job.json
 ```
 
 Expect `RESULT: confirmed …` (exit 0), `RESULT: duplicate …`, `FAILED: …`, or
-`HALT: indeterminate …`. A single Rust-driven submit proves both gates; to prove
-Gate 1 independently first, use a second trainee (a duplicate classification on
-a re-run also proves the chain but must be verified on the portal).
+`HALT: indeterminate …`. Immediately before the submit the run prints a warning
+line: from that point a death reporting no result cannot say whether the portal
+took the record, so **if the process is killed after that line, check the portal
+before re-running**. That warning is the whole of this path's crash story — it
+has no checkpoint, deliberately.
+
+This run proves Gate 1 (Python → portal → confirmation) and Gate 2 (Rust →
+Python → DSSP → Rust). It exercises **none** of stages 25–28: `run_single` has no
+checkpoint, no recovery gate and no engine. A green run here says nothing about
+the batch machinery.
+
+**Stages 25–28 — the batch path (checkpoint, recovery, dedupe, abort drain):**
+
+```bash
+cp job.batch.example.json job.json   # two real trainees: one by id, one by name
+cd rust
+cargo run -- ../job.json
+```
+
+This is the only run that exercises what stages 25–28 were built for:
+`resolve_against`, `run_batch`, `recovery::guard`, the checkpoint store, and the
+engine's in-flight record before each submit. Expect a stderr line naming the
+checkpoint file, then the JSON `BatchReport` on stdout, exit 0.
+
+**It submits for real, for both trainees** — pick two you are content to log a
+training for. How to read it:
+
+- `python/.evidence/submit-response-*.html` versus §5 of the phase4 spec. The
+  `duplicate` classification is a **text match** on that body, and it is the
+  documented second safety layer for the crash window. If the portal's real
+  wording differs from the match list, a genuine duplicate classifies as
+  `confirmed` and Rust reports success on a replay — worth confirming here,
+  because this is the one run that can.
+- `dssp.checkpoint.json` (beside the job file, gitignored) should exist, and
+  should name both trainees in `results` with `pending` and `in_flight` empty.
+- **Re-running the same job file is not a second test** — it re-submits both. For
+  the duplicate path without a second record, put the *same* trainee in twice
+  (`[{"id": "…"}, {"name": "…"}]`, both resolving to one person): that collapses
+  to a single submission and proves the dedupe instead.
+- To prove the recovery gate, run the batch again (or kill it partway and re-run).
+  A start over a live checkpoint must be **refused with exit 3** and the counts
+  printed. That refusal is the Gate 3 promise. If it does not happen, stop and
+  investigate — do not pass `DSSP_RESUME` to get past it.
+
+### What the fixtures cannot prove
+
+Every stage marked Passed on `pytest` rests on markup that encodes the parser's
+own assumptions (`python/tests/test_submit_outcomes.py` defines the trainee table
+and form inline). The live run is the first test of these, and they fail
+*silently*, so they are listed here to be checked deliberately:
+
+| assumption | where | how it fails |
+|---|---|---|
+| trainee ids are numeric | `constants.py` `TRAINEE_ID_RE` (`\d+`) | a non-numeric id is never extracted; the row is dropped and the trainee reads as `TRAINEE_NOT_FOUND` |
+| the name is the third `td` | `parsing.py:97` (positional, against the spec's own rule) | an inserted column yields a blank name; a name match then fails as `TRAINEE_NOT_FOUND` |
+| one `pgsize=10000` request returns everything | `constants.py:25` | silent truncation; see the count check above |
+| exactly one `table.table-checkable` | `constants.py:33` | a second matching table merges rows from both |
+| duplicate wording | `parsing.py` `submission_outcome` (text match) | misclassification, in the unsafe direction — see above |
+| the login marker | `parsing.py` `is_login_page` / `has_authenticated_marker` | a rewritten login page reads as authenticated, or vice versa |
+
+### If it fails
+
+Record enough that the failure is diagnosable without re-running it — Stage 16's
+list, unchanged:
+
+- which layer reported (Rust, the worker, Playwright, or the portal);
+- the raw error and the `error_code`;
+- the current checkpoint file (`DSSP_CHECKPOINT`, default beside the job);
+- whether a submission committed — from the evidence dump, the checkpoint, or
+  the portal itself.
+
+**Anything indeterminate is investigated on the portal and never re-run.** A
+`HALT:` exit 3, a killed process after the single-run warning, and a refused start
+are all states where re-running is the wrong move and reading the portal is the
+right one.
 
 ## Current Execution Rule
 

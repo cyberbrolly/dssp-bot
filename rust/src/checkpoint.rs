@@ -257,8 +257,14 @@ impl BatchCheckpoint {
     /// Returns whether it changed anything, so a caller can skip a redundant
     /// write.
     pub fn promote_suspect(&mut self, id: &str) -> bool {
-        // A real in-flight record is better evidence than a suspicion inferred
-        // from a queue, so it is never overwritten by one.
+        // A guard, not the protection. The caller cannot get here: `guard`
+        // promotes only what `untracked_suspect` hands it, and that is `None` for
+        // any file carrying the `in_flight` key — the same key whose presence is
+        // what makes this `Some`. What stops a suspect being re-run is the
+        // promotion itself, which takes it out of `never_attempted`, plus the
+        // `suspect_id` filter on the resume roster. Should a future caller ever
+        // be able to reach this, the rule stands: a real in-flight record is
+        // direct evidence and a suspicion inferred from a queue is not.
         if self.in_flight.is_some() {
             return false;
         }
@@ -654,8 +660,28 @@ mod tests {
         );
     }
 
-    /// A real in-flight record is direct evidence; a suspicion inferred from a
-    /// queue is not, and must never displace it.
+    /// Why the guard inside [`BatchCheckpoint::promote_suspect`] cannot fire for
+    /// its one caller, stated where the two conditions sit: a file that names a
+    /// trainee in flight is precisely a file that tracks in flight, and such a
+    /// file has no untracked suspect to promote. The caller therefore never sees
+    /// a suspect and a real in-flight record at the same time.
+    #[test]
+    fn a_file_that_records_in_flight_has_no_suspect_to_promote() {
+        let cp = interrupted_mid_submission();
+
+        assert!(cp.in_flight.is_some(), "the file names a trainee in flight");
+        assert!(
+            cp.untracked_suspect(true).is_none(),
+            "so the caller has nothing to promote, and never reaches the guard"
+        );
+    }
+
+    /// The guard itself, called directly — the only way to reach it. Labelled
+    /// rather than left to read as protection: `guard` cannot produce this state,
+    /// so this pins the branch against a future edit and nothing more. What
+    /// actually keeps a suspect from being re-run is the promotion, which takes
+    /// it out of [`Self::never_attempted`], plus the `suspect_id` filter on the
+    /// resume roster.
     #[test]
     fn promoting_a_suspect_never_displaces_a_real_in_flight_record() {
         let mut cp = interrupted_mid_submission();
