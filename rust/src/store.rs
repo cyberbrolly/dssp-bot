@@ -143,7 +143,25 @@ impl CheckpointStore {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
             _ => Path::new("."),
         };
-        let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+
+        // Best-effort, and the two ways it fails are not the same thing. Not
+        // being able to open a directory at all is the documented platform case
+        // — a directory is not a file everywhere — and says nothing about this
+        // filesystem, so it stays silent. A directory that *did* open and then
+        // failed to sync is a real fault on the one leg the pre-submit write's
+        // safety argument rests on, so it is reported rather than swallowed:
+        // `save` still returns Ok, and a caller that only reads the return value
+        // would otherwise take an unsynced rename for a durable one.
+        if let Ok(dir) = fs::File::open(parent)
+            && let Err(e) = dir.sync_all()
+        {
+            eprintln!(
+                "dssp-bot: could not sync {} after writing {}: {e} — the checkpoint is saved, \
+                 but a power loss could still revert it to the previous one",
+                parent.display(),
+                self.path.display(),
+            );
+        }
 
         Ok(())
     }

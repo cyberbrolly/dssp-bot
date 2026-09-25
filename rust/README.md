@@ -119,6 +119,10 @@ The next start reads that file first, before it connects to anything:
   submitted again — those are reported and left for you. If there is nothing left
   to attempt, the run exits 0 when every loose end is settled and 3 when a human
   is still owed.
+  A file from a build **older than this one** — written before the checkpoint
+  named a submission in flight — runs none of its queue: it cannot say how far
+  through it got, so every trainee still waiting in it is carried forward as
+  unconfirmed and the run exits 3 with the names. Check the portal for them.
 - **Unreadable** — a corrupt file is not a file that says nothing ran. Refused,
   never treated as an empty slot.
 - **Killed, but owing nothing** — a run that died between its last result and

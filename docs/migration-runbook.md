@@ -50,7 +50,7 @@ run).
 | 25 | Rust coordinator          | 🟢 Passed     | `cargo test` (47)               | batch CLI + pre-flight dedupe; `2d2fcf9` |
 | 26 | Retry policy              | 🟢 Passed     | retry tests                     | `decision.rs` + E2E backoff |
 | 27 | Checkpointing             | 🟢 Passed     | `cargo test` (79) + clippy      | port TS `BatchCheckpoint.ts` + store + engine wiring; Gate 3 items → Stage 28 |
-| 28 | Recovery                  | 🟢 Passed     | `cargo test` (145) + clippy     | **Gate 3** — in-flight record + start gate; premise now enforced, not assumed |
+| 28 | Recovery                  | 🟢 Passed     | `cargo test` (150) + clippy     | **Gate 3** — in-flight record + start gate; independent panel run, 5 defects fixed; 1 left open |
 | 29 | Extension → Rust          | ⬜ Not Started | API integration                 | API designed → `docs/daemon-api.md`; TS still at repo root |
 | 30 | Pause                     | ⬜ Not Started | pause test                      | state exists; no engine API |
 | 31 | Stop                      | ⬜ Not Started | stop test                       | abort path exists |
@@ -60,7 +60,7 @@ run).
 | 35 | Security review           | ⬜ Not Started | credential scan                 | design measures already in place |
 | 36 | Final testing             | ⬜ Not Started | Rust + Python + extension       | **Gate 5** |
 | 37 | Firefox                   | ⬜ Not Started | Firefox E2E                     | new scope |
-| 38 | Documentation             | 🟢 Passed     | docs reviewed against code      | 6 contradictions found and fixed; see the Stage 38 record |
+| 38 | Documentation             | 🟢 Passed     | docs reviewed against code      | 7 contradictions found and fixed; see the Stage 38 record |
 | 39 | Final verification        | ⬜ Not Started | full verification               | **Gate 6** |
 | 40 | Migration complete        | ⬜ Not Started | Definition of Done              |       |
 
@@ -307,6 +307,16 @@ Verification:
   both ways — the crash-window trainee is named, refused, and in no roster.
 - README.md: `DSSP_RESUME` and `DSSP_CHECKPOINT` in the env table, the exit-3
   row, and a Recovery section.
+- Re-measured after the third pass, which is this stage's final count:
+  **cargo test — 150 passed, 0 failed**, `cargo clippy --all-targets` clean.
+  The five new tests are `an_id_that_looks_positional_does_not_swallow_a_nameless_entry`,
+  `a_name_does_not_collide_with_an_id`,
+  `an_abort_on_the_last_trainee_is_recorded_as_an_abort`,
+  `an_abort_with_nothing_drained_exits_3_not_4`, and
+  `a_clean_batch_exits_0`; three tests that pinned the unsafe legacy-resume
+  behaviour were rewritten to pin the safe one, and one was renamed. The
+  per-module distribution above is otherwise unchanged, which reproduces the
+  Stage 38 record's grep counts plus the new cases.
 
 Review pass (an adversarial panel — five independent lenses over the module,
 each finding then given to two skeptics told to refute it). It found one
@@ -417,34 +427,144 @@ Second pass — closing the one item this stage left open:
   stronger than a reading usually is in exactly one way: the premise the claim
   rests on is now enforced by the compiler rather than argued from convention.
   It is weaker in another, and that is the item still open below.
+- **Third pass: the independent panel, finally run.** Round two's harness was
+  unavailable; round one's was the only independent lens this stage had ever
+  had. This pass ran it. Four lenses over `checkpoint.rs`, `recovery.rs`,
+  `store.rs` and `main.rs`, each asked for a concrete crash instant or input
+  rather than an opinion; every finding handed to three skeptics told to refute
+  it; admitted only when two of the three failed to. It found five defects. All
+  five are fixed with a regression test, per this stage's rule:
+
+  - **A file too old to record `in_flight` could be resumed from a stale
+    handoff.** Convergent critical: three of three skeptics, and reached
+    independently by two lenses. Round two made `never_attempted()`
+    drain-then-queue, which is sound only for a file that records the key —
+    that write is what makes `pending` mean "definitely never handed over". A
+    build that had no such write dropped a failed one and carried on, so such a
+    file can be behind by more than the single handoff
+    `untracked_suspect` accounts for, and its `pending` vouches for nothing.
+    Resuming that queue would re-submit a trainee the portal may already hold.
+    `continuable` (`recovery.rs:290`) now draws a legacy file's roster from
+    `drained_skips()` alone, since a drain happens after the queue stops being
+    worked; the rest of the queue rides along as unconfirmed
+    (`unvouched_queue`, `checkpoint.rs:235`, code `CRASH_UNTRACKED_QUEUE`) so
+    the file's counts still add up and the operator still sees every name. The
+    old behaviour was pinned by a test asserting it; that test now asserts the
+    safe one, and its name changed to match.
+  - **A legacy file's suspect reached the resume under the ordinary in-flight
+    code.** `carried()` synthesizes the promoted suspect through
+    `in_flight_record`, and the resume path reported it as it came — losing the
+    distinction the refusal path keeps deliberately, which is the one fact that
+    says how far the rest of the file can be trusted. The relabel at
+    `recovery.rs:154` restores it, and the distinction now survives both paths.
+  - **`owed` did not count the trainees the file cannot place.** `unaccounted()`
+    — the gap between `total` and the three groups — was added to
+    `blocks_start` but not to the resume's `owed` (`recovery.rs:179`), so a
+    resume over such a file could report that it owed nothing while its own
+    counts did not add up. It is counted now. The closing line lost its claim
+    that every trainee was "either recorded or left unconfirmed", which was
+    false in exactly that case; it now states what the run would submit.
+  - **An aborted batch could exit 4 — or 0.** Exit 4 is "definitive failures,
+    safe to re-run"; an abort is neither, and the aborted row's own outcome may
+    be `Success`. The counts cannot separate the cases: a batch aborting on its
+    *last* trainee drains nothing, so `skipped` stays 0, and the old test read
+    that as 0 for a clean abort and 4 for one that happened to end on a failure.
+    `BatchReport` now carries an `aborted` flag (`report.rs:45`) set by both
+    early-exit paths, and `batch_exit_code` (`main.rs:625`) reads it first. This
+    also closes a doc-versus-code contradiction the Stage 38 pass missed:
+    `rust/README.md`'s exit table has listed "a batch aborted mid-run" under
+    exit 3 all along, and the code could return 0 or 4 for it.
+  - **A rename whose durability was not confirmed was silent.** `save()` syncs
+    the parent directory best-effort and discarded the error. It now reports a
+    `sync_all()` failure on a directory that did open (`store.rs:156`), and
+    stays silent only when the directory cannot be opened at all — which is the
+    one case the best-effort design exists for.
+
+- **Item B, the keyed dedupe, implemented as the record proposed.**
+  `queue_key` returned a `String`, so the positional fallback `#3` shared one
+  namespace with every id and name compared against it: an entry whose id is
+  literally `#3`, listed beside an entry at index 3 with neither, collapsed as a
+  repeat and one of the two was dropped. `QueueKey` (`engine.rs:74`) is a tagged
+  `Id`/`Name`/`Position` now, and `dedupe`'s set is keyed by it. The durable
+  shape is unchanged — `pending` and `in_flight` remain plain strings — so the
+  file format that stage 29's designed `GET /checkpoint` proxies is not touched
+  and the store's fixture tests still hold. Regression tests: an id that looks
+  positional does not swallow a nameless entry; a name does not collide with an
+  id.
+
+- **`rust/README.md` — not a no-op after all.** Two operator-visible changes came
+  out of this pass. The exit-3 row already claimed "a batch aborted mid-run"; the
+  code could return 0 or 4 for it, so fixing the code made the README true rather
+  than needing an edit. The other did need one: a file from a build older than
+  this one now runs none of its queue on a resume and exits 3 naming every
+  trainee it could not vouch for. That is a new sentence in the `DSSP_RESUME`
+  bullet. Nothing else in the operator surface moved — the durable file format,
+  the env table, the `RESULT:` lines and the other exit rows are unchanged.
+- **`docs/daemon-api.md` — checked, unchanged.** Stage 29's contract is
+  `recovery::guard(&store, req.resume)` before anything is spawned, and a
+  `409` carrying its refusal; the signature and the refusal's shape are both
+  what they were. The keyed dedupe is internal to `engine.rs`, and the file
+  format `GET /checkpoint` proxies is untouched, so the designed daemon inherits
+  every fix above without an edit. This is the sense in which item B's fix was
+  the cheap one: it is invisible to the next caller.
 
 Errors:
 - The first adversarial pass found the critical hole above. Fixed, with a
   regression test for each defect, rather than recorded and carried.
 - The second pass found the three defects above. Same rule: fixed, with tests,
   not recorded.
+- The third pass found the five above. Same rule again. Two findings were
+  refuted and are recorded below as refuted, and one was left open rather than
+  decided, because fixing it changes operator-facing behaviour on the path the
+  live gates use.
 
 Open for whoever reviews this stage:
-- **No independent lens has attacked the fixed tree.** The liveness-check claim
-  has now been re-checked against the fixed code and is enforced rather than
-  assumed (second pass above) — but re-checked by reading, by the same author as
-  the fixes. Round one's critical came from five independent lenses; nothing
-  equivalent has been pointed at what round one left behind. The highest-value
-  target for that panel is still `blocks_start` no longer consulting `is_live()`,
-  and behind it the resume roster's `suspect_id` filter in `guard`, which now
-  carries the weight the dead guard in `promote_suspect` was believed to carry.
-- **The dedupe key is a string space that input can also write into.**
-  `queue_key` (`engine.rs:51`) falls back to `format!("#{index}")` for an entry
-  with neither id nor name, and that fallback shares one `HashSet<String>` with
-  the ids and names it is compared against. So an entry whose id (or name) is
-  literally `#3`, listed alongside an entry at index 3 that has neither, collapses
-  as a repeat and is dropped with the "already queued" note. Unreachable on the
-  CLI path — `resolve_against` rejects an entry with no id and no name before the
-  engine sees it, and portal ids are numeric — but `BatchEngine::run` is `pub`,
-  and Stage 29's daemon is the next caller. The robust fix is a key enum
-  (`Id`/`Name`/`Position`) instead of a shared `String`; the cheaper one is for
-  the daemon to validate its roster at its own boundary, which is the same
-  boundary-versus-engine choice A2 was left as.
+- **A plain start over a checkpoint that records landed work is not refused.**
+  Third pass, confirmed (two of three skeptics). Kill the process between one
+  trainee's settle write and the next one's pre-send write, then run the same
+  job file again *without* `DSSP_RESUME`: the file reads `results=[1]`,
+  `pending=[2,3]`, no `in_flight`, so `blocks_start` is false, `guard` returns
+  `Fresh`, and the CLI re-queues the whole job file — trainee 1 included, which
+  that same file records as landed. The recovered line does print those counts
+  before the overwrite, and the portal's `duplicate|already logged` match is the
+  next layer; the dissenting skeptic is right that the entry under "deliberately
+  not done" below chose disclosure over refusal, and that both are recorded. The
+  gap it leaves is narrower and real: the most natural operator action after a
+  crash — run the command again — is the one that re-submits, and the layer that
+  stops it is the portal's text match, which this stage lists elsewhere as an
+  assumption that can fail in the unsafe direction. Two candidate fixes, for
+  whoever decides: widen `blocks_start` (`checkpoint.rs:266`) from "is a
+  submission missing" to "is a submission missing, *or* does this file already
+  record a landed one", or keep the disclosure and move its warning into a
+  refusal that `DSSP_RESUME` clears. Not decided here because it changes
+  operator-facing behaviour on the live-gate path, and because it reinterprets
+  a choice this document already records.
+- **What the audit did not reach.** Recorded so this pass is not read as wider
+  than it was. Both panels read `checkpoint.rs`, `recovery.rs`, `store.rs`,
+  `main.rs`, and (third pass only) `engine.rs`, `worker.rs` and `python/app`.
+  Still never a lens target: `decision.rs`, `resolution.rs`, `queue.rs`,
+  `state.rs`. And the shapes of evidence this stage has never produced for Gate
+  3: no test kills the process for real (every crash is simulated by
+  constructing a file), no write-fault injection (the fatal-write premise is
+  tested by making the *store* fail, not the disk), no concurrency case (there
+  is no lock or pid file, so two batches over one path are untested), no fuzz
+  over arbitrary checkpoint files — every fixture is well-formed — and
+  `Response.v` is deserialized but still never compared to `protocol::V`. The
+  panel's own critic named the last one as the sharpest: the gate reduces to
+  Rust reading `proves_nothing_submitted` correctly, and the version field that
+  would detect a worker disagreeing about what that flag means is read and
+  dropped.
+- **Refuted, and recorded so they are not re-litigated.** Two findings did not
+  survive: that `promote_suspect`'s dead early return is still load-bearing
+  (three of three refuted — it is unreachable from its one caller, as round two
+  recorded, and the promotion plus `guard`'s `suspect_id` filter is what holds),
+  and that `unaccounted`'s `saturating_sub` hides an over-count in the unsafe
+  direction (three of three refuted — an over-count needs one trainee in two
+  groups, which the roster dedupe prevents, while the dangerous direction, a
+  trainee in no group, does refuse). Also checked and found sound this pass:
+  `blocks_start`'s `has_unconfirmed() || unaccounted() > 0` composition;
+  `settled()`'s exclusion of `Skipped`; and the refusal's arithmetic, which now
+  counts a legacy file's roster from the same source the resume does.
 
 Deliberately not done (and why):
 - **A batch-scoped acknowledgement** (resume *this* batch, not whatever is in
@@ -462,12 +582,24 @@ Deliberately not done (and why):
   and report them as its own results. What the gate owes the operator instead is
   the recovered line, which now prints and reports those counts before the
   overwrite. The archive idea is declined on the same ground: the records worth
-  keeping are the unconfirmed ones, and those are carried, not archived.
+  keeping are the unconfirmed ones, and those are carried, not archived. The
+  third pass confirmed a finding in this neighbourhood — a fresh start
+  re-submits landed trainees, not merely reports them — and it is left open
+  above rather than used to reverse this decision.
 - **Making the parent-directory fsync fatal.** It is best-effort because a
   directory cannot be opened as a file on every platform, and a fatal version
   would stop every batch on one. The path bug above is fixed; the residual is
   that on such a platform the rename's durability is not guaranteed, which is a
-  property of the platform rather than of this design.
+  property of the platform rather than of this design. The third pass raised a
+  stronger form — have `save()` distinguish "written" from "written and the
+  rename is durable", and let the pre-send write (`engine.rs:231`) treat
+  non-durable as it treats a failed write. Declined for the same reason plus
+  one more: the precondition is a directory that opened and then refused
+  `sync_all`, which on a real filesystem means the disk is already failing, so
+  the change would buy a halt in the case where every other write is about to
+  fail anyway — at the cost of a return type every caller must carry, on the
+  one path that must not gain a way to fail. What it should do instead it now
+  does: say so, loudly, on stderr.
 - The portal's own `duplicate|already logged` match remains a SECOND layer. It
   is not what makes the crash window safe, and Stage 27 said so explicitly.
 
@@ -494,6 +626,9 @@ Status: 🟢 Passed
 Changes:
 Reviewed every claim in the docs against the code and corrected what the code
 contradicted. Six contradictions, all doc-side; no code changed to match a doc.
+A seventh — the progress summary — was found later and is corrected in this
+record's "Checked and found accurate" list, which is where the wrong check that
+let it through was written down.
 
 - docs/protocol.md — `PORTAL_UNAVAILABLE` was listed as
   `proves_nothing_submitted: true`. Both implementations say false
@@ -530,8 +665,13 @@ contradicted. Six contradictions, all doc-side; no code changed to match a doc.
   corrected reasoning rather than contradicting it.
 
 Checked and found accurate (no change needed):
-- The progress summary (25 Passed / 1 In Progress / 0 Failed / 3 Blocked /
-  11 Not Started = 40) re-derives exactly from the status table.
+- The progress summary originally claimed 25 Passed / 1 In Progress. **That was
+  wrong, and this bullet is the correction.** The check behind it confirmed only
+  that both numbers sum to 40; it never compared the distribution. The status
+  table's row 38 is 🟢 Passed, so the summary was one short of the table and
+  named an In Progress stage that does not exist. Corrected below to match the
+  table, and the check is now stated as what it actually is: the summary's
+  numbers are read off the table's, row by row, not merely added up.
 - The env-var tables: all 8 variables documented across rust/README.md and
   docs/protocol.md are read by the code (3 by Rust, 5 by the worker), no read
   variable is undocumented, and every stated default matches.
@@ -545,20 +685,25 @@ Verification:
   and line recorded in the entry.
 - Test counts settled, previously 133 in the status table against 143 in the
   Stage 28 record: both were right at different times, and the real number is
-  now 145, confirmed twice (cargo test, and `grep -c '#\[test\]'` per module:
-  37 checkpoint, 28 engine, 25 recovery, 24 decision, 13 store, 11
-  resolution/dedupe, 4 state, 3 queue).
-- NOT verified: the Python evidence dump added to the worker for the live gates
-  (DSSP_DUMP_DIR, python/app/portal/client.py) and its tests have not been run —
-  the Bash classifier was unavailable for the whole of this pass. `python -m
-  pytest` must be green before the live run; nothing else in this record depends
-  on it.
+  now 150 — 145 as measured here, plus the 5 the third pass on Stage 28 added
+  afterwards. `grep -c '#[test]'` per module gives 37 checkpoint, 28 engine,
+  25 recovery, 24 decision, 13 store, 11 resolution/dedupe, 4 state, 3 queue for
+  the 145, confirmed twice (cargo test, and the grep); the status table carries
+  the current 150.
+- The Python evidence dump added to the worker for the live gates
+  (DSSP_DUMP_DIR, python/app/portal/client.py) and its tests had not been run
+  when this record was written: the Bash classifier was unavailable for the
+  whole of this pass. **Now run, and green.** `python/.venv/bin/python -m
+  pytest` passes 53 tests, including the 7 in `tests/test_evidence_dump.py`
+  that had never executed. This is the last thing the live gates needed from
+  here: nothing in the Python tree is now unproven by test.
 
 Errors:
 - The Bash tool was refused for most of this pass ("deepseek-v4-flash is
   temporarily unavailable"), so the doc review was done by reading. Re-checking a
   claim against the code is exactly what reading is for; running the suite is
-  not, and that gap is recorded above rather than papered over.
+  not, and that gap was recorded above rather than papered over. It is closed
+  now — see the last Verification entry.
 
 Next:
 Stages 10/15/24 need the operator (see the Live-Run Procedure). Stage 29 follows
@@ -568,8 +713,8 @@ them, designed but deliberately unbuilt.
 ## Migration Progress Summary
 
 ```text
-Completed:  25 / 40
-In Progress: 1   (38)
+Completed:  26 / 40
+In Progress: 0
 Failed:      0
 Blocked:     3   (10, 15, 24)
 Skipped:     0

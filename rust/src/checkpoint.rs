@@ -180,6 +180,20 @@ impl BatchCheckpoint {
         })
     }
 
+    /// The trainees a batch abort drained without attempting, in drain order.
+    ///
+    /// The one form of never-sent evidence nothing can hide behind: a drained
+    /// row is written *after* this batch stopped working the queue, so no
+    /// handoff happened behind it. That is what makes it safe to roster even for
+    /// a file whose queue is not — see [`Self::unvouched_queue`].
+    pub fn drained_skips(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .filter(|result| result.outcome == Outcome::Skipped)
+            .map(|result| result.trainee_id.clone())
+            .collect()
+    }
+
     /// Every trainee that was never sent, in the order it was queued.
     ///
     /// Two groups qualify and neither can produce a duplicate: the `skipped`
@@ -187,17 +201,49 @@ impl BatchCheckpoint {
     /// it never reached. Recovery may safely queue all of them again — which is
     /// what makes the spec's "pending jobs continue" reachable without an
     /// acknowledgement.
+    ///
+    /// Only true of a file that can vouch for its queue. For one that cannot,
+    /// [`Self::drained_skips`] is the whole of the answer: see
+    /// [`Self::unvouched_queue`].
     pub fn never_attempted(&self) -> Vec<String> {
-        let skipped = self
-            .results
-            .iter()
-            .filter(|result| result.outcome == Outcome::Skipped)
-            .map(|result| result.trainee_id.clone());
-
         // Drain order then queue order: a crash during the drain leaves the
         // already-drained trainees in `results` and the untouched remainder in
         // `pending`, so this concatenation restores the original batch order.
-        skipped.chain(self.pending.iter().cloned()).collect()
+        self.drained_skips()
+            .into_iter()
+            .chain(self.pending.iter().cloned())
+            .collect()
+    }
+
+    /// Every trainee left behind the head of a pre-Stage-28 file's queue,
+    /// written down as unconfirmed.
+    ///
+    /// [`Self::untracked_suspect`] takes the head of `pending` on the premise
+    /// that such a build "wrote at settle points, so its last write named the
+    /// trainee it was about to work on — everything queued behind that one was
+    /// not yet dequeued". That holds only if the last write *landed*. It need
+    /// not have: the builds that wrote these files dropped a failed write and
+    /// carried on rather than stopping, so the file can be behind by more than
+    /// one handoff, and every entry in its queue could already have been handed
+    /// to the worker. The premise fails in the one direction this module may not
+    /// be wrong in, so the rest of the queue is not evidence of never-sent
+    /// either, and must not be offered as work.
+    ///
+    /// Called on a snapshot whose suspect has already been promoted, so this is
+    /// the tail: the head is [`Self::in_flight_record`] by then, and counting it
+    /// here as well would put one trainee in two groups.
+    pub fn unvouched_queue(&self) -> Vec<TrainingResult> {
+        self.pending
+            .iter()
+            .map(|id| TrainingResult {
+                trainee_id: id.clone(),
+                trainee_name: String::new(),
+                outcome: Outcome::Indeterminate,
+                attempts: 0,
+                error_code: Some(LEGACY_QUEUE_CODE.to_string()),
+                message: Some(LEGACY_QUEUE_MESSAGE.to_string()),
+            })
+            .collect()
     }
 
     /// Whether a new batch may take this checkpoint's slot without an operator
@@ -305,6 +351,21 @@ pub const LEGACY_PENDING_CODE: &str = "CRASH_UNTRACKED_PENDING";
 /// Why that record is unconfirmed, in the operator's terms.
 pub const LEGACY_PENDING_MESSAGE: &str =
     "was next in queue when a build without in-flight tracking died — the submission may have \
+     reached the portal";
+
+/// Error code on the synthesized record for a trainee left *behind* the head of a
+/// pre-Stage-28 file's queue.
+///
+/// Distinct from [`LEGACY_PENDING_CODE`] because the two make different claims:
+/// the head is the one the dead build was most likely working on, and the tail is
+/// a trainee it may equally well have reached — the difference is only that the
+/// file stopped being able to say. One message that covered both would have to
+/// be vague about the one thing the operator acts on.
+pub const LEGACY_QUEUE_CODE: &str = "CRASH_UNTRACKED_QUEUE";
+
+/// Why that record is unconfirmed, in the operator's terms.
+pub const LEGACY_QUEUE_MESSAGE: &str =
+    "was still queued in a file that cannot say how far it had got — the submission may have \
      reached the portal";
 
 #[derive(Debug, Clone, Serialize)]

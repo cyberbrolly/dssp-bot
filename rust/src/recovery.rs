@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use crate::checkpoint::{BatchCheckpoint, Unreconciled};
+use crate::checkpoint::{BatchCheckpoint, IN_FLIGHT_CODE, Unreconciled};
 use crate::protocol::TraineeRef;
 use crate::report::{Outcome, TrainingResult};
 use crate::store::CheckpointStore;
@@ -141,19 +141,54 @@ pub fn guard(store: &CheckpointStore, resume: bool) -> Result<Start, String> {
         // Belt and braces since the promotion removed it from `pending`; the
         // filter is what keeps that true if the two ever drift apart.
         let suspect_id = suspect.as_ref().map(|record| record.trainee_id.as_str());
+        let runnable = continuable(&previous, loaded.tracks_in_flight);
+
+        let mut carried = carried(&previous);
+
+        // `carried` synthesizes the promoted suspect through `in_flight_record`,
+        // which stamps the ordinary crash-window code. Which of the two it came
+        // from is the fact that says how far the rest of the file can be trusted,
+        // and the refusal path keeps the distinction deliberately — so a resume
+        // that reported it as an ordinary in-flight record would lose exactly the
+        // one warning the operator needs to read the queue below correctly.
+        if let Some(record) = &suspect {
+            for slot in carried.iter_mut() {
+                if slot.error_code.as_deref() == Some(IN_FLIGHT_CODE) {
+                    *slot = record.clone();
+                }
+            }
+        }
+
+        // A file that could not record a submission in flight cannot vouch for
+        // its queue either, and `continuable` has already dropped the whole of it
+        // from the roster. Those trainees are not nothing, though: they may be on
+        // the portal, and the file is rewritten in full, so leaving them out of
+        // the carry would erase the only mention of them. They ride along as
+        // unconfirmed, which is also what keeps this file's counts adding up.
+        let stranded = if loaded.tracks_in_flight {
+            Vec::new()
+        } else {
+            previous.unvouched_queue()
+        };
+
+        // Everything a human still owes an answer for. Not just the unconfirmed
+        // records: counts that do not add up are trainees the file has lost
+        // track of entirely, and every one of them may be on the portal. Rolling
+        // them into `owed` is what stops a run over such a file reporting itself
+        // finished — see `announce_resume`.
+        let owed = unreconciled.indeterminate.len() + stranded.len() + previous.unaccounted();
+
+        carried.extend(stranded);
 
         return Ok(Start {
             plan: Plan::Resume {
-                roster: previous
-                    .never_attempted()
+                roster: runnable
                     .iter()
                     .filter(|id| Some(id.as_str()) != suspect_id)
                     .map(|id| by_id(id))
                     .collect(),
-                // Read off `previous` rather than off the `unreconciled` above,
-                // so the count and the records it counts come from one snapshot.
-                carried: carried(&previous),
-                owed: unreconciled.indeterminate.len(),
+                carried,
+                owed,
             },
             previous: Some(previous),
             recovered,
@@ -166,6 +201,7 @@ pub fn guard(store: &CheckpointStore, resume: bool) -> Result<Start, String> {
             &previous,
             &unreconciled,
             suspect.as_ref(),
+            &continuable(&previous, loaded.tracks_in_flight),
         ));
     }
 
@@ -240,6 +276,25 @@ fn carried(previous: &BatchCheckpoint) -> Vec<TrainingResult> {
     records
 }
 
+/// The trainees a resume may safely offer as work.
+///
+/// A file that records in-flight work can vouch for its whole queue: the write
+/// that precedes every send is fatal if it fails, so whatever is still in
+/// `pending` was never handed over, and everything an abort drained was never
+/// sent either. A file too old to record it cannot vouch for any of the queue —
+/// the builds that wrote those files dropped a failed write and carried on, so
+/// the file can be behind by more than the one handoff
+/// [`BatchCheckpoint::untracked_suspect`] accounts for. Only the drained rows
+/// survive that doubt, because a drain happens after the queue stops being
+/// worked. See [`BatchCheckpoint::unvouched_queue`].
+fn continuable(previous: &BatchCheckpoint, tracks_in_flight: bool) -> Vec<String> {
+    if tracks_in_flight {
+        previous.never_attempted()
+    } else {
+        previous.drained_skips()
+    }
+}
+
 /// Records in `results` that were submitted and reached a conclusion.
 ///
 /// Not "everything that is not unconfirmed". A `Skipped` row was drained after
@@ -267,19 +322,32 @@ fn refusal(
     previous: &BatchCheckpoint,
     unreconciled: &Unreconciled,
     suspect: Option<&TrainingResult>,
+    runnable: &[String],
 ) -> String {
-    // Not `never_attempted().len()` when there is a suspect: that trainee is
-    // carried rather than continued, so counting it here would promise a resume
-    // one more run than it will actually make.
+    // Not the whole of what a resume could run when there is a suspect: that
+    // trainee is carried rather than continued, so counting it here would promise
+    // a resume one more run than it will actually make. And for a file that
+    // cannot vouch for its queue, `runnable` is already only the drained rows —
+    // promising the rest would send the operator to a resume that runs nothing.
     let suspect_id = suspect.map(|record| record.trainee_id.as_str());
-    let never = previous
-        .never_attempted()
+    let never = runnable
         .iter()
         .filter(|id| Some(id.as_str()) != suspect_id)
         .count();
     let unconfirmed = unreconciled.indeterminate.len();
 
     let unaccounted = previous.unaccounted();
+
+    // The third bucket is worded by what a *resume* would do with it, not by
+    // what the file knows, because for a file that cannot vouch for its queue
+    // those are different numbers: the queue is not evidence of never-sent, so
+    // nothing in it is offered, and "3 never attempted" would promise a continue
+    // the resume will not make.
+    let queued = if suspect.is_some() {
+        format!("{never} a resume would run")
+    } else {
+        format!("{never} never attempted")
+    };
 
     let action = if unaccounted > 0 {
         // Not the resume advice: continuing would not tell the operator anything
@@ -303,7 +371,7 @@ fn refusal(
     format!(
         "dssp-bot: refusing to start — the checkpoint at {} is not reconciled\n\
          dssp-bot:   previous batch started {}: {} trainee(s), {} settled, \
-         {unconfirmed} unconfirmed, {never} never attempted\n\
+         {unconfirmed} unconfirmed, {queued}\n\
          dssp-bot:   {}\n\
          dssp-bot:   {action}\n\
          dssp-bot:   or move {} aside to start a fresh batch, once you have checked the portal",
@@ -332,8 +400,9 @@ fn reason(
     // fact that changes how much the rest of the file can be trusted.
     if let Some(record) = suspect {
         return format!(
-            "the file was written by a build that could not record a submission in flight, so \
-             {} — next in its queue — may already be on the portal",
+            "the file was written by a build that could not record a submission in flight, so it \
+             cannot say how far through its queue it got — {} was next, and anything behind it may \
+             be on the portal as well",
             record.trainee_id
         );
     }
@@ -399,7 +468,7 @@ fn unreadable(path: &Path, error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::CheckpointStatus;
+    use crate::checkpoint::{CheckpointStatus, LEGACY_PENDING_CODE, LEGACY_QUEUE_CODE};
     use crate::report::Outcome;
     use std::fs;
     use std::path::PathBuf;
@@ -857,6 +926,13 @@ mod tests {
     /// empty batch. The settled row still rides along, because the file it is
     /// resumed into is rewritten in full and this run should not be the reason
     /// that record disappears.
+    ///
+    /// It is not, however, a clean bill of health, and this is the case that says
+    /// so: the file's own numbers account for one trainee of the four it claims,
+    /// so three are missing from every group it has. A roster cannot repair that
+    /// — nothing was left to run — but a run that exits 0 over it has told an
+    /// operator, and any automation reading the exit code, that a batch three
+    /// trainees short of an account finished cleanly.
     #[test]
     fn a_resume_of_a_settled_batch_has_nothing_to_run() {
         let scratch = Scratch::new("clean-resume");
@@ -872,7 +948,10 @@ mod tests {
             Plan::Resume { roster, carried, owed } => {
                 assert!(roster.is_empty(), "nothing was left unsent");
                 assert_eq!(carried.len(), 1, "the record that did land");
-                assert_eq!(owed, 0, "and nothing is owed: exit 0, not 3");
+                assert_eq!(
+                    owed, 3,
+                    "the three trainee(s) the counts cannot place are still owed a human: exit 3"
+                );
             }
             other => panic!("expected a resume, got {other:?}"),
         }
@@ -919,18 +998,29 @@ mod tests {
         let refusal = guard(&store, false).expect_err("must not be overwritten");
 
         assert!(refusal.contains("could not record a submission in flight"), "{refusal}");
-        assert!(refusal.contains("may already be on the portal"), "{refusal}");
+        assert!(refusal.contains("cannot say how far through its queue it got"), "{refusal}");
+        assert!(refusal.contains("anything behind it may be on the portal"), "{refusal}");
         assert!(refusal.contains('2'), "the trainee in question: {refusal}");
         assert!(
-            refusal.contains("2 never attempted"),
-            "the suspect is not one a resume promises to run: {refusal}"
+            refusal.contains("0 a resume would run"),
+            "a resume of this file runs none of its queue: {refusal}"
         );
     }
 
-    /// And a resume keeps it out of the queue, while still continuing the two
-    /// behind it — the file is written off, not the batch.
+    /// And a resume runs none of the queue — not the suspect, and not the two
+    /// behind it either.
+    ///
+    /// This is the fix for a file stale by more than one handoff. The premise
+    /// that makes the tail look safe is that a legacy build's last write landed;
+    /// it need not have. Those builds dropped a failed write and carried on, so
+    /// the file can name trainee 1 while trainee 2 was also submitted and 3 was
+    /// in flight — and a roster of `["3", "4"]` would then re-submit 3, which is
+    /// the one thing Gate 3 forbids. The file here is the fixture above, which is
+    /// exactly that state; nothing on disk distinguishes it from the benign
+    /// reading, which is why the whole queue has to be written off rather than
+    /// the head alone.
     #[test]
-    fn a_resume_of_an_untracked_file_runs_the_queue_behind_the_suspect() {
+    fn a_resume_of_an_untracked_file_runs_none_of_its_queue() {
         let scratch = Scratch::new("legacy-resume");
         let store = untracked(&scratch);
 
@@ -940,13 +1030,40 @@ mod tests {
             Plan::Resume { roster, carried, owed } => {
                 let ids: Vec<String> = roster.iter().filter_map(|r| r.id.clone()).collect();
 
-                assert_eq!(ids, vec!["3", "4"], "not the one that may have been sent");
-                assert!(carried.iter().any(|r| r.trainee_id == "2"));
                 assert!(
-                    carried.iter().any(|r| r.trainee_id == "1"),
-                    "the row that landed rides along too"
+                    ids.is_empty(),
+                    "nothing in a queue the file cannot vouch for may be offered as work: {ids:?}"
                 );
-                assert_eq!(owed, 1, "the suspect is what a human is owed");
+
+                // Not dropped, though: what is not safe to run is still evidence,
+                // and the file is rewritten in full, so leaving these out of the
+                // carry would erase the only record that they exist.
+                for id in ["1", "2", "3", "4"] {
+                    assert!(
+                        carried.iter().any(|r| r.trainee_id == id),
+                        "trainee {id} must ride along: {carried:?}"
+                    );
+                }
+
+                // The head and the tail are marked apart, so the report says
+                // which trainee the dead build was most likely working on and
+                // which it merely might have reached. The refusal keeps that
+                // distinction; a resume that flattened it would lose the one fact
+                // that says how far the file can be trusted.
+                let code = |id: &str| {
+                    carried
+                        .iter()
+                        .find(|r| r.trainee_id == id)
+                        .and_then(|r| r.error_code.clone())
+                };
+                assert_eq!(code("2").as_deref(), Some(LEGACY_PENDING_CODE));
+                assert_eq!(code("3").as_deref(), Some(LEGACY_QUEUE_CODE));
+                assert_eq!(code("4").as_deref(), Some(LEGACY_QUEUE_CODE));
+
+                assert_eq!(
+                    owed, 3,
+                    "the suspect and the two behind it are all a human's to check"
+                );
             }
             other => panic!("expected a resume, got {other:?}"),
         }

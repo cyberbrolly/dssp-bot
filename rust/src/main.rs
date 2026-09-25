@@ -515,12 +515,20 @@ fn announce_resume(
         checkpoint.path().display()
     );
 
+    // Counted off `carried` rather than taken from `owed`: `owed` answers "what
+    // does a human still owe an answer for", which also includes the trainees a
+    // file's own counts have lost track of. Those are not in `carried`, so using
+    // it here would overstate how many of these records are unconfirmed.
+    let unconfirmed = carried
+        .iter()
+        .filter(|r| r.outcome == crate::report::Outcome::Indeterminate)
+        .count();
+
     if !carried.is_empty() {
         eprintln!(
-            "dssp-bot:   carrying {} result(s) forward into this batch — {} of them unconfirmed \
-             and never replayed",
+            "dssp-bot:   carrying {} result(s) forward into this batch — {unconfirmed} of them \
+             unconfirmed and never replayed",
             carried.len(),
-            owed
         );
     }
 
@@ -540,9 +548,13 @@ fn announce_resume(
     }
 
     if roster.is_empty() {
+        // Deliberately no longer says "every trainee was either recorded or left
+        // unconfirmed": that is false exactly when `owed` counts trainees the
+        // file's own numbers have lost track of, and the lines above have just
+        // named them. The claim was the part that could not be checked; the
+        // operator gets the counts instead.
         eprintln!(
-            "dssp-bot: nothing to resume — every trainee in {} was either recorded or left \
-             unconfirmed",
+            "dssp-bot: nothing to resume — this run would submit nothing from {}",
             checkpoint.path().display()
         );
 
@@ -603,7 +615,14 @@ fn print_report(report: &BatchReport) {
 /// confirmation, and a skipped one sits behind an aborted batch — both need a
 /// human. A definitive failure is terminal but safe to re-run.
 fn batch_exit_code(report: &BatchReport) -> i32 {
-    if report.indeterminate > 0 || report.skipped > 0 {
+    // `aborted` first, and not only the counts: a run that stopped on its last
+    // queued trainee drains nothing, so `skipped` is 0 and the trainee that
+    // stopped it carries whatever outcome it had. Without this the run reports
+    // "definitive failures, safe to re-run" for a batch that halted because the
+    // session lapsed or the portal changed shape — the two cases where the
+    // README asks for a human, and the same verdict the single-trainee path
+    // already gives.
+    if report.aborted || report.indeterminate > 0 || report.skipped > 0 {
         3
     } else if report.failed > 0 {
         4
@@ -750,5 +769,52 @@ mod tests {
     fn a_resolvable_batch_reports_no_problems() {
         let available = portal(&[("123", "John Doe")]);
         assert!(resolve_against(&available, &[want_id("123")]).is_ok());
+    }
+
+    // -- exit codes ---------------------------------------------------------
+
+    fn report_of(outcomes: &[crate::report::Outcome], aborted: bool) -> BatchReport {
+        let results = outcomes
+            .iter()
+            .enumerate()
+            .map(|(i, outcome)| crate::report::TrainingResult {
+                trainee_id: (i + 1).to_string(),
+                trainee_name: String::new(),
+                outcome: *outcome,
+                attempts: 1,
+                error_code: None,
+                message: None,
+            })
+            .collect();
+
+        BatchReport::build(results, "0".to_string(), "1".to_string(), aborted)
+    }
+
+    /// A run that aborted on its last queued trainee drains nothing, so its
+    /// counts are a `Failed` with no skips and no indeterminate — the shape a
+    /// batch that simply hit a bad response leaves. Exit 4 means "definitive
+    /// failures, safe to re-run", and that is the wrong advice for a run that
+    /// stopped because the session lapsed or the portal changed shape: those are
+    /// the cases the README sends to a human, and the ones the single-trainee
+    /// path already answers with 3.
+    #[test]
+    fn an_abort_with_nothing_drained_exits_3_not_4() {
+        use crate::report::Outcome::{Failed, Success};
+
+        let aborted = report_of(&[Success, Failed], true);
+        assert_eq!(aborted.skipped, 0, "nothing was left to drain");
+        assert_eq!(batch_exit_code(&aborted), 3);
+
+        // The same counts without the abort flag: a batch that ran to the end
+        // and had one trainee rejected is genuinely safe to re-run.
+        let finished = report_of(&[Success, Failed], false);
+        assert_eq!(batch_exit_code(&finished), 4);
+    }
+
+    #[test]
+    fn a_clean_batch_exits_0() {
+        use crate::report::Outcome::Success;
+
+        assert_eq!(batch_exit_code(&report_of(&[Success, Success], false)), 0);
     }
 }

@@ -33,13 +33,28 @@ pub struct BatchReport {
     pub skipped: usize,
     pub indeterminate: usize,
     pub success_rate: f64,
+    /// Whether the run stopped early, rather than by working through its queue.
+    ///
+    /// The counts cannot answer this on their own, which is why it is recorded
+    /// separately: a batch that aborted on its *last* trainee drains nothing, so
+    /// `skipped` stays 0 and the aborting row is whatever outcome it was — and a
+    /// run that stopped for a lapsed session or a changed portal then looks
+    /// exactly like a run that finished. `batch_exit_code` reads this to tell
+    /// "definitive failures, safe to re-run" apart from "a human is owed a look",
+    /// which is the distinction the exit contract is for.
+    pub aborted: bool,
     pub started_at: String,
     pub finished_at: String,
     pub results: Vec<TrainingResult>,
 }
 
 impl BatchReport {
-    pub fn build(results: Vec<TrainingResult>, started_at: String, finished_at: String) -> Self {
+    pub fn build(
+        results: Vec<TrainingResult>,
+        started_at: String,
+        finished_at: String,
+        aborted: bool,
+    ) -> Self {
         let successful = results
             .iter()
             .filter(|r| r.outcome == Outcome::Success)
@@ -70,6 +85,7 @@ impl BatchReport {
             skipped,
             indeterminate,
             success_rate,
+            aborted,
             started_at,
             finished_at,
             results,

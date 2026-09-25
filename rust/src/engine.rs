@@ -56,6 +56,37 @@ fn queue_key(trainee: &TraineeRef, index: usize) -> String {
         .unwrap_or_else(|| format!("#{index}"))
 }
 
+/// Which namespace a trainee's key belongs to.
+///
+/// The queue key and the dedupe key are the same *string* and have to stay that
+/// way: the string is what the checkpoint durably records and what a resume
+/// looks for in the queue afterwards. They must not, though, share one
+/// *namespace* while being compared against each other. `queue_key` falls back
+/// to `#<index>` for an entry with neither id nor name, so an entry whose id is
+/// literally `#3`, listed beside a nameless entry at index 3, produces the same
+/// string twice — and the set holding both cannot tell a genuine repeat from two
+/// different trainees that happen to spell the same. One of them is then dropped
+/// with a note about a repeat that was never there.
+///
+/// Tagging keeps the string for the file and gives the comparison three
+/// namespaces, so only like can collide with like.
+#[derive(Hash, PartialEq, Eq)]
+enum QueueKey {
+    Id(String),
+    Name(String),
+    Position(usize),
+}
+
+/// The trainee's key, in the namespace it came from. Same precedence as
+/// [`queue_key`], and the two must agree about which field won.
+fn key_namespace(trainee: &TraineeRef, index: usize) -> QueueKey {
+    match (&trainee.id, &trainee.name) {
+        (Some(id), _) => QueueKey::Id(id.clone()),
+        (None, Some(name)) => QueueKey::Name(name.clone()),
+        (None, None) => QueueKey::Position(index),
+    }
+}
+
 /// A roster is a set: collapse repeats, keep the first occurrence.
 ///
 /// Two entries under one key would submit the same trainee twice, and after a
@@ -70,14 +101,17 @@ fn queue_key(trainee: &TraineeRef, index: usize) -> String {
 /// left inside `total` would put the file permanently one trainee short of its
 /// groups, which `blocks_start` reads as a submission that may have gone
 /// unrecorded and refuses on every start thereafter.
+///
+/// Compared by [`QueueKey`], written out as a `String` — see that type for why
+/// the two are not the same question.
 fn dedupe(trainees: Vec<TraineeRef>) -> Vec<(String, TraineeRef)> {
-    let mut seen: HashSet<String> = HashSet::with_capacity(trainees.len());
+    let mut seen: HashSet<QueueKey> = HashSet::with_capacity(trainees.len());
     let mut unique: Vec<(String, TraineeRef)> = Vec::with_capacity(trainees.len());
 
     for (i, trainee) in trainees.into_iter().enumerate() {
         let key = queue_key(&trainee, i);
 
-        if !seen.insert(key.clone()) {
+        if !seen.insert(key_namespace(&trainee, i)) {
             eprintln!("dssp-bot: {key} is already queued — skipping the repeat");
 
             continue;
@@ -211,6 +245,11 @@ impl BatchEngine {
             queue.enqueue(key, trainee);
         }
 
+        // Set by either early exit below. The counts alone cannot say it: an
+        // abort on the last queued trainee drains nothing, so `skipped` stays 0
+        // and the run reads as one that worked through its queue.
+        let mut aborted = false;
+
         while let Some(task) = queue.dequeue() {
             // Before the submission, not after it. From this instant the trainee
             // is in no other group — it has left the queue and its result does
@@ -247,6 +286,7 @@ impl BatchEngine {
                 // not know it still owes a submission.
                 queue.put_back(task);
                 drain_skipped(&mut queue, &mut results, NOT_SUBMITTED);
+                aborted = true;
                 let _ = self.machine.transition_to(AutomationState::Stopped);
                 break;
             }
@@ -274,6 +314,7 @@ impl BatchEngine {
             if should_abort(last) {
                 let reason = abort_reason(last);
                 drain_skipped(&mut queue, &mut results, &reason);
+                aborted = true;
                 let _ = self.machine.transition_to(AutomationState::Stopped);
                 break;
             }
@@ -298,7 +339,7 @@ impl BatchEngine {
             None,
         );
 
-        Ok(BatchReport::build(results, started_at, now_ms()))
+        Ok(BatchReport::build(results, started_at, now_ms(), aborted))
     }
 
     /// One trainee: submit with the retry policy, never re-committing an
@@ -561,6 +602,30 @@ mod tests {
             .collect()
     }
 
+    /// An entry addressed by id, by name, or by nothing at all — the three
+    /// shapes `queue_key` distinguishes, and the three that used to share one
+    /// string space.
+    fn numbered(id: &str) -> TraineeRef {
+        TraineeRef {
+            id: Some(id.to_string()),
+            name: None,
+        }
+    }
+
+    fn named(name: &str) -> TraineeRef {
+        TraineeRef {
+            id: None,
+            name: Some(name.to_string()),
+        }
+    }
+
+    fn anonymous() -> TraineeRef {
+        TraineeRef {
+            id: None,
+            name: None,
+        }
+    }
+
     /// Zero delays keep retry tests instant.
     fn fast_policy() -> RetryPolicy {
         RetryPolicy {
@@ -620,6 +685,74 @@ mod tests {
         assert_eq!(w.submit_calls, 2, "the repeat never reached the worker");
         assert_eq!(report.total, 2, "and the file accounts for two, not three");
         assert_eq!(report.successful, 2);
+    }
+
+    /// The dedupe key is a string that the input can also write into: `queue_key`
+    /// falls back to `#<index>` for an entry with neither id nor name, and that
+    /// fallback used to share one `HashSet<String>` with the ids and names it was
+    /// compared against. An id of literally `#1`, listed beside a nameless entry
+    /// at index 1, therefore produced the same string twice — and the second was
+    /// dropped as a repeat, with a note about a repeat that was never there,
+    /// while a real trainee never reached the worker and nothing durable said so.
+    ///
+    /// Unreachable from the CLI, which resolves every entry to a portal id first,
+    /// but `BatchEngine::run` is `pub` and Stage 29's daemon is the next caller —
+    /// so the comparison is namespaced here rather than left to a caller to
+    /// validate its way around.
+    #[test]
+    fn an_id_that_looks_positional_does_not_swallow_a_nameless_entry() {
+        let mut w = FakeTransport::new(
+            true,
+            vec![confirmed("1", "A"), confirmed("2", "B")],
+        );
+
+        let roster = vec![numbered("#1"), anonymous()];
+        let report = fast_engine().run(&mut w, &session(), roster).unwrap();
+
+        assert_eq!(w.submit_calls, 2, "two entries, two different trainees");
+        assert_eq!(report.total, 2);
+    }
+
+    /// The other half of the same collision. An id and a name are different
+    /// namespaces, so a trainee *named* `x` is not the trainee *with id* `x`, and
+    /// collapsing the two would drop one of them as a repeat.
+    #[test]
+    fn a_name_does_not_collide_with_an_id() {
+        let mut w = FakeTransport::new(
+            true,
+            vec![confirmed("1", "A"), confirmed("2", "B")],
+        );
+
+        let roster = vec![numbered("x"), named("x")];
+        let report = fast_engine().run(&mut w, &session(), roster).unwrap();
+
+        assert_eq!(w.submit_calls, 2);
+        assert_eq!(report.total, 2);
+    }
+
+    /// The counts cannot say a batch stopped early. This is the case that shows
+    /// it: an abort on the *last* queued trainee drains nothing, so `skipped` is
+    /// 0 and the row that stopped the run is a `Failed` one — and a run that
+    /// halted because the session lapsed then looks, from its numbers alone,
+    /// exactly like a run that worked through its queue and hit a bad response.
+    /// `aborted` is what lets the exit code tell those apart.
+    #[test]
+    fn an_abort_on_the_last_trainee_is_recorded_as_an_abort() {
+        let mut w = FakeTransport::new(
+            true,
+            vec![resp(
+                r#"{"v":1,"status":"error","error_code":"SESSION_EXPIRED","message":"gone","proves_nothing_submitted":true}"#,
+            )],
+        );
+        let report = fast_engine().run(&mut w, &session(), refs(&["1"])).unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.skipped, 0, "nothing was left to drain behind it");
+        assert_eq!(report.indeterminate, 0);
+        assert!(
+            report.aborted,
+            "nothing in the counts says the run stopped early"
+        );
     }
 
     #[test]
