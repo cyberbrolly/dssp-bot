@@ -5,13 +5,9 @@ import type { TrainingFormOptions } from "../../domain/TrainingFormOptions";
 
 /**
  * The wire form of a `PortalAdapter` call, sent from the background worker to
- * the content script.
- *
- * Every `PortalAdapter` method needs an arm here and a case in
- * `content-script.ts`, or the call cannot cross the boundary at all. The session
- * operations were once missing from both, so `RemotePortalAdapter` had no way to
- * forward them even in principle. `PortalAdapterWiring.test.ts` now asserts the
- * three-way correspondence.
+ * the content script. Every method needs an arm here and a case in
+ * `content-script.ts`, or the call cannot cross the boundary;
+ * `PortalAdapterWiring.test.ts` asserts the three-way correspondence.
  */
 export type PortalCommand =
   | { type: "PORTAL_IS_PAGE" }

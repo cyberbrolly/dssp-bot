@@ -9,18 +9,11 @@ export type SubmissionOutcome =
   | { status: "rejected"; message: string };
 
 /**
- * Every operation the engine can ask of the DSSP portal.
- *
- * Deliberately free of optional members. The three session operations were once
- * declared `?:` so that adapters could opt in, and `RemotePortalAdapter` — the
- * only adapter the service worker actually uses — silently implemented none of
- * them while still satisfying this interface. The engine feature-detected them,
- * found nothing, and fell through to a path that failed every trainee. Nothing
- * caught it, because optionality made the omission legal.
- *
- * A required member turns that omission back into a compile error. Any adapter
- * that genuinely cannot perform an operation says so at runtime, by returning a
- * failed `Result` the way `UnmappedPortalAdapter` does.
+ * Every operation the engine can ask of the DSSP portal. Deliberately free of
+ * optional members: optionality once let `RemotePortalAdapter` silently omit the
+ * session operations while still satisfying this interface. A required member
+ * turns that omission into a compile error; an adapter that genuinely cannot
+ * perform an operation returns a failed `Result` instead.
  */
 export interface PortalAdapter {
   /**

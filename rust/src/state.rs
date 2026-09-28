@@ -1,4 +1,4 @@
-//! Automation state machine. Port of AutomationState.ts.
+//! Automation state machine.
 //!
 //! Guards the per-trainee progression so an illegal jump (e.g. submitting
 //! without having loaded a trainee) is a hard error rather than a silent bug.

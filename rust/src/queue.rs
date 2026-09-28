@@ -8,7 +8,6 @@ pub struct QueueTask<T> {
     pub payload: T,
 }
 
-/// A plain first-in, first-out queue of identified tasks.
 #[derive(Debug)]
 pub struct TaskQueue<T> {
     tasks: VecDeque<QueueTask<T>>,
@@ -38,10 +37,8 @@ impl<T> TaskQueue<T> {
         self.tasks.pop_front()
     }
 
-    /// Put a dequeued task back at the front, where it came from.
-    ///
     /// For the one case a task leaves the queue and must not be run: the run
-    /// stopped before submitting it. At the front rather than the back, so the
+    /// stopped before submitting it. Put back at the front, not the back, so the
     /// order a batch was queued in survives — a drain records these as skipped
     /// in dequeue order, and that order is what a resume re-runs them in.
     pub fn put_back(&mut self, task: QueueTask<T>) {
@@ -91,9 +88,6 @@ mod tests {
         assert_eq!(q.ids(), vec!["b", "c"]);
     }
 
-    /// The trainee a stopped run took off the queue but never sent belongs back
-    /// where it was, not at the end: the order these are drained in is the order
-    /// a resume re-runs them in.
     #[test]
     fn a_task_put_back_keeps_its_place() {
         let mut q: TaskQueue<i32> = TaskQueue::new();

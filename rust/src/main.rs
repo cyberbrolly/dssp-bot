@@ -81,13 +81,10 @@ fn normalize_name(value: &str) -> String {
         .to_uppercase()
 }
 
-/// Decide single vs batch from the job file.
-///
-/// Everything that can be checked without the portal is checked here, before a
-/// browser opens: a malformed batch must fail closed rather than submit a
-/// prefix of its trainees and then discover the problem. Names are resolved —
-/// and duplicates dropped — later, in [`resolve_trainees`], once the worker can
-/// be asked what the portal actually holds.
+/// Decide single vs batch from the job file, checking everything possible
+/// without the portal: a malformed batch must fail closed rather than submit a
+/// prefix and then discover the problem. Names are resolved and duplicates
+/// dropped later, in [`resolve_trainees`].
 fn plan(job: &Job) -> Result<Plan, String> {
     match (&job.trainee, &job.trainees) {
         (Some(_), Some(_)) => {
@@ -137,16 +134,12 @@ impl ResolveFailure {
 
 /// Resolve a batch against an already-fetched trainee list, then dedupe.
 ///
-/// Mirrors `PortalClient._resolve_trainee` so a reference resolves the same way
-/// whether the CLI or the worker does it: an explicit id must exist, a name
-/// must match exactly one trainee, and anything else stops the batch while the
-/// report is still empty. Deduping *after* resolution is the point — two
-/// entries naming one person, one by id and one by name, collapse into a single
-/// submission instead of the second coming back as a duplicate.
-///
-/// Every unresolvable entry is collected rather than stopping at the first, so
-/// one run tells the operator about all of them. Split out from
-/// [`resolve_trainees`] so the matching rules are testable without a worker.
+/// Mirrors `PortalClient._resolve_trainee`: an explicit id must exist, a name
+/// must match exactly one trainee, and anything else stops the batch. Deduping
+/// *after* resolution collapses two entries naming one person (one by id, one
+/// by name) into a single submission. Every unresolvable entry is collected
+/// rather than stopping at the first, so one run reports all of them; split out
+/// from [`resolve_trainees`] so the rules are testable without a worker.
 fn resolve_against(
     available: &[TraineeInfo],
     trainees: &[TraineeRef],
@@ -219,8 +212,7 @@ fn resolve_against(
 
 /// Fetch the portal's trainee list and canonicalize the batch against it.
 ///
-/// Resolution needs an authenticated session, so the caller establishes one
-/// before calling this.
+/// Needs an authenticated session — the caller establishes one first.
 fn resolve_trainees(
     client: &mut WorkerClient,
     trainees: &[TraineeRef],
@@ -283,8 +275,7 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
         }
     };
 
-    // 1. Session gate. On the first run this blocks while you log in manually
-    //    in the opened browser window.
+    // On the first run this blocks for manual login in the opened browser window.
     eprintln!("dssp-bot: ensuring portal session…");
     match client.send(&Request::ensure_session(new_id())) {
         Ok(r) if r.status == Status::Ok => eprintln!("dssp-bot: session ok"),
@@ -298,7 +289,6 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
         }
     }
 
-    // 2. Informational: show the options the portal actually offers.
     match client.send(&Request::get_form_options(new_id(), None)) {
         Ok(r) if r.status == Status::Ok => eprintln!(
             "dssp-bot: form options — {} instructors, {} training types",
@@ -309,14 +299,10 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
         Err(e) => eprintln!("dssp-bot: form options error: {e}"),
     }
 
-    // 3. Submit one trainee. Rust owns retry; the same job_id spans attempts.
-    //
-    // Said once, before the loop rather than on each attempt: nothing below this
-    // line is durable, so from the first send onward a death that reports no
-    // result is a death that cannot say whether the portal took the record. One
-    // line covers every attempt, and stderr is unbuffered — unlike a checkpoint,
-    // it cannot be lost by the crash it warns about. A batch needs no such line:
-    // it writes the window down before it opens it.
+    // Rust owns retry; the same job_id spans attempts. Warn once, before the
+    // loop: nothing below is durable, so a death that reports no result cannot
+    // say whether the portal took the record. stderr is unbuffered and so cannot
+    // be lost by the crash it warns about.
     eprintln!(
         "dssp-bot: submitting {} now — if this process dies before it reports a result, the \
          submission may already be on the portal: check there before re-running this job",
@@ -355,9 +341,8 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
     };
 
     client.shutdown();
-    // Discharge the warning above, or leave it standing. An operator who saw it
-    // and then a stop has to be able to tell "the portal answered" from "it did
-    // not" without knowing what each exit code means.
+    // Discharge the warning above, or leave it standing: the operator must be
+    // able to tell "the portal answered" from "it did not".
     if code == 3 {
         eprintln!("dssp-bot: the submission is not settled by this run — check the portal first");
     } else {
@@ -367,18 +352,13 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
     code
 }
 
-/// Many trainees, one session. The engine aborts the whole batch — draining
-/// whatever is still queued as skipped — the moment a result cannot be
-/// accounted for.
+/// Many trainees, one session. The engine aborts the whole batch — draining what
+/// is still queued as skipped — the moment a result cannot be accounted for.
 ///
-/// Unlike the single-trainee path, a batch always checkpoints — the engine will
-/// not even build without a sink: it is the run most likely to be interrupted,
-/// and the one where an interrupted run has real records on the portal to
-/// account for. A single submission that dies changes nothing durable; all it
-/// can do is say so, which is what the warning before its submit loop is for.
-///
-/// The checkpoint is reconciled *before* the worker is spawned, so a start that
-/// has to be refused opens no browser and submits nothing.
+/// A batch always checkpoints (the engine will not build without a sink): an
+/// interrupted run has real records on the portal to account for. The checkpoint
+/// is reconciled *before* the worker is spawned, so a refused start opens no
+/// browser and submits nothing.
 fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) -> i32 {
     // Where a killed batch leaves its record. Named on stderr because the file
     // is the operator's only account of a run that never printed a report.
@@ -393,14 +373,12 @@ fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) ->
         }
     };
 
-    // `recovery::Plan` is qualified: `Plan` here already names the job file's
-    // shape, which is a different question ("single or batch?") from this one.
+    // Qualified: `Plan` already names the job file's shape, a different question.
     let (wanted, carried) = match start.plan {
         recovery::Plan::Fresh => {
-            // Only on this path, where the counts are exactly the file's own: a
-            // resume reports the same records itself, one line each, and a
-            // resume of a file old enough to have an untracked suspect would
-            // otherwise be described here by a count that does not include it.
+            // Only here, where the counts are exactly the file's own: a resume
+            // reports its own records itself, so this line would otherwise be
+            // given a count that misses an untracked suspect.
             if start.recovered
                 && let Some(previous) = &start.previous
             {
@@ -475,12 +453,9 @@ fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) ->
 }
 
 /// Says out loud what a predecessor left un-attempted, so a fresh start does not
-/// drop it in silence.
-///
-/// Those trainees are deliberately not carried into the new batch — the job file
-/// decides what runs — but a batch that quietly leaves five people unsubmitted,
-/// because an earlier run aborted before reaching them, is the kind of gap an
-/// operator finds out about from the portal.
+/// drop it in silence. Those trainees are deliberately not carried into the new
+/// batch — the job file decides what runs — but a batch that quietly leaves
+/// people unsubmitted is a gap an operator would otherwise find on the portal.
 fn announce_fresh(start: &Start) {
     let Some(previous) = &start.previous else {
         return;
@@ -515,10 +490,9 @@ fn announce_resume(
         checkpoint.path().display()
     );
 
-    // Counted off `carried` rather than taken from `owed`: `owed` answers "what
-    // does a human still owe an answer for", which also includes the trainees a
-    // file's own counts have lost track of. Those are not in `carried`, so using
-    // it here would overstate how many of these records are unconfirmed.
+    // Counted off `carried`, not `owed`: `owed` also counts trainees the file's
+    // own numbers lost track of, which are not in `carried` — using it here would
+    // overstate how many of these records are unconfirmed.
     let unconfirmed = carried
         .iter()
         .filter(|r| r.outcome == crate::report::Outcome::Indeterminate)
@@ -532,10 +506,9 @@ fn announce_resume(
         );
     }
 
-    // Printed before anything is submitted, so the ids are on screen while the
-    // operator can still stop the run — and printed whether or not there is
-    // anything left to run, because this list is the only place the crash-window
-    // trainee is named.
+    // Printed before anything is submitted so the ids are on screen while the
+    // operator can still stop the run — and printed even when nothing is left to
+    // run, because this list is the only place the crash-window trainee is named.
     for result in carried
         .iter()
         .filter(|r| r.outcome == crate::report::Outcome::Indeterminate)
@@ -548,19 +521,15 @@ fn announce_resume(
     }
 
     if roster.is_empty() {
-        // Deliberately no longer says "every trainee was either recorded or left
-        // unconfirmed": that is false exactly when `owed` counts trainees the
-        // file's own numbers have lost track of, and the lines above have just
-        // named them. The claim was the part that could not be checked; the
-        // operator gets the counts instead.
+        // No completeness claim: it would be false exactly when `owed` counts
+        // trainees the file's numbers lost track of — the lines above name them.
         eprintln!(
             "dssp-bot: nothing to resume — this run would submit nothing from {}",
             checkpoint.path().display()
         );
 
-        // Exit 3 only while a human is still owed: those records may exist on
-        // the portal, and this run has nothing to submit. A batch whose loose
-        // ends are all settled is simply already done.
+        // Exit 3 only while a human is still owed: those records may exist on the
+        // portal and this run submits nothing. Settled loose ends mean done.
         return Some(if owed == 0 { 0 } else { 3 });
     }
 
@@ -572,8 +541,7 @@ fn announce_resume(
     None
 }
 
-/// Up to five ids, then a count — enough to recognise the list without turning
-/// one line into a wall.
+/// Up to five ids, then a "+N more" count.
 fn preview(ids: &[String]) -> String {
     let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
 
@@ -615,13 +583,10 @@ fn print_report(report: &BatchReport) {
 /// confirmation, and a skipped one sits behind an aborted batch — both need a
 /// human. A definitive failure is terminal but safe to re-run.
 fn batch_exit_code(report: &BatchReport) -> i32 {
-    // `aborted` first, and not only the counts: a run that stopped on its last
-    // queued trainee drains nothing, so `skipped` is 0 and the trainee that
-    // stopped it carries whatever outcome it had. Without this the run reports
-    // "definitive failures, safe to re-run" for a batch that halted because the
-    // session lapsed or the portal changed shape — the two cases where the
-    // README asks for a human, and the same verdict the single-trainee path
-    // already gives.
+    // `aborted` first, not only the counts: a run that stopped on its last queued
+    // trainee drains nothing, so `skipped` is 0 and its outcome is whatever that
+    // trainee had. Without this it reports "safe to re-run" for a batch that
+    // halted on a lapsed session or a changed portal — the cases needing a human.
     if report.aborted || report.indeterminate > 0 || report.skipped > 0 {
         3
     } else if report.failed > 0 {
@@ -771,8 +736,6 @@ mod tests {
         assert!(resolve_against(&available, &[want_id("123")]).is_ok());
     }
 
-    // -- exit codes ---------------------------------------------------------
-
     fn report_of(outcomes: &[crate::report::Outcome], aborted: bool) -> BatchReport {
         let results = outcomes
             .iter()
@@ -790,13 +753,9 @@ mod tests {
         BatchReport::build(results, "0".to_string(), "1".to_string(), aborted)
     }
 
-    /// A run that aborted on its last queued trainee drains nothing, so its
-    /// counts are a `Failed` with no skips and no indeterminate — the shape a
-    /// batch that simply hit a bad response leaves. Exit 4 means "definitive
-    /// failures, safe to re-run", and that is the wrong advice for a run that
-    /// stopped because the session lapsed or the portal changed shape: those are
-    /// the cases the README sends to a human, and the ones the single-trainee
-    /// path already answers with 3.
+    /// A run that aborted on its last queued trainee drains nothing: its counts
+    /// are a `Failed` with no skips, so it would exit 4 ("definitive failures,
+    /// safe to re-run") when the halt actually needs a human.
     #[test]
     fn an_abort_with_nothing_drained_exits_3_not_4() {
         use crate::report::Outcome::{Failed, Success};

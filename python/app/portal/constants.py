@@ -16,7 +16,6 @@ def _flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-# Origin / URLs -------------------------------------------------------------
 DSSP_ORIGIN = os.environ.get("DSSP_ORIGIN", "https://dssp.frsc.gov.ng").rstrip("/")
 TRAINEE_PAGE_PATH = "/Trainee"
 TRAINING_FORM_PATH = "/Trainee/TrainingLog/TraineeId="
@@ -29,7 +28,6 @@ def training_form_url(trainee_id: str) -> str:
     return f"{DSSP_ORIGIN}{TRAINING_FORM_PATH}{quote(trainee_id)}"
 
 
-# Selectors -----------------------------------------------------------------
 TRAINEE_ROW_SELECTOR = "table.table-checkable tbody tr"
 TRAINEE_ID_LINK_SELECTOR = 'a[href*="TraineeId="]'
 TRAINING_LOG_LINK_SELECTOR = 'a[href*="/Trainee/TrainingLog/"][href*="TraineeId="]'
@@ -65,7 +63,6 @@ TRAINING_TYPE_SELECTORS = (
 # TraineeId=123 in an href, preceded by ? & or / (case-insensitive).
 TRAINEE_ID_RE = re.compile(r"(?:[?&/])TraineeId=(\d+)", re.IGNORECASE)
 
-# Runtime configuration -----------------------------------------------------
 # Persistent Chromium profile lives under python/.pw-profile (gitignored). The
 # operator logs in once and the session survives across worker restarts.
 _PYTHON_ROOT = Path(__file__).resolve().parents[2]

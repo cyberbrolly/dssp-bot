@@ -28,11 +28,9 @@ const LAST_REPORT_KEY = "dssp.lastReport";
 const CHECKPOINT_KEY = "dssp.checkpoint";
 
 /**
- * Persist batch progress after every trainee.
- *
- * Owns its own error reporting: the engine deliberately ignores failures here
- * so a storage problem cannot abort a run mid-submission, which means this is
- * the only place a failed write becomes visible.
+ * The engine deliberately ignores failures here, so a storage problem cannot
+ * abort a run mid-submission — which makes this the only place a failed write
+ * becomes visible.
  */
 async function writeCheckpoint(checkpoint: BatchCheckpoint): Promise<void> {
   try {
@@ -56,13 +54,9 @@ const runner = new BatchRunner(portal, engine);
 const messageBus = new MessageBus(browser.runtime);
 
 /**
- * Reconcile a checkpoint left behind by a previous worker.
- *
- * A checkpoint still marked `running` or `paused` means the last service worker
- * was terminated mid-batch — most likely while paused, since a paused engine
- * makes no API calls to hold the worker open. The trainees it had already
- * submitted are real records on the portal, so the checkpoint is re-marked
- * `interrupted` and kept for the operator rather than cleared.
+ * A checkpoint still marked `running` or `paused` means a previous worker was
+ * terminated mid-batch. Its already-submitted trainees are real portal records,
+ * so the checkpoint is re-marked `interrupted` and kept rather than cleared.
  */
 async function recoverInterruptedBatch(): Promise<void> {
   const stored = await storage.get<BatchCheckpoint>(CHECKPOINT_KEY);
@@ -122,8 +116,6 @@ async function startBatch(
 
     // A failed batch has usually already written records to the portal, so its
     // partial report is persisted on the same footing as a successful one.
-    // Returning early here previously discarded exactly the evidence needed to
-    // work out what had been submitted.
     const report = result.success ? result.data : engine.getReport();
 
     if (report) {
@@ -237,8 +229,8 @@ messageBus.listen(async (message) => {
   return handle(message);
 });
 
-// Runs on every worker start, not just install. That is the point: an ordinary
-// idle-collection restart is exactly how a batch gets interrupted.
+// Runs on every worker start, not just install: an ordinary idle-collection
+// restart is exactly how a batch gets interrupted.
 void recoverInterruptedBatch().catch((error: unknown) => {
   logger.error("Checkpoint recovery failed", {
     reason: error instanceof Error ? error.message : String(error),

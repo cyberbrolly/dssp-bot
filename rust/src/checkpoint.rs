@@ -1,8 +1,7 @@
 //! Durable batch progress. Ports BatchCheckpoint.ts.
 //!
-//! The engine keeps its queue and results in memory. A checkpoint mirrors them
-//! to disk after every trainee, because the question it answers — "what did
-//! this batch already write to the portal?" — has to outlive the process.
+//! The engine keeps its queue and results in memory; a checkpoint mirrors them
+//! to disk after every trainee.
 //!
 //! Serialized form stays snake_case, matching report.rs. The TS original uses
 //! camelCase, so anything reading this from the extension side needs a mapping.
@@ -25,7 +24,6 @@ pub enum CheckpointStatus {
     Interrupted,
 }
 
-/// A durable snapshot of batch progress.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchCheckpoint {
     pub status: CheckpointStatus,
@@ -42,35 +40,26 @@ pub struct BatchCheckpoint {
     /// The trainee handed to the worker whose result has not come back yet.
     ///
     /// The one window in which a trainee belongs to no other field: it has left
-    /// `pending` and has no entry in `results`, so before this field existed a
-    /// crash there left a possibly-submitted record in no group at all, and
-    /// recovery had nothing to go on. Non-`None` only in the write taken
-    /// immediately before the submission is sent.
+    /// `pending` and has no entry in `results`, so a crash there would leave a
+    /// possibly-submitted record in no group at all. Non-`None` only in the write
+    /// taken immediately before the submission is sent.
     ///
-    /// `default`, so a file written before this field existed still parses.
-    /// Always serialized — `null` when idle — rather than skipped, so a reader
-    /// can tell "nothing in flight" from "an older build wrote this", and so
-    /// the on-disk field-name test stays a real pin.
+    /// `default`, so a file written before this field existed still parses. Always
+    /// serialized — `null` when idle — rather than skipped, so a reader can tell
+    /// "nothing in flight" from "an older build wrote this".
     #[serde(default)]
     pub in_flight: Option<String>,
 }
 
 /// Receives each checkpoint the engine produces.
 ///
-/// Ports `CheckpointWriter` from BatchCheckpoint.ts, which the original port
-/// left out because nothing consumed it yet; the engine now wires a sink, so
-/// the trait belongs here rather than in the store that happens to implement
-/// it. Injected rather than owned so the engine stays free of storage concerns
-/// and remains testable without a filesystem — the unit tests pass a recorder,
-/// the CLI passes [`crate::store::CheckpointStore`].
+/// Injected rather than owned so the engine stays free of storage concerns and
+/// remains testable without a filesystem — the unit tests pass a recorder, the
+/// CLI passes [`crate::store::CheckpointStore`].
 ///
 /// Implementations own their own error reporting. The engine drops the error on
 /// purpose: a storage fault must not abort a batch that is otherwise submitting
 /// successfully, so the sink is the only place a failed write becomes visible.
-///
-/// The TS signature is `(checkpoint) => void | Promise<void>`; there is no
-/// async here, so a write is an ordinary call that returns its outcome rather
-/// than rejecting.
 pub trait CheckpointWriter {
     fn write(&mut self, checkpoint: &BatchCheckpoint) -> Result<(), String>;
 }
@@ -85,9 +74,7 @@ impl BatchCheckpoint {
     /// Re-mark a checkpoint abandoned by a terminated process.
     ///
     /// Returns whether the status actually changed, so a caller can skip a
-    /// redundant write. The TS original gets this by returning the input
-    /// unchanged and letting the caller compare references — an idiom Rust
-    /// does not need, so the answer is returned directly.
+    /// redundant write.
     pub fn mark_interrupted(&mut self) -> bool {
         if !self.is_live() {
             return false;
@@ -155,15 +142,15 @@ impl BatchCheckpoint {
     /// The trainee a file from a build without in-flight tracking could have
     /// handed to the worker without recording it, if any.
     ///
-    /// The head of `pending`, and only that one. Such a build wrote at settle
-    /// points, so its last write named the trainee it was about to work on —
-    /// everything queued behind that one was not yet dequeued, and is therefore
-    /// still evidence of never-sent. This is the same crash window [`Self::in_flight`]
-    /// names, recorded by a build that had no way to name it, which is why
-    /// recovery treats the two the same way: carried, never replayed.
+    /// The head of `pending`, and only that one: such a build wrote at settle
+    /// points, so its last write named the trainee it was about to work on, and
+    /// everything queued behind it was still evidence of never-sent. It is the
+    /// same crash window [`Self::in_flight`] names, recorded by a build that could
+    /// not name it — hence recovery treats the two the same: carried, never
+    /// replayed.
     ///
-    /// `tracks_in_flight` comes from the file rather than from this snapshot —
-    /// see `StoredCheckpoint` — because `#[serde(default)]` erases the difference
+    /// `tracks_in_flight` comes from the file rather than from this snapshot — see
+    /// `StoredCheckpoint` — because `#[serde(default)]` erases the difference
     /// between a file that had no such key and one that wrote `null`.
     pub fn untracked_suspect(&self, tracks_in_flight: bool) -> Option<TrainingResult> {
         if tracks_in_flight {
@@ -215,23 +202,19 @@ impl BatchCheckpoint {
             .collect()
     }
 
-    /// Every trainee left behind the head of a pre-Stage-28 file's queue,
-    /// written down as unconfirmed.
+    /// Every trainee left behind the head of a pre-Stage-28 file's queue, written
+    /// down as unconfirmed.
     ///
-    /// [`Self::untracked_suspect`] takes the head of `pending` on the premise
-    /// that such a build "wrote at settle points, so its last write named the
-    /// trainee it was about to work on — everything queued behind that one was
-    /// not yet dequeued". That holds only if the last write *landed*. It need
-    /// not have: the builds that wrote these files dropped a failed write and
-    /// carried on rather than stopping, so the file can be behind by more than
-    /// one handoff, and every entry in its queue could already have been handed
-    /// to the worker. The premise fails in the one direction this module may not
-    /// be wrong in, so the rest of the queue is not evidence of never-sent
-    /// either, and must not be offered as work.
+    /// [`Self::untracked_suspect`] takes the head of `pending` on the premise that
+    /// such a build wrote at settle points, so its last write named the trainee it
+    /// was about to work on. That holds only if the last write *landed*, and those
+    /// builds dropped a failed write rather than stopping — so the file can be
+    /// behind by more than one handoff, every remaining entry may already have
+    /// reached the worker, and the queue is not evidence of never-sent. It must not
+    /// be offered as work.
     ///
-    /// Called on a snapshot whose suspect has already been promoted, so this is
-    /// the tail: the head is [`Self::in_flight_record`] by then, and counting it
-    /// here as well would put one trainee in two groups.
+    /// Called on a snapshot whose suspect has already been promoted, so this is the
+    /// tail; counting the head here too would put one trainee in two groups.
     pub fn unvouched_queue(&self) -> Vec<TrainingResult> {
         self.pending
             .iter()
@@ -249,20 +232,15 @@ impl BatchCheckpoint {
     /// Whether a new batch may take this checkpoint's slot without an operator
     /// first acknowledging what the previous one left behind.
     ///
-    /// The question is only ever "is this file missing a submission?", never
-    /// "was the process killed?". Before [`Self::in_flight`] existed those were
-    /// the same question — which is why the TS original blocks on a live status
-    /// — but a live file whose counts all add up now says outright that nothing
-    /// was in flight when it died, and refusing it would be a false alarm. A
-    /// gate that cries wolf is one an operator learns to wave through with
-    /// `DSSP_RESUME=1`, and that habit is what makes the real refusal worthless.
+    /// The question is "is this file missing a submission?", not "was the process
+    /// killed?" — a live file whose counts all add up says nothing was in flight
+    /// when it died, and refusing it would train the operator to wave the gate
+    /// through with `DSSP_RESUME=1`, making the real refusal worthless.
     ///
-    /// Two things can still be missing, and liveness settles neither: an
-    /// unconfirmed record (which includes a trainee left in flight), and counts
-    /// that do not add up at all — see [`Self::unaccounted`].
-    ///
-    /// Never-attempted trainees do not block on their own: nothing was sent for
-    /// them, so leaving them out of a new batch cannot create a duplicate.
+    /// Two things can still be missing, and liveness settles neither: an unconfirmed
+    /// record (including a trainee left in flight), and counts that do not add up —
+    /// see [`Self::unaccounted`]. Never-attempted trainees do not block on their own:
+    /// nothing was sent for them, so leaving them out cannot create a duplicate.
     pub fn blocks_start(&self) -> bool {
         self.has_unconfirmed() || self.unaccounted() > 0
     }
@@ -288,20 +266,16 @@ impl BatchCheckpoint {
     ///
     /// A file from a build without [`Self::in_flight`] states what it knows by
     /// *omission* — the key's absence **is** the evidence — and every write this
-    /// build makes adds that key. So the first rewrite of a legacy file would
-    /// destroy the very thing [`Self::untracked_suspect`] reads: the next start
-    /// would take a silent file for a clean one and submit a trainee the dead
-    /// build may already have sent. Recording the suspicion therefore has to
-    /// come *before* anything that rewrites the file, or the recording is what
-    /// erases it.
+    /// build makes adds that key, so the first rewrite would destroy the very thing
+    /// [`Self::untracked_suspect`] reads: the next start would take a silent file
+    /// for a clean one and submit a trainee the dead build may already have sent.
+    /// Record the suspicion *before* any rewrite of the file.
     ///
-    /// Moving the trainee out of `pending` and into `in_flight` keeps the
-    /// partition — it leaves one group as it enters the other — and takes it out
-    /// of [`Self::never_attempted`], which is what stops a resume from running
+    /// Moving the trainee from `pending` to `in_flight` keeps the partition and
+    /// takes it out of [`Self::never_attempted`], which stops a resume from running
     /// it.
     ///
-    /// Returns whether it changed anything, so a caller can skip a redundant
-    /// write.
+    /// Returns whether it changed anything, so a caller can skip a redundant write.
     pub fn promote_suspect(&mut self, id: &str) -> bool {
         // A guard, not the protection. The caller cannot get here: `guard`
         // promotes only what `untracked_suspect` hands it, and that is `None` for
@@ -343,9 +317,8 @@ pub const IN_FLIGHT_MESSAGE: &str =
     "dequeued but no result was recorded — the submission may have reached the portal";
 
 /// Error code on the synthesized record for the trainee a pre-Stage-28 file left
-/// at the head of its queue. Distinct from [`IN_FLIGHT_CODE`] because the two
-/// say different things to whoever reads the report: one is a file that named the
-/// trainee it was submitting and the other is a file that could not.
+/// at the head of its queue. Distinct from [`IN_FLIGHT_CODE`]: one is a file that
+/// named the trainee it was submitting, the other a file that could not.
 pub const LEGACY_PENDING_CODE: &str = "CRASH_UNTRACKED_PENDING";
 
 /// Why that record is unconfirmed, in the operator's terms.
@@ -357,10 +330,9 @@ pub const LEGACY_PENDING_MESSAGE: &str =
 /// pre-Stage-28 file's queue.
 ///
 /// Distinct from [`LEGACY_PENDING_CODE`] because the two make different claims:
-/// the head is the one the dead build was most likely working on, and the tail is
-/// a trainee it may equally well have reached — the difference is only that the
-/// file stopped being able to say. One message that covered both would have to
-/// be vague about the one thing the operator acts on.
+/// the head is the one the dead build was most likely working on, the tail one it
+/// may equally well have reached. One message for both would have to be vague
+/// about the one thing the operator acts on.
 pub const LEGACY_QUEUE_CODE: &str = "CRASH_UNTRACKED_QUEUE";
 
 /// Why that record is unconfirmed, in the operator's terms.
@@ -405,8 +377,6 @@ mod tests {
         }
     }
 
-    // -- liveness -----------------------------------------------------------
-
     #[test]
     fn running_and_paused_are_live() {
         assert!(checkpoint(CheckpointStatus::Running).is_live());
@@ -418,8 +388,6 @@ mod tests {
         assert!(!checkpoint(CheckpointStatus::Finished).is_live());
         assert!(!checkpoint(CheckpointStatus::Interrupted).is_live());
     }
-
-    // -- mark_interrupted ---------------------------------------------------
 
     /// A live checkpoint is what a killed process leaves behind, so this is the
     /// case recovery exists for.
@@ -461,8 +429,6 @@ mod tests {
         assert_eq!(live.pending, vec!["3".to_string(), "4".to_string()]);
         assert_eq!(live.total, 4);
     }
-
-    // -- unreconciled -------------------------------------------------------
 
     #[test]
     fn only_indeterminate_results_are_unreconciled() {
@@ -512,8 +478,6 @@ mod tests {
         assert_eq!(split.indeterminate.len(), 1);
         assert_eq!(split.unprocessed.len(), 2);
     }
-
-    // -- the crash window ---------------------------------------------------
 
     /// The shape a process killed mid-submission leaves behind: trainee 2 was
     /// dequeued and handed to the worker, so it is in neither `results` nor
@@ -572,8 +536,6 @@ mod tests {
         }
     }
 
-    // -- never_attempted ----------------------------------------------------
-
     /// A batch abort drains the rest of the queue as skipped without ever
     /// sending it, so those ids — not just `pending` — are what a resume may
     /// safely run again.
@@ -590,8 +552,6 @@ mod tests {
         assert_eq!(cp.never_attempted(), vec!["2", "3"]);
     }
 
-    /// A crash during the drain leaves some in `results` and some in `pending`;
-    /// drain order then queue order is the order they were originally queued in.
     #[test]
     fn never_attempted_restores_queue_order_across_a_partial_drain() {
         let mut cp = checkpoint(CheckpointStatus::Interrupted);
@@ -614,8 +574,6 @@ mod tests {
         assert!(cp.never_attempted().is_empty(), "{:?}", cp.never_attempted());
     }
 
-    // -- the start gate -----------------------------------------------------
-
     /// A live checkpoint is a killed process; its last trainee's outcome may be
     /// unknown, so the next batch must not overwrite the only account of it.
     #[test]
@@ -631,7 +589,6 @@ mod tests {
         assert!(checkpoint(CheckpointStatus::Finished).blocks_start());
     }
 
-    /// The crash-window trainee, which is why the field exists at all.
     #[test]
     fn an_in_flight_trainee_blocks_a_start() {
         assert!(interrupted_mid_submission().blocks_start());
@@ -665,8 +622,6 @@ mod tests {
         assert!(!cp.blocks_start());
     }
 
-    // -- counts that do not add up ------------------------------------------
-
     /// Every trainee is in exactly one of `results`, `pending` and `in_flight`,
     /// so anything less than `total` means one has gone missing — and a file
     /// that cannot place a trainee cannot be trusted to be complete either.
@@ -698,12 +653,10 @@ mod tests {
         assert_eq!(cp.unaccounted(), 0);
     }
 
-    // -- promoting an untracked file's suspicion ----------------------------
-
     /// The regression this exists for: recording the suspicion is a *write*, and
-    /// every write this build makes adds the `in_flight` key that a legacy
-    /// file's evidence consists of not having. Promoting puts the fact into the
-    /// file's own fields first, so it survives being rewritten.
+    /// every write adds the `in_flight` key a legacy file's evidence consists of not
+    /// having. Promoting puts the fact into the file's fields first, so it survives
+    /// being rewritten.
     #[test]
     fn promoting_a_suspect_moves_it_out_of_the_queue_and_into_flight() {
         let mut cp = checkpoint(CheckpointStatus::Running);
@@ -721,11 +674,9 @@ mod tests {
         );
     }
 
-    /// Why the guard inside [`BatchCheckpoint::promote_suspect`] cannot fire for
-    /// its one caller, stated where the two conditions sit: a file that names a
-    /// trainee in flight is precisely a file that tracks in flight, and such a
-    /// file has no untracked suspect to promote. The caller therefore never sees
-    /// a suspect and a real in-flight record at the same time.
+    /// Why the guard inside [`BatchCheckpoint::promote_suspect`] cannot fire for its
+    /// one caller: a file that names a trainee in flight is precisely one that tracks
+    /// in flight, and such a file has no untracked suspect to promote.
     #[test]
     fn a_file_that_records_in_flight_has_no_suspect_to_promote() {
         let cp = interrupted_mid_submission();
@@ -737,12 +688,10 @@ mod tests {
         );
     }
 
-    /// The guard itself, called directly — the only way to reach it. Labelled
-    /// rather than left to read as protection: `guard` cannot produce this state,
-    /// so this pins the branch against a future edit and nothing more. What
-    /// actually keeps a suspect from being re-run is the promotion, which takes
-    /// it out of [`Self::never_attempted`], plus the `suspect_id` filter on the
-    /// resume roster.
+    /// The guard itself, called directly — the only way to reach it. It pins the
+    /// branch against a future edit, nothing more: what keeps a suspect from being
+    /// re-run is the promotion (out of [`Self::never_attempted`]) plus the
+    /// `suspect_id` filter on the resume roster.
     #[test]
     fn promoting_a_suspect_never_displaces_a_real_in_flight_record() {
         let mut cp = interrupted_mid_submission();
@@ -765,8 +714,6 @@ mod tests {
         assert_eq!(cp.in_flight, before.in_flight);
     }
 
-    // -- files from a build without in-flight tracking ----------------------
-
     /// Such a build wrote only at settle points, so its last write named the
     /// trainee it was about to work on. That one may already be on the portal;
     /// the rest of the queue was not yet dequeued and is still evidence.
@@ -783,8 +730,6 @@ mod tests {
         assert_eq!(suspect.error_code.as_deref(), Some(LEGACY_PENDING_CODE));
     }
 
-    /// A file that *can* record in flight says what it knows, and it does not
-    /// need the head of the queue to stand in for the marker.
     #[test]
     fn a_tracked_file_has_no_untracked_suspect() {
         let mut cp = checkpoint(CheckpointStatus::Running);
@@ -793,8 +738,6 @@ mod tests {
         assert!(cp.untracked_suspect(true).is_none());
     }
 
-    /// Nothing queued, nothing suspect: the file's own records account for
-    /// everything it could have submitted.
     #[test]
     fn an_empty_queue_leaves_nothing_to_suspect() {
         let mut cp = checkpoint(CheckpointStatus::Finished);
@@ -802,8 +745,6 @@ mod tests {
 
         assert!(cp.untracked_suspect(false).is_none());
     }
-
-    // -- persistence contract ----------------------------------------------
 
     /// The checkpoint is written to disk and read back by a later process, so
     /// the round trip has to preserve every field.

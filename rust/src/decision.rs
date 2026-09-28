@@ -63,7 +63,6 @@ fn aborts_batch(code: &str) -> bool {
     matches!(code, "SESSION_EXPIRED" | "PORTAL_STRUCTURE_CHANGED")
 }
 
-/// Decide what to do with a `submit_training` response.
 pub fn decide_submit(resp: &Response) -> Decision {
     match resp.status {
         Status::Ok => match resp.outcome.as_deref() {
@@ -192,8 +191,6 @@ mod tests {
         resp(&format!(r#"{{"v":1,"status":"error",{body}}}"#))
     }
 
-    // -- decide_submit: the single-trainee live path ------------------------
-
     #[test]
     fn confirmed_is_accepted_and_carries_its_reference() {
         match decide_submit(&ok(r#""outcome":"confirmed","reference":"REF-1""#)) {
@@ -313,8 +310,6 @@ mod tests {
         ));
     }
 
-    // -- settle_submit: the batch path --------------------------------------
-
     #[test]
     fn settle_confirmed_is_success() {
         assert_eq!(
@@ -401,8 +396,6 @@ mod tests {
             Settle::Indeterminate { .. }
         ));
     }
-
-    // -- retry policy -------------------------------------------------------
 
     #[test]
     fn backoff_grows_then_caps_at_the_ceiling() {

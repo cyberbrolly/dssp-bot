@@ -7,9 +7,8 @@ import {
 } from "../../src/core/infrastructure/portal/BridgeProtocol";
 
 /**
- * Stand-in for the window shared by both worlds. postMessage is a broadcast
- * channel with no request/response semantics, which is what makes the
- * correlation and spoofing cases below worth asserting.
+ * Stand-in for the window shared by both worlds. postMessage broadcasts with no
+ * request/response semantics, so correlation and spoofing need explicit tests.
  */
 class FakeWindow {
   readonly posted: unknown[] = [];

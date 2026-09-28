@@ -164,7 +164,6 @@ pub struct Response {
 }
 
 impl Response {
-    /// Human-readable summary for logs and the final report.
     pub fn summary(&self) -> String {
         match self.status {
             Status::Ok => {

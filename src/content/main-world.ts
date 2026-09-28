@@ -1,20 +1,14 @@
 /**
- * MAIN-world half of the content script.
+ * MAIN-world half of the content script. Runs in the page's own JS context, so
+ * `window.alert` and `XMLHttpRequest` here are the ones the portal actually
+ * uses; neither is reachable from the ISOLATED world, which is why this file
+ * exists. No `chrome.*` API is available — anything needing one goes through
+ * the postMessage bridge, and imports must stay free of extension APIs.
  *
- * Runs in the page's own JavaScript context, so `window.alert` here is the
- * function the portal actually calls and `XMLHttpRequest` is the constructor it
- * actually uses. Neither is reachable from the ISOLATED world, which is the
- * whole reason this file exists.
- *
- * No `chrome.*` API is available here. Everything that needs one goes through
- * the postMessage bridge to content-script.ts. Imports must stay free of
- * extension APIs — BridgeProtocol is types and pure predicates only.
- *
- * Injected at document_start, but @crxjs loads this chunk through a dynamic
- * import, so the patches land a tick later rather than truly first. That is
- * fine for this portal: its scripts call `alert` from jQuery event handlers at
- * submit time, long after load. It would not be safe against a page that
- * captured `window.alert` into a local during its own first script.
+ * @crxjs loads this chunk via dynamic import, so the patches land a tick after
+ * document_start, not truly first. Safe for this portal (its alert calls come
+ * from jQuery submit handlers, long after load), but not against a page that
+ * captured `window.alert` into a local in its own first script.
  */
 
 import {
@@ -56,15 +50,11 @@ function reply(id: string, response: unknown): void {
   window.postMessage(message, window.location.origin);
 }
 
-/** Decides whether dialogs are currently suppressed. Starts disarmed. */
 const dialogs = new DialogGate();
 
 /**
- * Render a dialog argument as text.
- *
- * The portal passes whatever it likes to alert(). Since the message text is the
- * only success/failure signal available, an object must not collapse to
- * "[object Object]" — that would discard the outcome of a submission.
+ * The portal passes whatever it likes to alert(), and that text is the only
+ * success/failure signal, so an object must not collapse to "[object Object]".
  */
 function toText(value: unknown): string {
   if (value === null || value === undefined) return "";
@@ -94,25 +84,16 @@ function recordAlert(text: string, at: string): void {
 
 /**
  * Swallow the portal's modal dialogs and record them instead — but only while
- * armed.
+ * armed. A native alert blocks the page and no extension can dismiss it, so an
+ * unarmed submit would stall; the text is captured because it is the portal's
+ * only success/failure signal.
  *
- * A native alert blocks the page until dismissed, and nothing in an extension
- * can click it. Left alone it would stall every batch on the first submission.
- * The text is the portal's only success/failure signal, so it is captured
- * rather than discarded.
- *
- * Suppression is deliberately NOT the default. `confirm()` answering Yes
- * unconditionally would auto-accept the portal's own destructive prompts for an
- * administrator browsing by hand, and a swallowed `alert()` would hide the
- * portal's feedback from them. So the wrappers are installed at document_start
- * (to be in place before the portal's handlers run) but pass straight through
- * to the originals until the ISOLATED half arms them around a submission it
- * started.
- *
- * Arming carries a deadline rather than a flag: if the ISOLATED half is torn
- * down mid-batch — navigation, a killed service worker, a thrown handler — the
- * page returns to normal on its own instead of staying suppressed for as long
- * as the tab is open.
+ * Suppression is NOT the default: unconditionally answering `confirm()` Yes
+ * would auto-accept the portal's own destructive prompts, and a swallowed
+ * `alert()` would hide its feedback from an administrator browsing by hand. The
+ * wrappers install at document_start but pass through to the originals until
+ * armed around a submission, and arming carries a deadline so a torn-down
+ * ISOLATED half returns the page to normal instead of staying suppressed.
  */
 function interceptDialogs(): void {
   /* eslint-disable @typescript-eslint/unbound-method --
@@ -122,8 +103,7 @@ function interceptDialogs(): void {
   const originalConfirm = window.confirm;
   /* eslint-enable @typescript-eslint/unbound-method */
 
-  // Every dialog is recorded either way: the text is useful evidence even when
-  // the extension is only observing. Only the suppression is conditional.
+  // Every dialog is recorded; only the suppression is conditional.
   window.alert = (message?: unknown): void => {
     recordAlert(toText(message), new Date().toISOString());
 
@@ -148,11 +128,8 @@ function interceptDialogs(): void {
 }
 
 /**
- * Record responses to portal POSTs.
- *
- * The portal reports outcomes through an alert, which is easy to miss and
- * ambiguous. The underlying HTTP response is the more reliable signal, and
- * capturing it is only possible from this world.
+ * The portal's alert is easy to miss and ambiguous; the underlying HTTP
+ * response is the more reliable signal, and only this world can capture it.
  */
 function interceptXhr(): void {
   /* eslint-disable @typescript-eslint/unbound-method --
@@ -219,10 +196,8 @@ function interceptXhr(): void {
 }
 
 /**
- * Bridge commands this world can answer.
- *
- * Only the page-global dialog and XHR interception lives here. Form discovery
- * and submission are handled by the isolated-world portal adapter.
+ * Bridge commands this world can answer. Form discovery and submission live in
+ * the isolated-world portal adapter, not here.
  */
 function handle(command: unknown): unknown {
   const type =

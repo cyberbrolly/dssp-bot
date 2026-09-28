@@ -44,9 +44,8 @@ def test_the_raw_body_is_written_verbatim_when_asked(tmp_path, monkeypatch):
 
 
 def test_a_dump_that_cannot_be_written_does_not_raise(tmp_path, monkeypatch):
-    # A file where the directory should be: mkdir raises NotADirectoryError, an
-    # OSError. A diagnostic that can abort a submission is worse than no
-    # diagnostic, so this must be swallowed.
+    # mkdir raises NotADirectoryError (an OSError) here; a diagnostic that can
+    # abort a submission is worse than none, so it must be swallowed.
     blocker = tmp_path / "evidence"
     blocker.write_text("not a directory")
     monkeypatch.setenv("DSSP_DUMP_DIR", str(blocker))
@@ -55,10 +54,9 @@ def test_a_dump_that_cannot_be_written_does_not_raise(tmp_path, monkeypatch):
 
 
 def test_a_body_that_is_not_valid_utf8_is_replaced_not_raised(tmp_path, monkeypatch):
-    # resp.text() can hand back a lone surrogate when the portal mislabels its
-    # charset. Writing that raises UnicodeEncodeError — a ValueError, so it would
-    # NOT be caught by an OSError handler, and the submission would die on a
-    # diagnostic. The body must go to disk with the offending character replaced.
+    # A lone surrogate (mislabelled charset) makes write_text raise
+    # UnicodeEncodeError — a ValueError, so an OSError handler misses it and the
+    # submission dies on a diagnostic. Replace the character; don't raise.
     monkeypatch.setenv("DSSP_DUMP_DIR", str(tmp_path))
 
     PortalClient()._dump("submit-response-1.html", "ok \ud800 done", "unit test")

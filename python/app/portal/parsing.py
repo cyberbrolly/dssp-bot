@@ -1,9 +1,7 @@
 """HTML parsing for the DSSP portal.
 
 Pure functions over BeautifulSoup documents — no network, no browser. Ported
-from DSSPPortalAdapter.ts. This task covers the read side (trainees, form
-options, session detection, normalisation); the submit side (payload building
-and outcome classification) is added in a later task.
+from DSSPPortalAdapter.ts.
 """
 
 from __future__ import annotations
@@ -25,7 +23,6 @@ def parse_html(html: str) -> BeautifulSoup:
     return BeautifulSoup(html or "", "lxml")
 
 
-# -- normalisation ----------------------------------------------------------
 def normalize_name(value: str) -> str:
     """Collapse whitespace and upper-case, so 'John  Doe' == 'JOHN DOE'."""
     return " ".join((value or "").split()).upper()
@@ -62,7 +59,6 @@ def format_training_date(value: str) -> str:
     raise e.validation("Training date must use YYYY-MM-DD (or DD/MM/YYYY) format.")
 
 
-# -- trainees ---------------------------------------------------------------
 def _cell_text(cells: list[Tag], index: int) -> str:
     return cells[index].get_text().strip() if 0 <= index < len(cells) else ""
 
@@ -116,7 +112,6 @@ def get_trainees(soup: BeautifulSoup) -> list[dict[str, Any]]:
     return trainees
 
 
-# -- form options -----------------------------------------------------------
 def _option_label(option: Tag) -> str:
     text = option.get_text()
     return (text if text.strip() else option.get("label", "")).strip()
@@ -237,7 +232,6 @@ def get_form_options(soup: BeautifulSoup) -> dict[str, list[dict[str, str]]]:
     return {"instructors": instructors, "training_types": training_types}
 
 
-# -- session detection ------------------------------------------------------
 def is_login_page(soup: BeautifulSoup, href: str) -> bool:
     try:
         path = urlparse(href).path or "/"
@@ -260,7 +254,6 @@ def has_authenticated_marker(soup: BeautifulSoup) -> bool:
     )
 
 
-# -- form filling / payload -------------------------------------------------
 def get_training_form_fields(soup: BeautifulSoup) -> dict[str, Tag]:
     """Locate the Log New Training form and its three required controls."""
     training_date = find_training_date_input(soup)
@@ -382,7 +375,6 @@ def build_form_payload(
     if submitter is not None and submitter.get("name"):
         payload.append((submitter["name"], submitter.get("value") or ""))
 
-    # Apply the session values (fillTrainingFormFields).
     date_name = fields["training_date"].get("name")
     instructor_name = fields["instructor"].get("name")
     type_name = fields["training_type"].get("name")
@@ -410,7 +402,6 @@ def build_form_payload(
     return form, payload
 
 
-# -- submission outcome -----------------------------------------------------
 _DUPLICATE_RE = re.compile(
     r"duplicate|already\s+(?:logged|recorded|exists?)", re.IGNORECASE
 )

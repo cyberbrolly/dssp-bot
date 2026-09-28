@@ -4,9 +4,6 @@ Owns a persistent Chromium context. The operator logs in once in the opened
 window; the session is stored on disk (python/.pw-profile) and reused. Data
 operations run through the context's request API so they share the login
 cookies, mirroring the old extension's credentialed fetch approach.
-
-This task implements the context lifecycle and the manual-login session gate.
-Read/submit operations are added in later tasks.
 """
 
 from __future__ import annotations
@@ -32,7 +29,6 @@ class PortalClient:
         self._pw: Optional[Playwright] = None
         self._context = None  # BrowserContext (persistent)
 
-    # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
         if self._context is not None:
             return
@@ -68,7 +64,6 @@ class PortalClient:
         pages = self._context.pages
         return pages[0] if pages else self._context.new_page()
 
-    # -- session gate -------------------------------------------------------
     def ensure_session(self, timeout_ms: Optional[int] = None) -> bool:
         """Open /Trainee and, if the portal shows the login page, wait until the
         operator signs in. Returns True once an authenticated page is detected;
@@ -109,7 +104,6 @@ class PortalClient:
 
             time.sleep(1.0)
 
-    # -- reads --------------------------------------------------------------
     def _get(self, url: str, evidence: str = ""):
         """GET through the context request API so it carries the login cookies.
 
@@ -162,10 +156,9 @@ class PortalClient:
             directory = Path(target)
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / name
-            # errors="replace": a body that is not valid UTF-8 (a lone surrogate
-            # from a mislabelled charset) must still be dumped rather than
-            # raising — UnicodeEncodeError is a ValueError, not an OSError, so it
-            # would slip past the handler below and fail the submission.
+            # errors="replace": a non-UTF-8 body must still be dumped. A raised
+            # UnicodeEncodeError is a ValueError, not an OSError, so it would slip
+            # past the handler below and fail the submission.
             path.write_text(body, encoding="utf-8", errors="replace")
         except (OSError, ValueError) as exc:
             log.warning("could not dump %s: %s", source, exc)
@@ -196,7 +189,6 @@ class PortalClient:
         )
         return {"trainee_id": trainee_id, **parse.get_form_options(soup)}
 
-    # -- submit -------------------------------------------------------------
     def _resolve_trainee(self, trainee: dict) -> dict:
         """Resolve a trainee safely. By id when given, else by normalized name.
         Never guesses: an ambiguous name match stops the job."""
@@ -259,9 +251,8 @@ class PortalClient:
             ) from exc
 
         body = resp.text()
-        # The response to a real POST is the one piece of evidence worth having:
-        # "duplicate" is a text match on this body (see submission_outcome), and
-        # the crash-window safety argument leans on that match being right.
+        # The POST response is the evidence "duplicate" is matched against (see
+        # submission_outcome); the crash-window safety argument leans on it.
         self._dump(f"submit-response-{resolved['id']}.html", body, resp.url)
         redirected = resp.url != action
         outcome = parse.submission_outcome(body, resp.url, resp.status, redirected)

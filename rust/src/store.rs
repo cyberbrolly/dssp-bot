@@ -82,10 +82,9 @@ impl CheckpointStore {
 
         let unreadable = |e: serde_json::Error| format!("{}: unreadable checkpoint: {e}", self.path.display());
 
-        // Parsed once as loose JSON, because the typed parse below cannot answer
-        // the question: `#[serde(default)]` makes an absent `in_flight` key and a
-        // null one identical once the struct exists, and telling those apart is
-        // the whole point of asking.
+        // Parsed as loose JSON first: `#[serde(default)]` makes an absent
+        // `in_flight` key and a null one identical once the struct exists, and
+        // separating the two is the whole point of asking.
         let raw: serde_json::Value = serde_json::from_str(&text).map_err(unreadable)?;
         let tracks_in_flight = raw
             .as_object()
@@ -101,13 +100,11 @@ impl CheckpointStore {
 
     /// Rewrite the checkpoint file in one step.
     ///
-    /// Through a temporary file and a rename, because `fs::write` truncates in
-    /// place: a process killed mid-write would leave a half-written file that
-    /// the next start cannot parse, and recovery would then have to treat a
-    /// batch that did submit as one that never ran. The extension gets this for
-    /// free from `storage.set`, which is the only reason the TS side has no
-    /// equivalent dance. `rename(2)` on POSIX is atomic within one directory, so
-    /// a reader sees either the previous checkpoint or the new one.
+    /// Through a temporary file and a rename: `fs::write` truncates in place, so
+    /// a process killed mid-write would leave a half-written file the next start
+    /// cannot parse, and recovery would then treat a batch that did submit as
+    /// one that never ran. `rename(2)` on POSIX is atomic within one directory,
+    /// so a reader sees either the previous checkpoint or the new one.
     pub fn save(&self, checkpoint: &BatchCheckpoint) -> Result<(), String> {
         let json = serde_json::to_string_pretty(checkpoint)
             .map_err(|e| format!("could not serialize checkpoint: {e}"))?;
@@ -144,14 +141,12 @@ impl CheckpointStore {
             _ => Path::new("."),
         };
 
-        // Best-effort, and the two ways it fails are not the same thing. Not
-        // being able to open a directory at all is the documented platform case
-        // — a directory is not a file everywhere — and says nothing about this
-        // filesystem, so it stays silent. A directory that *did* open and then
-        // failed to sync is a real fault on the one leg the pre-submit write's
-        // safety argument rests on, so it is reported rather than swallowed:
-        // `save` still returns Ok, and a caller that only reads the return value
-        // would otherwise take an unsynced rename for a durable one.
+        // Best-effort. Failing to open a directory at all is the documented
+        // platform case (a directory is not a file everywhere), so it stays
+        // silent. Opening it but failing to sync is a real fault on the leg the
+        // pre-submit safety argument rests on, so it is reported: `save` still
+        // returns Ok, and a caller reading only the return value would otherwise
+        // take an unsynced rename for a durable one.
         if let Ok(dir) = fs::File::open(parent)
             && let Err(e) = dir.sync_all()
         {
@@ -181,15 +176,11 @@ impl CheckpointStore {
 
 /// Resolve where a batch should checkpoint, without consulting the environment.
 ///
-/// Split out of [`CheckpointStore::for_job`] so the rule is testable on its own —
-/// the same split `resolve_against` gets in `main.rs`, and for the same reason:
-/// a test that has to check whether `DSSP_CHECKPOINT` happens to be exported
-/// asserts nothing on the machines where it is.
-///
-/// One fixed slot rather than one per job, mirroring the single
-/// `dssp.checkpoint` storage key the extension uses: two batches sharing a
-/// directory should not silently keep two half-truths about what reached the
-/// portal. The override is the escape hatch for exactly that case.
+/// Split out of [`CheckpointStore::for_job`] so the rule is testable without
+/// depending on whether `DSSP_CHECKPOINT` happens to be exported. It is one
+/// fixed slot rather than one per job, mirroring the extension's single
+/// `dssp.checkpoint` key: two batches sharing a directory must not keep two
+/// half-truths about what reached the portal. The override is the escape hatch.
 pub fn resolve_path(job_path: &Path, override_path: Option<OsString>) -> PathBuf {
     match override_path {
         Some(path) => PathBuf::from(path),
@@ -504,9 +495,8 @@ mod tests {
         assert!(text.contains("\"running\""), "{text}");
     }
 
-    /// The default location is a fixed name beside the job file, not derived
-    /// from it: the checkpoint is per-batch, and `DSSP_CHECKPOINT` is the escape
-    /// hatch when two batches need to coexist.
+    /// The default is a fixed name beside the job file, not derived from it;
+    /// `DSSP_CHECKPOINT` is the escape hatch when two batches must coexist.
     #[test]
     fn the_default_file_sits_beside_the_job() {
         assert_eq!(

@@ -12,14 +12,12 @@ from typing import Any, TextIO
 
 V = 1
 
-# Operations ----------------------------------------------------------------
 OP_PING = "ping"
 OP_ENSURE_SESSION = "ensure_session"
 OP_LIST_TRAINEES = "list_trainees"
 OP_GET_FORM_OPTIONS = "get_form_options"
 OP_SUBMIT_TRAINING = "submit_training"
 
-# Error codes ---------------------------------------------------------------
 # Mirror of src/core/shared/errors.ts ErrorCode, plus protocol-level codes.
 ERR_ELEMENT_NOT_FOUND = "ELEMENT_NOT_FOUND"
 ERR_TIMEOUT = "TIMEOUT"

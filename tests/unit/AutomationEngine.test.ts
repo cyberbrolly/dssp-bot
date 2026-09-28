@@ -289,10 +289,9 @@ describe("AutomationEngine", () => {
   });
 
   it("catches a session that lapses mid-batch", async () => {
-    // Passes the pre-flight and the first trainee, then the session dies. The
-    // guard has to re-check per trainee to notice; a batch-scoped check would
-    // keep submitting into a dead session and record every later trainee as a
-    // generic failure with no indication the session was the cause.
+    // The session passes the pre-flight and the first trainee, then dies. A
+    // batch-scoped check would keep submitting into a dead session, so the guard
+    // must re-check per trainee.
     const { engine, portal } = engineWith({
       isPortalPage: (check) => check <= 1,
     });

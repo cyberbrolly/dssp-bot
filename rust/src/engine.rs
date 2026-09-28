@@ -40,14 +40,10 @@ fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// The key a trainee is queued under, and the one written to `in_flight`.
-///
-/// One definition for both, because they have to agree: whatever `run` records
-/// as in flight is what a resume will look for in the queue. Id first, since a
-/// resume re-resolves what it finds in the file against the portal and a name is
-/// not an identity there. The positional fallback exists only so an entry
-/// carrying neither is still addressable in the queue; `resolve_against` gives
-/// the CLI an id before it reaches here, so it is a library-caller case.
+/// The key a trainee is queued under, and the one written to `in_flight`; one
+/// definition because the two must agree. Id first, since a name is not an
+/// identity on the portal; `#<index>` only as a fallback for an entry with
+/// neither, which is a library-caller case only.
 fn queue_key(trainee: &TraineeRef, index: usize) -> String {
     trainee
         .id
@@ -56,20 +52,10 @@ fn queue_key(trainee: &TraineeRef, index: usize) -> String {
         .unwrap_or_else(|| format!("#{index}"))
 }
 
-/// Which namespace a trainee's key belongs to.
-///
-/// The queue key and the dedupe key are the same *string* and have to stay that
-/// way: the string is what the checkpoint durably records and what a resume
-/// looks for in the queue afterwards. They must not, though, share one
-/// *namespace* while being compared against each other. `queue_key` falls back
-/// to `#<index>` for an entry with neither id nor name, so an entry whose id is
-/// literally `#3`, listed beside a nameless entry at index 3, produces the same
-/// string twice — and the set holding both cannot tell a genuine repeat from two
-/// different trainees that happen to spell the same. One of them is then dropped
-/// with a note about a repeat that was never there.
-///
-/// Tagging keeps the string for the file and gives the comparison three
-/// namespaces, so only like can collide with like.
+/// Which namespace a trainee's key belongs to. The key *string* is shared with
+/// the queue, but `queue_key`'s `#<index>` fallback can collide with a literal
+/// id or name of the same spelling, so the comparison is tagged into three
+/// namespaces — only like can collide with like.
 #[derive(Hash, PartialEq, Eq)]
 enum QueueKey {
     Id(String),
@@ -87,23 +73,11 @@ fn key_namespace(trainee: &TraineeRef, index: usize) -> QueueKey {
     }
 }
 
-/// A roster is a set: collapse repeats, keep the first occurrence.
-///
-/// Two entries under one key would submit the same trainee twice, and after a
-/// crash the second copy is still in `pending` — where a resume would run it
-/// again and re-submit something already confirmed. `resolve_against` collapses
-/// repeats on the CLI path before the engine sees them; this is the same rule
-/// applied at the last point before a submit, so a caller that skips that
-/// pre-flight cannot reach the worker with a repeat either.
-///
-/// Later entries lose, matching `resolve_against`'s "already queued — skipping",
-/// and the caller must count the result rather than its input: a dropped repeat
-/// left inside `total` would put the file permanently one trainee short of its
-/// groups, which `blocks_start` reads as a submission that may have gone
-/// unrecorded and refuses on every start thereafter.
-///
-/// Compared by [`QueueKey`], written out as a `String` — see that type for why
-/// the two are not the same question.
+/// A roster is a set: collapse repeats, keep the first occurrence. A repeat
+/// submitted twice would leave the second copy in `pending`, where a resume
+/// re-runs something already confirmed. The caller must count the result, not
+/// its input: a dropped repeat still counted leaves the file one trainee short,
+/// which `blocks_start` reads as an unrecorded submission and refuses on.
 fn dedupe(trainees: Vec<TraineeRef>) -> Vec<(String, TraineeRef)> {
     let mut seen: HashSet<QueueKey> = HashSet::with_capacity(trainees.len());
     let mut unique: Vec<(String, TraineeRef)> = Vec::with_capacity(trainees.len());
@@ -126,23 +100,15 @@ fn dedupe(trainees: Vec<TraineeRef>) -> Vec<(String, TraineeRef)> {
 pub struct BatchEngine {
     policy: RetryPolicy,
     machine: StateMachine,
-    /// Where the durable record of this batch goes.
-    ///
-    /// Not an `Option`, and not a builder step, so it cannot be left out. A
-    /// batch that submits without a sink puts records on the portal that nothing
-    /// on disk names, and the next start reads that silence as "never sent" and
-    /// submits them again — the failure this stage exists to prevent.
-    /// `AutomationEngineOptions.checkpoint` is optional; this is deliberately
-    /// narrower, for the same reason Stage 28 narrows that engine's
-    /// swallow-everything `saveCheckpoint` rather than keeping it. The unit tests
-    /// pass a recorder; the CLI passes [`crate::store::CheckpointStore`].
+    /// Where the durable record of this batch goes. Not an `Option`, so it
+    /// cannot be left out: a batch that submits without a sink leaves nothing on
+    /// disk naming what it sent, and the next start reads that silence as
+    /// "never sent" and re-submits.
     checkpoint: Box<dyn CheckpointWriter>,
     /// Results a predecessor could not account for, carried into this batch.
-    ///
-    /// History, not work: they are never queued, never re-decided and never
-    /// allowed to abort the run. They are here because the checkpoint file is
-    /// rewritten in full, so the first write of a resumed batch would otherwise
-    /// drop the only record of a submission that may already exist.
+    /// History, not work: never queued, never re-decided, never aborting this
+    /// run. Carried because the file is rewritten in full, so a resumed batch's
+    /// first write would otherwise drop the record of a possible submission.
     carried: Vec<TrainingResult>,
 }
 
@@ -173,15 +139,10 @@ impl BatchEngine {
 
     /// Write the current position to durable storage.
     ///
-    /// The returned error is the caller's to use, and there is exactly one call
-    /// that uses it: the write taken before a submission, which `run` treats as
-    /// fatal. Every other one is dropped, because a storage error must not abort
-    /// a batch that is otherwise succeeding — aborting would strand a trainee
-    /// mid-flow, which is worse than a missing checkpoint, and the sink has
-    /// already been told about it. Ports `saveCheckpoint` in AutomationEngine.ts,
-    /// whose swallow-everything behaviour Stage 28 narrows rather than keeps;
-    /// see the pre-submission call in [`BatchEngine::run`] for why that one
-    /// write is different.
+    /// The error is the caller's to use, and only the pre-submission call in
+    /// [`BatchEngine::run`] does: that write is fatal, every other one is
+    /// dropped, because a storage error must not abort an otherwise-succeeding
+    /// batch (stranding a trainee mid-flow is worse) — the sink already reports it.
     fn save_checkpoint(
         &mut self,
         status: CheckpointStatus,
@@ -218,23 +179,19 @@ impl BatchEngine {
         // this file from its very first write, or the write that follows would
         // replace the only record of a submission that may already exist.
         let mut results: Vec<TrainingResult> = std::mem::take(&mut self.carried);
-        // Collapsed before the count is taken, never after: `total` has to agree
-        // with the groups a reader will sum, and a dropped repeat that was still
-        // counted would leave the file one trainee short of itself.
+        // Collapsed before the count: `total` must agree with the groups a
+        // reader sums, and a counted repeat would leave the file one trainee short.
         let queued = dedupe(trainees);
-        // Taken from the queue as asked for, not from what survives the run:
-        // `total` answers "how many trainees this file accounts for", so a later
-        // skip-drain must not shrink it — and the carried records are part of
-        // that accounting, which is what keeps each trainee in exactly one group.
+        // Taken as asked, not from what survives the run: `total` must not shrink
+        // when a skip-drain happens, and the carried records are part of it.
         let total = queued.len() + results.len();
         self.machine.reset();
         let _ = self.machine.transition_to(AutomationState::Initializing);
 
         // Once per batch — a failure here aborts before any record is written.
-        // Deliberately no checkpoint on this path: the TS engine writes a
-        // terminal one with an untouched queue, which says "finished, nothing
-        // attempted" about a batch that never started. The report on stderr is
-        // the honest account of that.
+        // Deliberately no checkpoint on this path: a terminal write with an
+        // untouched queue would say "finished, nothing attempted" about a batch
+        // that never started. The stderr report is the honest account.
         let ensure = worker.send(&Request::ensure_session(new_id()))?;
         if ensure.status != Status::Ok {
             return Err(format!("session not established: {}", ensure.summary()));
@@ -251,22 +208,15 @@ impl BatchEngine {
         let mut aborted = false;
 
         while let Some(task) = queue.dequeue() {
-            // Before the submission, not after it. From this instant the trainee
-            // is in no other group — it has left the queue and its result does
-            // not exist yet — so if the process dies now, this write is the only
-            // thing that can say a submission may have reached the portal. Its
-            // window spans the whole portal round trip and every retry backoff.
+            // Taken before the submission, not after. From here the trainee is in
+            // no other group, so if the process dies now this write is the only
+            // thing that can say a submission may have reached the portal; its
+            // window spans the whole round trip and every retry backoff.
             //
-            // The one checkpoint write whose failure stops the run. Everywhere
-            // else a storage error is survivable because a later write follows
-            // it; here no later write can undo the send that would come next. A
-            // run that cannot record the window must not open it: submitting
-            // anyway would put a trainee on the portal with nothing durable
-            // naming it, and the next start would read that silence as "never
-            // sent" and submit it a second time — the exact duplicate this stage
-            // exists to prevent. Not sending strands nothing, so the usual
-            // argument against aborting (a trainee caught mid-flow) does not
-            // apply.
+            // The one write whose failure stops the run: no later write can undo
+            // the send that would follow, so a run that cannot record the window
+            // must not open it — submitting anyway puts a trainee on the portal
+            // with nothing durable naming it, which the next start re-submits.
             if let Err(e) = self.save_checkpoint(
                 CheckpointStatus::Running,
                 &started_at,
@@ -280,10 +230,8 @@ impl BatchEngine {
                      be written: {e}",
                     task.id
                 );
-                // Back into the queue so the drain below records it as skipped
-                // — never sent, and so safe to run again. Dropping it here
-                // instead would leave it in no group at all, and a resume would
-                // not know it still owes a submission.
+                // Back into the queue so the drain below records it as skipped,
+                // never sent, and so safe to run again.
                 queue.put_back(task);
                 drain_skipped(&mut queue, &mut results, NOT_SUBMITTED);
                 aborted = true;
@@ -294,13 +242,9 @@ impl BatchEngine {
             let result = self.process_trainee(worker, session, &task.payload);
             results.push(result);
 
-            // Cleared by the same write that records the result, so no
-            // checkpoint ever lists one trainee under both.
-            //
-            // Between the abort check and this write is where the TS engine
-            // puts its own: this is the checkpoint that has to carry the result
-            // which caused the abort, and the one a crash during the drain below
-            // would leave behind.
+            // Cleared by the same write that records the result, so no checkpoint
+            // ever lists one trainee under both — including the result that
+            // caused an abort just below.
             let _ = self.save_checkpoint(
                 CheckpointStatus::Running,
                 &started_at,
@@ -325,11 +269,8 @@ impl BatchEngine {
         }
 
         // Terminal either way: an aborted batch is as final as a completed one,
-        // and its results are the ones most worth keeping, since they say what
-        // reached the portal before it went wrong. This is also the first
-        // write to contain the drained skips — they are never checkpointed
-        // individually, because a batch that reaches the drain has already
-        // stopped submitting.
+        // and this is the first write to contain the drained skips — they are
+        // never checkpointed individually.
         let _ = self.save_checkpoint(
             CheckpointStatus::Finished,
             &started_at,
@@ -466,11 +407,8 @@ fn abort_reason(result: &TrainingResult) -> String {
 }
 
 /// Why the trainees a run stopped before reaching are recorded as skipped.
-///
-/// Distinct from an abort's reason on purpose: an abort means the portal refused
-/// something, and this means the run never asked. Both leave a trainee that is
-/// safe to run again, which is what `Skipped` promises, but only the second one
-/// is a local fault the operator can clear.
+/// Distinct from an abort's reason: an abort means the portal refused something,
+/// this means the run never asked — a local fault the operator can clear.
 const NOT_SUBMITTED: &str = "not submitted: the run stopped before reaching it";
 
 fn drain_skipped(
@@ -500,13 +438,8 @@ mod tests {
 
     use crate::checkpoint::{BatchCheckpoint, CheckpointStatus, CheckpointWriter};
 
-    /// Scripts one response per submit_training call, in order.
-    ///
-    /// It also doubles as the instrument for the crash-window tests: given a
-    /// sink handle it snapshots what that sink had been given at the instant
-    /// each submission was sent, which is the only place the ordering between
-    /// "recorded" and "sent" can actually be observed. `die_on_call` turns one
-    /// of those instants into a process death.
+    /// Scripts one response per submit_training call, in order; also the
+    /// instrument for the crash-window tests, snapshotting the sink at each send.
     struct FakeTransport {
         ensure_ok: bool,
         submits: VecDeque<Response>,
@@ -636,10 +569,7 @@ mod tests {
         }
     }
 
-    /// An engine whose sink the test never reads back: the policy is what these
-    /// tests are about, so the writes land in a recorder nobody holds a handle
-    /// to. Every engine has somewhere to write — that is the constructor's whole
-    /// point — so "no sink" is no longer a state a test can ask for.
+    /// A policy under test, writing to a sink the test never reads back.
     fn fast_engine() -> BatchEngine {
         BatchEngine::with_policy(fast_policy(), Box::new(Recorder::default()))
     }
@@ -662,17 +592,12 @@ mod tests {
         assert_eq!(report.success_rate, 1.0);
     }
 
-    /// A roster is a set. The same id twice would be two submissions, the second
-    /// of which the portal refuses as a duplicate and the report counts as a
-    /// failure — a batch that went fine reading as one that needed attention.
-    /// `resolve_against` collapses repeats before the CLI gets here; this is the
-    /// same rule at the last point before a submit.
+    /// A roster is a set: the same id twice would submit twice, and the portal's
+    /// duplicate refusal would make a fine batch read as one needing attention.
     #[test]
     fn a_repeated_id_is_queued_and_submitted_once() {
-        // Three responses for three queued entries, so a run that submits the
-        // repeat reaches the assertions below rather than dying on an exhausted
-        // script: a regression here should say "three submits, not two", not
-        // "no scripted submit response left". The third goes unused.
+        // Three responses for three entries so a regression fails on the count
+        // assertion, not on an exhausted script; the third goes unused.
         let mut w = FakeTransport::new(
             true,
             vec![confirmed("1", "A"), confirmed("1", "A"), confirmed("2", "B")],
@@ -687,18 +612,10 @@ mod tests {
         assert_eq!(report.successful, 2);
     }
 
-    /// The dedupe key is a string that the input can also write into: `queue_key`
-    /// falls back to `#<index>` for an entry with neither id nor name, and that
-    /// fallback used to share one `HashSet<String>` with the ids and names it was
-    /// compared against. An id of literally `#1`, listed beside a nameless entry
-    /// at index 1, therefore produced the same string twice — and the second was
-    /// dropped as a repeat, with a note about a repeat that was never there,
-    /// while a real trainee never reached the worker and nothing durable said so.
-    ///
-    /// Unreachable from the CLI, which resolves every entry to a portal id first,
-    /// but `BatchEngine::run` is `pub` and Stage 29's daemon is the next caller —
-    /// so the comparison is namespaced here rather than left to a caller to
-    /// validate its way around.
+    /// The dedupe key is a string the input can also write into: an id of
+    /// literally `#1`, beside a nameless entry at index 1, used to produce the
+    /// same string twice — dropping a real trainee as a repeat. Unreachable from
+    /// the CLI, but `run` is `pub`, so the comparison is namespaced here.
     #[test]
     fn an_id_that_looks_positional_does_not_swallow_a_nameless_entry() {
         let mut w = FakeTransport::new(
@@ -730,12 +647,10 @@ mod tests {
         assert_eq!(report.total, 2);
     }
 
-    /// The counts cannot say a batch stopped early. This is the case that shows
-    /// it: an abort on the *last* queued trainee drains nothing, so `skipped` is
-    /// 0 and the row that stopped the run is a `Failed` one — and a run that
-    /// halted because the session lapsed then looks, from its numbers alone,
-    /// exactly like a run that worked through its queue and hit a bad response.
-    /// `aborted` is what lets the exit code tell those apart.
+    /// The counts cannot say a batch stopped early: an abort on the *last*
+    /// trainee drains nothing, so `skipped` is 0 and the run's numbers look
+    /// exactly like one that worked through its queue. `aborted` is what lets
+    /// the exit code tell them apart.
     #[test]
     fn an_abort_on_the_last_trainee_is_recorded_as_an_abort() {
         let mut w = FakeTransport::new(
@@ -829,7 +744,6 @@ mod tests {
         assert_eq!(w.submit_calls, 0);
     }
 
-    // -- checkpointing ------------------------------------------------------
 
     /// Records every checkpoint in order. The engine owns the sink, so the test
     /// keeps a handle rather than taking it back.
@@ -856,10 +770,8 @@ mod tests {
         }
     }
 
-    /// A sink that accepts `ok` writes and then fails, the way a disk fills up
-    /// mid-batch while the run keeps going. Shared like [`Recorder`], because
-    /// the engine takes ownership of the sink and the test still needs to read
-    /// what reached it.
+    /// A sink that accepts `ok` writes then fails, the way a disk fills up
+    /// mid-batch; shared so the test can still read what reached it.
     #[derive(Clone)]
     struct Filling {
         ok: Rc<Cell<usize>>,
@@ -900,13 +812,9 @@ mod tests {
         BatchEngine::with_policy(fast_policy(), Box::new(crate::store::CheckpointStore::new(path)))
     }
 
-    /// One settled write per trainee, then a terminal one. A single write at the
-    /// end would mean a crash mid-batch leaves no record of what it already
-    /// submitted — the gap this whole stage exists to close.
-    ///
-    /// The writes taken *before* each submission are the in-flight markers, and
-    /// they are the subject of the tests below; this one is about the settled
-    /// record, so it reads only the writes that have no trainee in flight.
+    /// One settled write per trainee, then a terminal one: a single write at the
+    /// end would lose the record of everything already submitted on a crash.
+    /// Reads only the settled writes (no trainee in flight).
     #[test]
     fn checkpoints_after_every_settled_trainee() {
         let recorder = Recorder::default();
@@ -973,15 +881,9 @@ mod tests {
         assert_eq!(first.pending, vec!["2", "3"]);
     }
 
-    // -- the crash window ---------------------------------------------------
 
-    /// The ordering this stage exists for, observed from inside the window: at
-    /// the instant the submission is sent, the sink already names the trainee
-    /// as in flight, and the queue no longer does.
-    ///
-    /// Fails against the code before this stage, which wrote nothing until the
-    /// result came back — leaving the trainee in no group at all for the length
-    /// of the portal round trip.
+    /// At the instant a submission is sent, the sink already names the trainee as
+    /// in flight and the queue no longer does.
     #[test]
     fn a_trainee_is_checkpointed_before_its_submission_is_sent() {
         let recorder = Recorder::default();
@@ -1037,16 +939,10 @@ mod tests {
         assert!(!split.unprocessed.contains(&"2".to_string()), "and not merely queued");
     }
 
-    /// Gate 3's evidence, end to end and on a real disk: a batch killed in the
-    /// commit window, the file a later process finds, and the decision that file
-    /// produces.
-    ///
-    /// The test above proves the write ordering inside one process. This one
-    /// proves the bytes reached the disk and that a *second* store, opening the
-    /// file the way the CLI does, refuses the next batch by default and then —
-    /// under the acknowledgement — continues without ever re-queuing the trainee
-    /// whose submission may already exist. Every link in that chain is a place
-    /// the guarantee could be lost silently.
+    /// End to end on a real disk: a batch killed in the commit window, and a
+    /// second store that refuses the next batch by default, then — under the
+    /// acknowledgement — resumes without re-queuing the trainee whose submission
+    /// may already exist.
     #[test]
     fn a_crash_on_disk_is_refused_and_its_trainee_is_never_requeued() {
         use crate::recovery::{self, Plan};
@@ -1186,7 +1082,6 @@ mod tests {
         }
     }
 
-    // -- carried history ----------------------------------------------------
 
     fn indeterminate(id: &str, name: &str) -> TrainingResult {
         TrainingResult {
@@ -1326,14 +1221,9 @@ mod tests {
         assert_eq!(last.results[2].outcome, Outcome::Skipped);
     }
 
-    /// A batch that is submitting successfully must not be aborted by a storage
-    /// fault; the sink reports its own failures.
-    ///
-    /// The faults here start after the first trainee has been settled, which is
-    /// the case this guarantee is about: a write that follows a submission,
-    /// where a later write can still record what the loss would have hidden. The
-    /// write taken *before* a submission is the exception, and has its own tests
-    /// below.
+    /// A storage fault after a submission must not abort an otherwise-succeeding
+    /// batch; the sink reports its own failures. The pre-submission write is the
+    /// exception and has its own tests below.
     #[test]
     fn a_failing_checkpoint_writer_does_not_stop_the_batch() {
         let mut w = FakeTransport::new(true, vec![confirmed("1", "A"), confirmed("2", "B")]);
@@ -1352,13 +1242,9 @@ mod tests {
         assert!(!sink.persisted().is_empty(), "the earlier writes landed");
     }
 
-    /// The one write whose failure has to stop the run.
-    ///
-    /// If the in-flight record cannot be taken, the trainee must not be
-    /// submitted: the file would keep saying it was never sent, and the next
-    /// start would submit it again — a duplicate caused by a full disk rather
-    /// than by a crash. Nothing was sent, so nothing is stranded, and the
-    /// trainee is left in the group a resume knows how to pick up.
+    /// The one write whose failure has to stop the run: if the in-flight record
+    /// cannot be taken the trainee must not be submitted, or the file keeps
+    /// saying it was never sent and the next start submits it again.
     #[test]
     fn a_failed_in_flight_write_stops_the_batch_before_submitting() {
         let mut w = FakeTransport::new(true, vec![confirmed("1", "A"), confirmed("2", "B")]);
@@ -1374,9 +1260,8 @@ mod tests {
         assert!(sink.persisted().is_empty());
     }
 
-    /// And the trainee it stopped on is *first* in the group, in the order the
-    /// job queued it — so a resume re-runs the batch in the operator's order and
-    /// not the order a failed write happened to leave behind.
+    /// The trainee it stopped on is *first* in the group, so a resume re-runs the
+    /// batch in the operator's order, not the order a failed write left behind.
     #[test]
     fn a_failed_in_flight_write_leaves_the_queue_in_order() {
         let mut w = FakeTransport::new(true, vec![confirmed("1", "A"), confirmed("2", "B")]);
@@ -1407,14 +1292,8 @@ mod tests {
         assert!(!last.never_attempted().contains(&"1".to_string()));
     }
 
-    /// The one test that proves the halves are wired to each other: a real
-    /// [`CheckpointStore`] on a real disk, driven by the engine, read back by a
-    /// second store — which is exactly what recovery will do.
-    ///
-    /// The recorder tests above and the store tests below prove each side in
-    /// isolation, and both would stay green if nothing ever attached a sink to
-    /// the engine at all, which is the state this stage found the tree in. This
-    /// is the only test that would notice.
+    /// The one test that wires the halves together: a real [`CheckpointStore`] on
+    /// a real disk, driven by the engine and read back by a second store.
     #[test]
     fn a_batch_through_a_real_store_lands_on_disk() {
         use crate::store::CheckpointStore;
@@ -1445,7 +1324,6 @@ mod tests {
     }
 
     // ---- probe: crash matrix vs. Gate 3 (temporary, review scaffolding) ----
-
     struct Probe {
         sent: Rc<RefCell<Vec<String>>>,
         die_at: Option<usize>,
@@ -1548,13 +1426,9 @@ mod tests {
         (sent_ids, found)
     }
 
-    /// The crash instant a repeated id does its damage in.
-    ///
-    /// Without the dedupe the repeat is still queued when the first copy is sent,
-    /// so a crash mid-submit leaves it in `pending` — and `never_attempted`,
-    /// which is exactly what a resume turns into work, would offer it back. The
-    /// trainee is then submitted a second time against a portal that already has
-    /// the first one.
+    /// The crash instant a repeated id does its damage in: without the dedupe the
+    /// repeat is still in `pending` when the first copy is sent, so a crash
+    /// mid-submit leaves `never_attempted` to offer it back for a second submit.
     #[test]
     fn a_repeated_id_left_by_a_crash_is_not_queued_for_a_resume() {
         let (sent, found) = probe_one(None, Some(1), &["1", "1", "2"]);

@@ -42,7 +42,6 @@ SESSION = {
 }
 
 
-# -- trainees ---------------------------------------------------------------
 def test_get_trainees_extracts_rows_and_ids():
     trainees = parse.get_trainees(parse.parse_html(TRAINEES_HTML))
     assert [t["id"] for t in trainees] == ["123", "456"]
@@ -57,7 +56,6 @@ def test_get_trainees_skips_rows_without_trainee_id():
     assert all(t["name"] != "No Link" for t in trainees)
 
 
-# -- form options -----------------------------------------------------------
 def test_get_form_options():
     options = parse.get_form_options(parse.parse_html(FORM_HTML))
     assert options["instructors"] == [{"value": "10", "label": "Alice"}]
@@ -73,7 +71,6 @@ def test_get_form_options_missing_control():
     assert info.value.error_code == "ELEMENT_NOT_FOUND"
 
 
-# -- session detection ------------------------------------------------------
 def test_login_and_authenticated_detection():
     login = parse.parse_html(LOGIN_HTML)
     assert parse.is_login_page(login, "https://dssp.frsc.gov.ng/Account/Login")
@@ -85,7 +82,6 @@ def test_login_and_authenticated_detection():
     assert not parse.is_login_page(authed, "https://dssp.frsc.gov.ng/Trainee")
 
 
-# -- normalisation ----------------------------------------------------------
 def test_normalize_name():
     assert parse.normalize_name("John   Doe") == "JOHN DOE"
     assert parse.normalize_name(" john doe ") == "JOHN DOE"
@@ -111,7 +107,6 @@ def test_format_training_date_invalid(raw):
     assert info.value.error_code == "VALIDATION_FAILED"
 
 
-# -- payload building -------------------------------------------------------
 def test_build_form_payload_applies_session_values():
     form, payload = parse.build_form_payload(parse.parse_html(FORM_HTML), SESSION)
     assert form.get("method") == "post"
@@ -140,7 +135,6 @@ def test_select_form_option_rejects_unknown_value():
     assert info.value.error_code == "VALIDATION_FAILED"
 
 
-# -- submission outcome -----------------------------------------------------
 def test_outcome_confirmed_via_redirect_away_from_form():
     outcome = parse.submission_outcome(
         TRAINEES_HTML, "https://x/Trainee?saved=1", 200, True

@@ -32,7 +32,7 @@ run).
 |  7 | Browser manager           | 🟢 Passed     | `PortalClient` lifecycle        | persistent profile |
 |  8 | DSSP portal client        | 🟢 Passed     | portal module checks            | fixture-verified |
 |  9 | Connect Playwright → DSSP | 🟢 Passed     | DSSP-shaped fixture navigation  | real portal in Stage 10 |
-| 10 | Verify DSSP session       | 🟡 Blocked    | session test                    | awaiting live operator run |
+| 10 | Verify DSSP session       | 🟢 Passed     | live run 2026-09-28             | 346 parsed = 346 displayed; page size not capped |
 | 11 | Retrieve trainees         | 🟢 Passed     | trainee retrieval               | fixture-verified |
 | 12 | Trainee matching          | 🟢 Passed     | `pytest`                        | permanent suite in `python/tests/` |
 | 13 | Training form             | 🟢 Passed     | form workflow                   | fixture-verified |
@@ -135,6 +135,46 @@ Remain on Stage 14.
 ```
 
 ## Stage Records
+
+```text
+Stage: 10 — Verify DSSP session
+Status: 🟢 Passed
+
+Changes:
+- None. Read-only: the worker ran `ensure_session` and `list_trainees` against
+  the live portal and wrote nothing anywhere. Run as the Live-Run Procedure
+  below prescribes, with DSSP_DUMP_DIR=.evidence.
+
+Verification (live operator run, 2026-09-28):
+- `ensure_session` — the session is real: sign-in was done by hand in the headed
+  window, the authenticated marker is present in the captured page, and the
+  session persisted to python/.pw-profile/ (gitignored). No credentials stored.
+- `list_trainees` — 346 trainees, and all 346 carry a numeric TraineeId, so no
+  row was dropped by the parsing.py:88 rule.
+- The required count comparison holds. The portal's own page displays "Showing 1
+  to 346 of 346" and parsing the captured HTML yields 346. `pgsize=10000` is
+  therefore not being capped below the real total — the failure this stage
+  exists to catch, since a capped page truncates the list silently and the
+  missing trainees resurface later as TRAINEE_NOT_FOUND for people who plainly
+  exist.
+- Evidence: python/.evidence/trainee-list.html (1.0 MB) and
+  training-form-5668457.html from the same run. The latter came from a
+  `get_form_options` call, so the POST shape and the __RequestVerificationToken
+  assumption now have something to be checked against. Both files stay
+  gitignored: they hold raw portal HTML, including a form's antiforgery token.
+- The count was re-derived rather than read off the run: the saved HTML was put
+  back through app.portal.parsing.get_trainees, the same code path that produces
+  the response's count. The live response JSON was not kept, so this is
+  parsed-vs-displayed rather than field-vs-field; they agree here because both
+  are the same 346 rows.
+
+Errors:
+- None.
+
+Next:
+Stage 15 — Gate 1, one trainee end to end. Then Stage 24 — Gate 2. Both submit
+real records and still need the operator; nothing ahead of them is outstanding.
+```
 
 ```text
 Stage: 25 — Rust Coordinator
@@ -713,10 +753,10 @@ them, designed but deliberately unbuilt.
 ## Migration Progress Summary
 
 ```text
-Completed:  26 / 40
+Completed:  27 / 40
 In Progress: 0
 Failed:      0
-Blocked:     3   (10, 15, 24)
+Blocked:     2   (15, 24)
 Skipped:     0
 ```
 
@@ -734,9 +774,9 @@ Hard gates — do not continue past them until they pass.
 
 ## Current Execution Order
 
-The order the work follows, not a list of what is outstanding: 25–28 are already
-Passed (see the status table above), and the entry point today is whatever is
-still Blocked — the live gates at 10, 15 and 24.
+The order the work follows, not a list of what is outstanding: 10 and 25–28 are
+already Passed (see the status table above), and the entry point today is
+whatever is still Blocked — the live gates at 15 and 24.
 
 ```text
 10  Real DSSP session
@@ -771,7 +811,9 @@ First run is headed so the operator can sign in once; the session persists in
 run. Do them in order and stop at the first failure rather than working around
 it — a worked-around failure is a gate that has not been proven.
 
-**Stage 10 — session + retrieval (read-only, writes nothing):**
+**Stage 10 — session + retrieval (read-only, writes nothing):** 🟢 ran 2026-09-28,
+see the Stage 10 record. Kept here as the reference for the two gates below,
+which still need it.
 
 ```bash
 cd python

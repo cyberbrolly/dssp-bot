@@ -14,14 +14,10 @@ import type { PortalAdapter } from "../../src/core/infrastructure/portal/PortalA
 import type { TrainingSession } from "../../src/core/domain/TrainingSession";
 
 /**
- * Guards the popup -> worker -> content script -> DOM boundary.
- *
- * The session operations were once optional on `PortalAdapter` and absent from
- * `RemotePortalAdapter`, the wire protocol, and the content script all at once.
- * Every trainee failed at runtime while all 155 unit tests stayed green, because
- * the only coverage exercised `DSSPPortalAdapter` directly and never crossed the
- * remote hop. These tests assert the correspondence itself rather than any one
- * operation.
+ * Guards the popup -> worker -> content script -> DOM boundary. The session
+ * operations were once absent from the adapter, the wire protocol, and the
+ * content script all at once: every trainee failed at runtime while all unit
+ * tests stayed green. These tests assert the correspondence itself.
  */
 
 /** Every operation the engine may call. Adding one here is deliberate. */
