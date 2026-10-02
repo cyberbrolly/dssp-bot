@@ -15,6 +15,13 @@ use crate::report::{Outcome, TrainingResult};
 /// `Running` and `Paused` are live states: finding either one on startup means
 /// the process that wrote it never reached a terminal state, so it was killed.
 /// `Interrupted` records that conclusion.
+///
+/// `Finished` and `Aborted` are both terminal, and the difference is the point:
+/// `Finished` is a batch that worked through its queue, `Aborted` one the engine
+/// stopped early because a result could not be accounted for. They are kept apart
+/// because the start gate has to tell them apart — a batch that closed out may be
+/// run again over its slot, while one that stopped early left settled records on
+/// the portal that a plain re-run would ask for a second time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckpointStatus {
@@ -22,6 +29,7 @@ pub enum CheckpointStatus {
     Paused,
     Finished,
     Interrupted,
+    Aborted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,20 +237,81 @@ impl BatchCheckpoint {
             .collect()
     }
 
+    /// Results that reached a conclusion: `Success` or `Failed`, the two outcomes
+    /// that mean the portal was asked and answered.
+    ///
+    /// Not `results.len()`: a `Skipped` row was drained after an abort and never
+    /// sent, so counting it would let a file that submitted nothing pass for one
+    /// that landed work — see [`Self::blocks_start`], which this decides.
+    ///
+    /// Also not `results.len() - unconfirmed`: the in-flight trainee is synthesized
+    /// into the unconfirmed group without being in `results`, so subtracting it
+    /// would under-report what settled.
+    pub fn settled(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| matches!(result.outcome, Outcome::Success | Outcome::Failed))
+            .count()
+    }
+
+    /// Whether this file still records work that reached the portal, on a batch
+    /// that never recorded its own finish.
+    ///
+    /// The one clause of [`Self::blocks_start`] that reads the status — see there
+    /// for why the exemption is `Finished` rather than "not live".
+    ///
+    /// `Aborted` counts, and that is why it is a status rather than a `Finished`
+    /// file with a flag: an aborted batch stops early *after* landing whatever it
+    /// landed, so it is precisely a batch that records work and did not finish.
+    pub fn records_landed_work(&self) -> bool {
+        self.status != CheckpointStatus::Finished && self.settled() > 0
+    }
+
     /// Whether a new batch may take this checkpoint's slot without an operator
     /// first acknowledging what the previous one left behind.
     ///
-    /// The question is "is this file missing a submission?", not "was the process
-    /// killed?" — a live file whose counts all add up says nothing was in flight
-    /// when it died, and refusing it would train the operator to wave the gate
-    /// through with `DSSP_RESUME=1`, making the real refusal worthless.
+    /// Three things can be missing from a file, and liveness settles only the last:
     ///
-    /// Two things can still be missing, and liveness settles neither: an unconfirmed
-    /// record (including a trainee left in flight), and counts that do not add up —
-    /// see [`Self::unaccounted`]. Never-attempted trainees do not block on their own:
-    /// nothing was sent for them, so leaving them out cannot create a duplicate.
+    /// - an unconfirmed record, including a trainee left in flight —
+    ///   [`Self::has_unconfirmed`];
+    /// - counts that do not add up — [`Self::unaccounted`];
+    /// - **a batch that died with settled work on the file.** It still records
+    ///   submissions that reached the portal, and the engine rewrites the file in
+    ///   full, so a fresh start re-queues the job from the top and asks for those
+    ///   trainees a second time. What would have to catch that is the portal's own
+    ///   `duplicate|already logged` match — the second layer, which the runbook
+    ///   lists as an assumption that can fail in the unsafe direction, not the layer
+    ///   this gate is allowed to rest on.
+    ///
+    /// That third one is the only reason status is read here, and it is *not* the
+    /// check Stage 28 removed. That one blocked on liveness alone, so it fired on
+    /// every ordinary kill-and-retry where nothing was at stake — and a gate an
+    /// operator learns to answer with `DSSP_RESUME=1` stops being read. This one
+    /// fires only where answering it changes what happens: a killed batch that had
+    /// already landed something. A kill before the first settle still starts clean,
+    /// and a batch that recorded its own finish is exempt, so re-running a completed
+    /// job file keeps the meaning the runbook gives it.
+    ///
+    /// `Finished` therefore has to mean *closed out*, not merely *terminal* — which
+    /// is why an abort writes [`CheckpointStatus::Aborted`] instead. An aborted batch
+    /// is the case this clause exists for, and the common one: the engine stops on a
+    /// result it cannot account for, of which an expired session mid-batch is the
+    /// ordinary instance, and re-running the job file after signing in again is the
+    /// first thing an operator tries. Writing that as `Finished` would exempt exactly
+    /// the file the gate is for.
+    ///
+    /// The exemption is `Finished` and not "not live" on purpose. `mark_interrupted`
+    /// rewrites `Running` to `Interrupted`, so keying on liveness would make the
+    /// refusal expire the moment it was recorded and let the operator through by
+    /// running the command twice. The evidence has to be as durable as the `in_flight`
+    /// one it sits beside — and that is how the in-flight case already behaves: an
+    /// `Indeterminate` row keeps refusing every start until it is acknowledged.
+    ///
+    /// Never-attempted trainees still do not block on their own: nothing was sent
+    /// for them, so leaving them out cannot create a duplicate. They block here only
+    /// when they share a file with work that did land.
     pub fn blocks_start(&self) -> bool {
-        self.has_unconfirmed() || self.unaccounted() > 0
+        self.has_unconfirmed() || self.unaccounted() > 0 || self.records_landed_work()
     }
 
     /// How many trainees this file does not place in any group.
@@ -612,14 +681,84 @@ mod tests {
 
     /// Nothing was sent for a never-attempted trainee, so leaving it out of a
     /// new batch cannot create a duplicate — it must not require an override.
+    ///
+    /// The fixture carries no settled row on purpose. One would block on
+    /// [`Self::records_landed_work`], and this test would stop isolating the claim
+    /// it is named for — which is what it did before that clause existed. The
+    /// contrast is pinned by `a_landed_row_blocks_even_alongside_never_attempted_ones`.
     #[test]
     fn never_attempted_trainees_alone_do_not_block_a_start() {
+        let mut cp = checkpoint(CheckpointStatus::Interrupted);
+        cp.total = 3;
+        cp.results = vec![result("1", Outcome::Skipped)];
+        cp.pending = vec!["2".to_string(), "3".to_string()];
+
+        assert_eq!(cp.settled(), 0, "nothing in this file landed");
+        assert_eq!(cp.unaccounted(), 0);
+        assert!(!cp.blocks_start());
+    }
+
+    /// The other half of the rule above, and the hole Stage 28 left open: those
+    /// trainees are harmless *alone*. Sharing a file with work that did land makes
+    /// a plain start re-queue the job from the top and ask the portal for the landed
+    /// trainees a second time — which is what the portal's `duplicate|already logged`
+    /// match would have to catch, and it is the second layer, not this gate.
+    #[test]
+    fn a_landed_row_blocks_even_alongside_never_attempted_ones() {
         let mut cp = checkpoint(CheckpointStatus::Interrupted);
         cp.total = 3;
         cp.results = vec![result("1", Outcome::Success), result("2", Outcome::Skipped)];
         cp.pending = vec!["3".to_string()];
 
+        assert_eq!(cp.settled(), 1, "trainee 1 reached the portal");
+        assert!(cp.records_landed_work());
+        assert!(cp.blocks_start());
+    }
+
+    /// Only `Success` and `Failed` count as landed. A `Skipped` row was drained
+    /// after an abort and never sent, so a file of nothing but skips has landed
+    /// nothing — counting them would refuse a start over work that never happened.
+    #[test]
+    fn drained_skips_are_not_landed_work() {
+        let mut cp = checkpoint(CheckpointStatus::Running);
+        cp.total = 2;
+        cp.results = vec![result("1", Outcome::Skipped)];
+        cp.pending = vec!["2".to_string()];
+
+        assert_eq!(cp.settled(), 0);
+        assert!(!cp.records_landed_work());
         assert!(!cp.blocks_start());
+    }
+
+    /// A batch that wrote its own finish is exempt, which is what keeps re-running
+    /// a completed job file meaning what the runbook says it means — a re-run that
+    /// submits everyone again, not a refusal. The refusal would be permanent
+    /// otherwise: nothing rewrites a `Finished` file, so the landed row stays.
+    #[test]
+    fn a_finished_batch_is_exempt_from_the_landed_work_clause() {
+        let cp = checkpoint(CheckpointStatus::Finished);
+
+        assert!(cp.settled() > 0, "it landed work");
+        assert!(!cp.records_landed_work());
+    }
+
+    /// And the refusal outlives the write that records it. Keying this on
+    /// `is_live()` would let the operator straight through by running the command
+    /// twice, because `mark_interrupted` rewrites `Running` to `Interrupted` —
+    /// so the evidence has to survive that, exactly as `in_flight` does.
+    #[test]
+    fn marking_a_killed_batch_interrupted_does_not_expire_the_refusal() {
+        let mut cp = checkpoint(CheckpointStatus::Running);
+        cp.total = 1;
+        cp.results = vec![result("1", Outcome::Success)];
+        cp.pending = Vec::new();
+
+        assert!(cp.blocks_start(), "refused on the first start");
+
+        cp.mark_interrupted();
+
+        assert!(!cp.is_live(), "the status is no longer live");
+        assert!(cp.blocks_start(), "and it must still refuse the next start");
     }
 
     /// Every trainee is in exactly one of `results`, `pending` and `in_flight`,
@@ -807,5 +946,39 @@ mod tests {
     fn status_serializes_lowercase() {
         let json = serde_json::to_string(&CheckpointStatus::Interrupted).expect("serializes");
         assert_eq!(json, "\"interrupted\"");
+    }
+
+    /// Every status has to survive a round trip, because the file is the only
+    /// account of a run that never printed a report — and `aborted` is the one a
+    /// reader must not confuse with `finished`.
+    #[test]
+    fn every_status_round_trips_through_the_file() {
+        for status in [
+            CheckpointStatus::Running,
+            CheckpointStatus::Paused,
+            CheckpointStatus::Finished,
+            CheckpointStatus::Interrupted,
+            CheckpointStatus::Aborted,
+        ] {
+            let text = serde_json::to_string(&status).expect("serializes");
+            assert_eq!(
+                serde_json::from_str::<CheckpointStatus>(&text).expect("parses"),
+                status,
+                "{text}"
+            );
+        }
+    }
+
+    /// An aborted batch is terminal, so it is not a kill to record — but it does
+    /// block, which is the whole reason it is not written as `Finished`.
+    #[test]
+    fn an_aborted_batch_is_terminal_but_still_blocks_a_start() {
+        let mut cp = checkpoint(CheckpointStatus::Aborted);
+
+        assert!(!cp.is_live());
+        assert!(!cp.mark_interrupted(), "already terminal");
+        assert_eq!(cp.status, CheckpointStatus::Aborted);
+        assert!(cp.settled() > 0, "it landed work before it stopped");
+        assert!(cp.blocks_start());
     }
 }

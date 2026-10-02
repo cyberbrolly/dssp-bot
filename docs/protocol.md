@@ -43,6 +43,15 @@ or
 
 **`job_id` is echoed on every response** and must stay consistent end to end.
 
+**`v` is compared, not assumed.** Rust reads the version off every response and
+refuses one that is not its own — including the `ready` handshake. The reason is
+`proves_nothing_submitted`: the recovery gate reduces to Rust reading that flag
+correctly, and a worker speaking a different version is free to redefine it while
+every field still deserializes, which is a disagreement nothing else here would
+notice. A mismatch is refused in both directions, and one that arrives mid-submit
+becomes an indeterminate outcome rather than a retryable one — the worker replied,
+so the request was processed and the submission may have landed.
+
 ## Division of responsibility
 
 - **Python reports what happened; Rust decides what to do about it.** The worker
@@ -168,6 +177,10 @@ value would have licensed a retry the code correctly refuses.
 4. **`job_id` consistency** — echoed on every response line.
 5. **Golden rule** — Rust never fixes an automation error by adding retries;
    retryability comes from `proves_nothing_submitted` / the outcome table.
+6. **The version is checked, not trusted** — a response written to a different
+   protocol version is refused rather than read, because `v` is what would signal
+   that a flag like `proves_nothing_submitted` no longer means what it says. See
+   the Envelope section.
 
 ## Configuration (env, read by the worker)
 

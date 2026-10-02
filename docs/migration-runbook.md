@@ -50,7 +50,7 @@ run).
 | 25 | Rust coordinator          | 🟢 Passed     | `cargo test` (47)               | batch CLI + pre-flight dedupe; `2d2fcf9` |
 | 26 | Retry policy              | 🟢 Passed     | retry tests                     | `decision.rs` + E2E backoff |
 | 27 | Checkpointing             | 🟢 Passed     | `cargo test` (79) + clippy      | port TS `BatchCheckpoint.ts` + store + engine wiring; Gate 3 items → Stage 28 |
-| 28 | Recovery                  | 🟢 Passed     | `cargo test` (150) + clippy     | **Gate 3** — in-flight record + start gate; independent panel run, 5 defects fixed; 1 left open |
+| 28 | Recovery                  | 🟢 Passed     | `cargo test` (162) + clippy     | **Gate 3** — in-flight record + start gate; independent panel run, 5 defects fixed; the deferred one decided and fixed 2026-09-29 (follow-up), with a second panel over that fix |
 | 29 | Extension → Rust          | ⬜ Not Started | API integration                 | API designed → `docs/daemon-api.md`; TS still at repo root |
 | 30 | Pause                     | ⬜ Not Started | pause test                      | state exists; no engine API |
 | 31 | Stop                      | ⬜ Not Started | stop test                       | abort path exists |
@@ -328,7 +328,9 @@ at each point, and what the next start does with it:
 | during a retry backoff | trainee `in_flight` | as above |
 | result in hand, before the settle write | trainee `in_flight` | as above — the outcome is lost, the id is not |
 | during the abort drain | as at the settle write — the drain is in memory only, so every un-attempted trainee is still in `pending` | `never_attempted` restores batch order |
-| after the last settle, before the terminal write | status still `running`, nothing in flight | starts clean, and reports what it recovered |
+| after the last settle, before the terminal write | status still `running`, nothing in flight, results landed | refused, naming the landed count — `DSSP_RESUME=1` carries them and runs nothing (see the follow-up below) |
+| the whole queue drained, terminal write made | status `finished` | starts clean — a re-run of a completed job file is an ordinary batch |
+| a result the engine cannot account for | status `aborted`, the drain still in memory | refused — an abort stops *after* landing whatever it landed |
 
 So the file can only ever claim a submission that was never issued, never the
 reverse. That is the safe direction to be wrong in: the cost is a human checking
@@ -558,8 +560,10 @@ Errors:
   decided, because fixing it changes operator-facing behaviour on the path the
   live gates use.
 
-Open for whoever reviews this stage:
-- **A plain start over a checkpoint that records landed work is not refused.**
+Decided and fixed on 2026-09-29 — see *Follow-up* below; the finding is kept here
+because the reasoning that deferred it is what the follow-up had to answer.
+
+**A plain start over a checkpoint that records landed work is not refused.**
   Third pass, confirmed (two of three skeptics). Kill the process between one
   trainee's settle write and the next one's pre-send write, then run the same
   job file again *without* `DSSP_RESUME`: the file reads `results=[1]`,
@@ -579,7 +583,83 @@ Open for whoever reviews this stage:
   refusal that `DSSP_RESUME` clears. Not decided here because it changes
   operator-facing behaviour on the live-gate path, and because it reinterprets
   a choice this document already records.
-- **What the audit did not reach.** Recorded so this pass is not read as wider
+
+### Follow-up — 2026-09-29: the open defect decided, and a second panel over the fix
+
+The second option above was taken. `blocks_start` gains a third clause,
+`records_landed_work()`, and the refusal it produces names the landed count and
+the ways forward. Four things about the decision are worth recording, because
+three of them are where the first draft of the fix was wrong.
+
+**The exemption is `Finished`, not "not live".** The issue's own predicate
+(`is_live() && !results.is_empty()`) does not survive contact with `guard`:
+`mark_interrupted` rewrites `Running`/`Paused` to `Interrupted`, and `guard`
+calls it *before* deciding, so a liveness-keyed refusal would expire the moment
+it was recorded and let the operator through by running the command twice. The
+evidence has to be as durable as the `in_flight` one it sits beside.
+
+**Three things, not one, can be missing from a file** — an unconfirmed record, a
+count that does not add up, and now a batch that died holding settled work.
+Liveness settled only the last. A kill *before* the first settle still starts
+clean, never-attempted trainees still do not block on their own, and a batch that
+worked through its whole queue is still an ordinary re-run, so the stage's own
+fix (removing the check that cried wolf on every kill-and-retry) is intact; the
+tests that pinned it are re-fixtured rather than deleted, each saying why.
+
+**A second panel over the fix** — four lenses, refutations adversarially — found
+three things, all in the fix rather than in the stage. It is recorded as the
+first panel is, because two of the three were the difference between the gate
+working and the gate looking like it worked:
+
+- **An aborted batch wrote `finished`.** The engine's terminal write was
+  `Finished` whether the loop drained or aborted ("an aborted batch is as final as
+  a completed one"), and `aborted` lives only on the in-memory report. So the
+  exemption above covered exactly the case the clause was written for: a session
+  that expires mid-batch leaves `results=[success, failed(SESSION_EXPIRED),
+  skipped]`, `pending=[]`, status `finished` — landed work, no in-flight record,
+  and a plain re-run that re-queues the whole file. `SESSION_EXPIRED` mid-batch is
+  the *ordinary* way an operator reaches this state, not the narrow one, so this
+  was the difference between the fix applying and not. Fixed by giving an aborted
+  batch its own terminal status (`CheckpointStatus::Aborted`): `Finished` now
+  means *closed out*, which is what the exemption needs it to mean. Reproduced
+  first with a failing test, then fixed.
+- **The refusal promised a resume that could not clear it.** `guard(store, true)`
+  with an empty roster and nothing owed returns `Plan::Resume{roster: []}`, and
+  `run_batch` prints "nothing to resume" and returns *before* the engine is
+  constructed — so the terminal write that closes a batch never happens, the file
+  keeps its landed rows, and because the clause above keys on a status only a
+  terminal write changes, every later plain start refuses too. Permanently: only
+  moving the file aside cleared it, which the refusal presents as the option for
+  when you suspect a duplicate. Fixed in `guard`: an acknowledgement that leaves
+  nothing to run and nothing owed writes the batch closed out, which is what the
+  refusal's "close it out" was promising.
+- **`settled()` counts failures that never reached the portal — left open.** A
+  `Failed` row arrives from `settle_submit` on the branch that requires
+  `proves_nothing_submitted == true`, so most `Failed` rows are the worker saying
+  the submit was never issued; `settled()` counts them all, so the clause can
+  refuse over a batch that landed nothing, and the refusal's "N submission(s)
+  that already settled" is then untrue. It over-counts in the safe direction —
+  `Indeterminate` is the only landing outcome it misses, and `has_unconfirmed`
+  catches those — so it is a false refusal, not a hole, and it has a written way
+  forward. Not fixed here: the file does not record `proves_nothing_submitted`
+  (`TrainingResult` keeps `error_code` and drops the flag), so narrowing it means
+  either persisting the flag or a third copy of a safety-critical code table in
+  Rust, and the protocol doc already records what a wrong copy of that table
+  costs (the `PORTAL_UNAVAILABLE` entry, Stage 38). The realistic gain is one flag
+  and the realistic cost is a duplicate record, so the conservative reading stays
+  until the live gates have run over this path.
+
+The panel's verification phase is discounted, not relied on: it ran against a
+tree that already contained the first two fixes, so its skeptics refuted findings
+the working diff had by then answered. The findings stand on their own
+reproductions — the first with a failing test at the time it was filed.
+
+Verification after the follow-up: **cargo test — 162 passed, 0 failed**,
+`cargo clippy --all-targets` clean, `pytest` 53 passed. The crash-instant table
+above is updated in place, since a row that describes the wrong next start is how
+an operator gets a second record.
+
+**What the audit did not reach.** Recorded so this pass is not read as wider
   than it was. Both panels read `checkpoint.rs`, `recovery.rs`, `store.rs`,
   `main.rs`, and (third pass only) `engine.rs`, `worker.rs` and `python/app`.
   Still never a lens target: `decision.rs`, `resolution.rs`, `queue.rs`,
@@ -587,13 +667,16 @@ Open for whoever reviews this stage:
   3: no test kills the process for real (every crash is simulated by
   constructing a file), no write-fault injection (the fatal-write premise is
   tested by making the *store* fail, not the disk), no concurrency case (there
-  is no lock or pid file, so two batches over one path are untested), no fuzz
-  over arbitrary checkpoint files — every fixture is well-formed — and
-  `Response.v` is deserialized but still never compared to `protocol::V`. The
-  panel's own critic named the last one as the sharpest: the gate reduces to
-  Rust reading `proves_nothing_submitted` correctly, and the version field that
-  would detect a worker disagreeing about what that flag means is read and
-  dropped.
+  is no lock or pid file, so two batches over one path are untested), and no fuzz
+  over arbitrary checkpoint files — every fixture is well-formed. Of these, the
+  one the panel's own critic named as sharpest — the gate reduces to Rust reading
+  `proves_nothing_submitted` correctly, and the version field that would detect a
+  worker disagreeing about what that flag means was read and dropped — is closed
+  in the follow-up above (`check_version` in `worker.rs`; `Response.v` is now
+  compared against `protocol::V` on every line, the `ready` handshake included,
+  and a mismatch arriving mid-submit becomes an indeterminate outcome rather than
+  a retryable one). The rest are still open, and the process-kill one is the
+  evidence Gate 3 most deserves.
 - **Refuted, and recorded so they are not re-litigated.** Two findings did not
   survive: that `promote_suspect`'s dead early return is still load-bearing
   (three of three refuted — it is unreachable from its one caller, as round two

@@ -106,8 +106,12 @@ impl WorkerClient {
         if bytes == 0 {
             return Err("worker closed stdout".to_string());
         }
-        serde_json::from_str(line.trim())
-            .map_err(|e| format!("invalid protocol line ({e}): {:?}", line.trim()))
+        let resp: Response = serde_json::from_str(line.trim())
+            .map_err(|e| format!("invalid protocol line ({e}): {:?}", line.trim()))?;
+
+        check_version(&resp)?;
+
+        Ok(resp)
     }
 
     /// Close stdin (worker exits on EOF) and reap the child.
@@ -117,8 +121,73 @@ impl WorkerClient {
     }
 }
 
+/// Refuse a response written to a different version of the protocol.
+///
+/// `protocol::V` was sent on every request and never read back off a response, so
+/// a worker that disagreed about what the fields *mean* parsed exactly like one that
+/// agreed. That matters most for `proves_nothing_submitted`: the recovery gate
+/// reduces to Rust reading that flag correctly, and a worker speaking v2 is free to
+/// redefine it while every field still deserializes — the one disagreement this
+/// protocol has no other way to notice.
+///
+/// Both directions are refused. An older worker reporting its own version to a newer
+/// build is the same disagreement from the other side, and silence about a field the
+/// reader expects is not agreement.
+///
+/// Mid-submit this becomes a transport error, which the engine already treats as
+/// `Indeterminate`: the worker replied, so the request was processed and the
+/// submission may have landed. That is the safe bucket — reported, never replayed.
+fn check_version(resp: &Response) -> Result<(), String> {
+    if resp.v == crate::protocol::V {
+        return Ok(());
+    }
+
+    Err(format!(
+        "protocol version mismatch: the worker speaks v{}, this build speaks v{} — refusing to \
+         act on fields that may not mean the same thing",
+        resp.v,
+        crate::protocol::V
+    ))
+}
+
 impl Drop for WorkerClient {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::V;
+
+    fn response(v: u32) -> Response {
+        serde_json::from_str(&format!(
+            r#"{{"v":{v},"status":"error","error_code":"PORTAL_UNAVAILABLE",
+                 "proves_nothing_submitted":false}}"#
+        ))
+        .expect("the fixture parses")
+    }
+
+    #[test]
+    fn a_response_at_this_builds_version_is_accepted() {
+        assert!(check_version(&response(V)).is_ok());
+    }
+
+    #[test]
+    fn a_response_from_a_different_protocol_version_is_refused() {
+        let error = check_version(&response(V + 1)).expect_err("a version this build cannot read");
+
+        assert!(error.contains("protocol version mismatch"), "{error}");
+        assert!(error.contains("speaks v2"), "names the worker's version: {error}");
+        assert!(error.contains("speaks v1"), "and this build's: {error}");
+    }
+
+    /// The check is a comparison, not a guess, because `v` is the one field with no
+    /// `#[serde(default)]`: a response that omits it fails to parse at all rather
+    /// than defaulting to something this build would accept.
+    #[test]
+    fn a_response_that_omits_the_version_does_not_parse() {
+        assert!(serde_json::from_str::<Response>(r#"{"status":"ok"}"#).is_err());
     }
 }

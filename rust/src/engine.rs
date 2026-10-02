@@ -268,11 +268,18 @@ impl BatchEngine {
             let _ = self.machine.transition_to(AutomationState::Complete);
         }
 
-        // Terminal either way: an aborted batch is as final as a completed one,
-        // and this is the first write to contain the drained skips — they are
-        // never checkpointed individually.
+        // Terminal either way, and this is the first write to contain the drained
+        // skips — they are never checkpointed individually. But the two terminals are
+        // not the same thing to a reader: an aborted batch stopped with whatever it
+        // had already landed still on the portal, so it is written as `Aborted` and
+        // the start gate refuses a plain re-run over it. Calling both `Finished` left
+        // the gate's one landed-work exemption covering the case it was written for.
         let _ = self.save_checkpoint(
-            CheckpointStatus::Finished,
+            if aborted {
+                CheckpointStatus::Aborted
+            } else {
+                CheckpointStatus::Finished
+            },
             &started_at,
             total,
             &results,
@@ -1216,9 +1223,31 @@ mod tests {
 
         let last = written.last().unwrap();
 
-        assert_eq!(last.status, CheckpointStatus::Finished);
+        assert_eq!(
+            last.status,
+            CheckpointStatus::Aborted,
+            "a batch that stopped early is not a batch that finished"
+        );
         assert!(last.pending.is_empty());
         assert_eq!(last.results[2].outcome, Outcome::Skipped);
+    }
+
+    /// The other half of the terminal status: a batch that worked through its queue
+    /// writes `Finished`, which is what keeps a re-run over a completed job file an
+    /// ordinary start rather than a refusal.
+    #[test]
+    fn a_batch_that_drains_its_queue_finishes_rather_than_aborts() {
+        let recorder = Recorder::default();
+        let mut w = FakeTransport::new(true, vec![confirmed("1", "A"), confirmed("2", "B")]);
+
+        with_recorder(&recorder)
+            .run(&mut w, &session(), refs(&["1", "2"]))
+            .unwrap();
+
+        let last = recorder.written().pop().expect("a terminal write");
+
+        assert_eq!(last.status, CheckpointStatus::Finished);
+        assert_eq!(last.results[1].outcome, Outcome::Success);
     }
 
     /// A storage fault after a submission must not abort an otherwise-succeeding

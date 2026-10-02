@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use crate::checkpoint::{BatchCheckpoint, IN_FLIGHT_CODE, Unreconciled};
+use crate::checkpoint::{BatchCheckpoint, CheckpointStatus, IN_FLIGHT_CODE, Unreconciled};
 use crate::protocol::TraineeRef;
 use crate::report::{Outcome, TrainingResult};
 use crate::store::CheckpointStore;
@@ -159,13 +159,30 @@ pub fn guard(store: &CheckpointStore, resume: bool) -> Result<Start, String> {
 
         carried.extend(stranded);
 
+        let roster: Vec<TraineeRef> = runnable
+            .iter()
+            .filter(|id| Some(id.as_str()) != suspect_id)
+            .map(|id| by_id(id))
+            .collect();
+
+        // Nothing left to run and no human owed an answer: the acknowledgement is
+        // the whole of what the operator came here to do, and it is recorded here
+        // because this is the one path out of the gate that never constructs the
+        // engine — so the terminal write that closes a batch does not happen, and a
+        // file the landed-work clause alone blocks would refuse every later plain
+        // start over a batch that had no loose ends left. That is the state the
+        // refusal calls "close it out", and it is the state a killed batch reaches
+        // routinely: die after the last settle and every trainee is accounted for.
+        if roster.is_empty() && owed == 0 {
+            previous.status = CheckpointStatus::Finished;
+            if let Err(e) = store.save(&previous) {
+                eprintln!("dssp-bot: could not close the batch out: {e}");
+            }
+        }
+
         return Ok(Start {
             plan: Plan::Resume {
-                roster: runnable
-                    .iter()
-                    .filter(|id| Some(id.as_str()) != suspect_id)
-                    .map(|id| by_id(id))
-                    .collect(),
+                roster,
                 carried,
                 owed,
             },
@@ -262,23 +279,6 @@ fn continuable(previous: &BatchCheckpoint, tracks_in_flight: bool) -> Vec<String
     }
 }
 
-/// Records in `results` that were submitted and reached a conclusion.
-///
-/// Not "everything that is not unconfirmed": a `Skipped` row was drained after an
-/// abort and never sent, and [`BatchCheckpoint::never_attempted`] already counts it
-/// as work still to do — counting it twice would push the refusal's breakdown past
-/// `total`.
-///
-/// Also not `results.len() - unconfirmed.len()`: the in-flight trainee is
-/// synthesized into the unconfirmed group without being in `results`, so
-/// subtracting it would under-report what settled.
-fn settled(cp: &BatchCheckpoint) -> usize {
-    cp.results
-        .iter()
-        .filter(|result| matches!(result.outcome, Outcome::Success | Outcome::Failed))
-        .count()
-}
-
 /// The refusal an operator reads, naming the file, what is in it, why it cannot
 /// be overwritten, and the ways forward.
 fn refusal(
@@ -317,6 +317,20 @@ fn refusal(
             "the counts are short by {unaccounted} — check the portal before deciding anything; \
              a resume will not run them"
         )
+    } else if previous.records_landed_work() && never > 0 {
+        // The landed count is named because it is the whole reason this is a
+        // refusal: the operator's instinct is to re-run the job file, and that is
+        // the one thing that would ask the portal for those trainees again.
+        format!(
+            "re-run with {RESUME_ENV}=1 to continue the {never} never-attempted trainee(s) — the \
+             {} already settled are carried forward, never submitted again",
+            previous.settled()
+        )
+    } else if previous.records_landed_work() {
+        format!(
+            "re-run with {RESUME_ENV}=1 to close it out — every trainee this file knows about is \
+             already settled, so the resume submits nothing"
+        )
     } else if never > 0 {
         format!(
             "re-run with {RESUME_ENV}=1 to continue the {never} never-attempted trainee(s); \
@@ -330,7 +344,8 @@ fn refusal(
     };
 
     format!(
-        "dssp-bot: refusing to start — the checkpoint at {} is not reconciled\n\
+        "dssp-bot: refusing to start — the checkpoint at {} holds a previous batch that was not \
+         closed out\n\
          dssp-bot:   previous batch started {}: {} trainee(s), {} settled, \
          {unconfirmed} unconfirmed, {queued}\n\
          dssp-bot:   {}\n\
@@ -339,7 +354,7 @@ fn refusal(
         path.display(),
         previous.started_at,
         previous.total,
-        settled(previous),
+        previous.settled(),
         reason(previous, unreconciled, suspect),
         path.display(),
     )
@@ -383,9 +398,21 @@ fn reason(
         );
     }
 
+    // After the two above, which are the sharper warnings — a trainee who may be
+    // mid-submission, or one the file cannot place at all, both outrank "this
+    // batch landed some work". A file can be all three at once.
+    if previous.records_landed_work() {
+        return format!(
+            "it records {} submission(s) that already settled, on a batch that never wrote its \
+             finish — running the job file again would ask the portal for them a second time",
+            previous.settled()
+        );
+    }
+
     // Reachable only with an unconfirmed record that is not an in-flight one:
     // `blocks_start` refuses over `has_unconfirmed` (an in-flight trainee, or an
-    // `Indeterminate` row, both handled above) or over a count that does not add up.
+    // `Indeterminate` row, both handled above), over a count that does not add up,
+    // or over landed work — also handled above.
     debug_assert!(
         !unreconciled.indeterminate.is_empty(),
         "a file with nothing unconfirmed and nothing unaccounted cannot be blocked"
@@ -405,7 +432,7 @@ pub fn recovered_line(path: &Path, previous: &BatchCheckpoint) -> String {
         "dssp-bot: recovered an interrupted batch from {}: {} settled, {unconfirmed} unconfirmed, \
          {} never attempted of {}",
         path.display(),
-        settled(previous),
+        previous.settled(),
         previous.never_attempted().len(),
         previous.total,
     )
@@ -563,15 +590,20 @@ mod tests {
         assert!(!after.is_live());
     }
 
-    /// A file left live but owing nothing — the process died between its last
-    /// settle and the terminal write, so `in_flight` is empty and no submission was
-    /// outstanding when it died. It starts clean and reports what it recovered.
+    /// A live file that landed work is refused even though nothing was outstanding
+    /// when the process died — the process was killed between its last settle and
+    /// the terminal write, so `in_flight` is empty and no submission was in doubt.
     ///
-    /// Liveness alone used to block this, which made the gate cry wolf on every
-    /// ordinary kill-and-retry.
+    /// It is still refused, because the file records submissions that reached the
+    /// portal and a plain start re-queues the job from the top. This reverses what
+    /// this test used to assert ("starts clean and says what it recovered"): that
+    /// behaviour re-submitted both trainees in the window where the operator most
+    /// believes they are recovering a crash. Liveness alone is still not what
+    /// blocks — `a_live_file_that_landed_nothing_starts_clean` pins that, and it is
+    /// the fix Stage 28 made and this must not undo.
     #[test]
-    fn a_live_file_that_owes_nothing_starts_clean_and_says_what_it_recovered() {
-        let scratch = Scratch::new("live-nothing-owed");
+    fn a_live_file_that_landed_work_is_refused_and_the_resume_closes_it_out() {
+        let scratch = Scratch::new("live-landed");
         let store = scratch.store();
         let mut cp = unfinished(CheckpointStatus::Running);
         cp.total = 2;
@@ -579,14 +611,111 @@ mod tests {
         cp.pending = Vec::new();
         store.save(&cp).expect("saves");
 
-        let start = guard(&store, false).expect("nothing is in doubt");
+        let refusal = guard(&store, false).expect_err("landed work must not be overwritten");
+
+        assert!(
+            refusal.contains("2 submission(s) that already settled"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("running the job file again"), "{refusal}");
+        assert!(refusal.contains("DSSP_RESUME=1"), "{refusal}");
+
+        // The way forward the refusal points at must not re-submit either of them.
+        let start = guard(&store, true).expect("the override");
+
+        match start.plan {
+            Plan::Resume {
+                roster,
+                carried,
+                owed,
+            } => {
+                assert!(roster.is_empty(), "nothing is left to attempt: {roster:?}");
+                assert_eq!(carried.len(), 2, "both records are carried, not queued");
+                assert_eq!(owed, 0, "and neither is outstanding for a human");
+            }
+            other => panic!("expected a resume, got {other:?}"),
+        }
+
+        // And the refusal must actually lift, which is what "close it out" promises:
+        // this path returns without ever constructing the engine, so nothing else
+        // would write the terminal status and every later plain start would refuse
+        // over a batch with no loose ends left.
+        let after = CheckpointStore::new(store.path()).load().expect("reads").expect("there");
+        assert_eq!(after.status, CheckpointStatus::Finished);
+
+        let start = guard(&store, false).expect("the batch is closed out");
+        assert_fresh(&start);
+        assert!(!start.recovered, "already terminal at the write above");
+    }
+
+    /// The Stage 28 fix, which the clause above must not undo: a kill *before* the
+    /// first settle leaves a live file with nothing on it, and a live file alone is
+    /// not a reason to refuse. Liveness by itself used to block here, which made the
+    /// gate cry wolf on every ordinary kill-and-retry.
+    #[test]
+    fn a_live_file_that_landed_nothing_starts_clean() {
+        let scratch = Scratch::new("live-nothing-landed");
+        let store = scratch.store();
+        let mut cp = unfinished(CheckpointStatus::Running);
+        cp.total = 3;
+        cp.results = Vec::new();
+        cp.pending = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        cp.in_flight = None;
+        store.save(&cp).expect("saves");
+
+        let start = guard(&store, false).expect("nothing was sent");
 
         assert_fresh(&start);
         assert!(start.recovered, "but the kill is still recorded and reported");
 
-        // And the mark is durable, so the next start is an ordinary one.
+        // Nothing landed, so this one *is* an ordinary next start: the batch it
+        // belonged to is gone and the job file runs from the top, as it should.
         let after = CheckpointStore::new(store.path()).load().expect("reads").expect("there");
         assert_eq!(after.status, CheckpointStatus::Interrupted);
+    }
+
+    /// An aborted batch is not a finished one, and the file has to say so — the
+    /// landed-work clause exempts `Finished`, so a batch that stopped early must not
+    /// be written as one.
+    ///
+    /// The engine stops on a result it cannot account for, of which an expired
+    /// session mid-batch is the ordinary instance, and it stops *after* landing
+    /// whatever it landed. Re-running the job file once signed back in is the first
+    /// thing an operator tries, so this is the shape the gate exists for — and the
+    /// reason [`CheckpointStatus::Aborted`] is a status rather than a flag on a
+    /// `Finished` file. `a_finished_batch_is_exempt_from_the_landed_work_clause`
+    /// keeps the other half: a batch that *did* close out stays an ordinary re-run.
+    #[test]
+    fn an_aborted_batch_is_refused_like_the_unfinished_batch_it_is() {
+        let scratch = Scratch::new("aborted");
+        let store = scratch.store();
+        let mut aborted = unfinished(CheckpointStatus::Aborted);
+        aborted.total = 3;
+        aborted.results = vec![
+            result("1", Outcome::Success),
+            TrainingResult {
+                error_code: Some("SESSION_EXPIRED".to_string()),
+                ..result("2", Outcome::Failed)
+            },
+            result("3", Outcome::Skipped),
+        ];
+        aborted.pending = Vec::new();
+        store.save(&aborted).expect("saves");
+
+        let refusal = guard(&store, false).expect_err("trainee 1 reached the portal");
+
+        assert!(refusal.contains("running the job file again"), "{refusal}");
+
+        // And the way forward still runs only what was never attempted.
+        let Plan::Resume { roster, carried, owed } =
+            guard(&store, true).expect("the override").plan
+        else {
+            panic!("expected a resume");
+        };
+
+        let ids: Vec<&str> = roster.iter().filter_map(|r| r.id.as_deref()).collect();
+        assert_eq!(ids, vec!["3"], "trainee 1 landed, trainee 2 was answered for");
+        assert_eq!(owed, 0, "{carried:?}");
     }
 
     /// The regression for the hole this gate had: the refusal's own write used

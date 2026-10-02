@@ -112,22 +112,31 @@ The next start reads that file first, before it connects to anything:
 - **May be missing a submission** — a submission that was in flight, a record
   that was never confirmed, or counts that do not add up. The start is refused
   with the counts and the ways forward (exit 3), and the file is marked
-  interrupted so the next attempt is ordinary.
+  interrupted. The refusal stands until it is acknowledged — recording the
+  interruption does not clear it, and neither does running the command again.
+- **Already landed work** — a batch that stopped early holding records that
+  reached the portal, whether it was killed or aborted itself. A plain start
+  re-queues the job file from the top, so it would ask the portal for those
+  trainees a second time; refused (exit 3), rather than left to the portal's own
+  duplicate match. This is narrower than "being killed": a kill *before* anything
+  landed still starts clean, and a batch that worked through its whole queue is
+  an ordinary re-run, as is a re-run of a completed job file. An aborted batch
+  writes `aborted`, not `finished`, precisely so it is not mistaken for one that
+  closed out.
 - **`DSSP_RESUME=1`** — continue it instead. The never-attempted trainees run;
   everything the predecessor recorded is carried forward into the new file so it
   stays whole. Nothing whose submission may already be on the portal is ever
   submitted again — those are reported and left for you. If there is nothing left
   to attempt, the run exits 0 when every loose end is settled and 3 when a human
-  is still owed.
+  is still owed; in the exit-0 case it also writes the batch closed out, so the
+  file stops refusing later starts. The acknowledgement is what lifts the
+  refusal, not a repeat of the original command.
   A file from a build **older than this one** — written before the checkpoint
   named a submission in flight — runs none of its queue: it cannot say how far
   through it got, so every trainee still waiting in it is carried forward as
   unconfirmed and the run exits 3 with the names. Check the portal for them.
 - **Unreadable** — a corrupt file is not a file that says nothing ran. Refused,
   never treated as an empty slot.
-- **Killed, but owing nothing** — a run that died between its last result and
-  its final write. Nothing is in doubt, so it starts clean and reports what it
-  recovered. Being killed is not by itself a reason to refuse.
 
 A checkpoint written by a build older than this stage has no record of what was
 in flight (older builds only wrote after a submission settled), so its first
