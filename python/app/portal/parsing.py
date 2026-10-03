@@ -405,7 +405,6 @@ def build_form_payload(
 _DUPLICATE_RE = re.compile(
     r"duplicate|already\s+(?:logged|recorded|exists?)", re.IGNORECASE
 )
-_SUCCESS_RE = re.compile(r"success|successfully|saved|recorded|created", re.IGNORECASE)
 
 
 def validation_message(soup: BeautifulSoup) -> Optional[str]:
@@ -480,14 +479,7 @@ def submission_outcome(
         )
         return {"outcome": "rejected", "message": detail}
 
-    final_path = urlparse(final_url).path
-    if (
-        (json_message is not None and json_message.get("success") is True)
-        or _SUCCESS_RE.search(message)
-        or status == 204
-        or (200 <= status < 300 and not body.strip())
-        or (redirected and "/TrainingLog" not in final_path)
-    ):
+    if json_message is not None and json_message.get("success") is True:
         return {"outcome": "confirmed", "reference": final_url}
 
     return {
