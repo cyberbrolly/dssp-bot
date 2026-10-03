@@ -135,11 +135,11 @@ def test_select_form_option_rejects_unknown_value():
     assert info.value.error_code == "VALIDATION_FAILED"
 
 
-def test_outcome_confirmed_via_redirect_away_from_form():
+def test_outcome_indeterminate_via_redirect_without_confirmation():
     outcome = parse.submission_outcome(
         TRAINEES_HTML, "https://x/Trainee?saved=1", 200, True
     )
-    assert outcome["outcome"] == "confirmed"
+    assert outcome["outcome"] == "indeterminate"
 
 
 def test_outcome_duplicate():
@@ -172,16 +172,41 @@ def test_outcome_rejected_json_success_false():
     assert outcome["message"] == "nope"
 
 
-def test_outcome_confirmed_json_success_true():
+@pytest.mark.parametrize("body", ['{"success": true}', '{"Success": true}'])
+def test_outcome_confirmed_json_success_true(body):
+    outcome = parse.submission_outcome(body, "https://x/post", 200, False)
+    assert outcome["outcome"] == "confirmed"
+
+
+@pytest.mark.parametrize("status", [200, 204])
+def test_outcome_indeterminate_empty_response(status):
+    outcome = parse.submission_outcome("", "https://x/post", status, False)
+    assert outcome["outcome"] == "indeterminate"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Training was not saved.",
+        "Submission unsuccessful.",
+        "No record was created.",
+        "Training saved successfully.",
+    ],
+)
+def test_outcome_indeterminate_without_verified_confirmation(message):
     outcome = parse.submission_outcome(
-        '{"success": true}', "https://x/post", 200, False
+        f"<html><body>{message}</body></html>", "https://x/post", 200, False
     )
-    assert outcome["outcome"] == "confirmed"
+    assert outcome["outcome"] == "indeterminate"
 
 
-def test_outcome_confirmed_empty_204():
-    outcome = parse.submission_outcome("", "https://x/post", 204, False)
-    assert outcome["outcome"] == "confirmed"
+@pytest.mark.parametrize(
+    "body",
+    ['{"success": "true"}', '{"success": 1}', '{"message": "saved"}'],
+)
+def test_outcome_indeterminate_without_boolean_json_success(body):
+    outcome = parse.submission_outcome(body, "https://x/post", 200, False)
+    assert outcome["outcome"] == "indeterminate"
 
 
 def test_outcome_indeterminate_when_unreadable():

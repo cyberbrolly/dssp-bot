@@ -25,6 +25,8 @@ TRAINEES_HTML = """
       <td><a href="/Trainee/TrainingLog/TraineeId=666">Log</a></td></tr>
   <tr><td>5</td><td>a</td><td>John Doe</td><td>x</td><td>Class B</td><td></td><td></td><td>0</td><td></td><td></td><td></td>
       <td><a href="/Trainee/TrainingLog/TraineeId=789">Log</a></td></tr>
+  <tr><td>6</td><td>a</td><td>Redirect Case</td><td>x</td><td>Class B</td><td></td><td></td><td>0</td><td></td><td></td><td></td>
+      <td><a href="/Trainee/TrainingLog/TraineeId=777">Log</a></td></tr>
 </tbody></table>
 """
 
@@ -47,10 +49,10 @@ LAST_POST = {}
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def _send(self, code, body, headers=None):
+    def _send(self, code, body, headers=None, content_type="text/html; charset=utf-8"):
         data = body.encode()
         self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(data)))
@@ -68,7 +70,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
+        post_count = LAST_POST.get("count", 0) + 1
         LAST_POST.clear()
+        LAST_POST["count"] = post_count
         LAST_POST["path"] = self.path
         LAST_POST["body"] = self.rfile.read(length).decode()
         LAST_POST["content_type"] = self.headers.get("Content-Type")
@@ -76,6 +80,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         tid = self.path.rsplit("/", 1)[-1]
         if tid == "123":
+            self._send(200, '{"success": true}', content_type="application/json")
+        elif tid == "777":
             self._send(302, "", {"Location": "/Trainee?saved=1"})
         elif tid == "456":
             self._send(200, "<html><body>Record already logged</body></html>")
@@ -134,7 +140,7 @@ def test_confirmed_payload_and_classification(client):
     assert result["outcome"] == "confirmed"
     assert result["trainee"] == {"id": "123", "name": "John Doe"}
     assert result["attempts"] == 1
-    assert result["reference"].endswith("/Trainee?saved=1")
+    assert result["reference"].endswith("/post/123")
 
     body = LAST_POST["body"]
     assert "TrainingDate=2026-09-14" in body  # 14/09/2026 normalised
@@ -165,6 +171,15 @@ def test_indeterminate(client):
         {"id": "555"}, session(instructor="10", training_type="1")
     )
     assert result["outcome"] == "indeterminate"
+    assert result["attempts"] == 1
+    assert LAST_POST["count"] == 1
+
+
+def test_redirect_without_confirmation_is_indeterminate(client):
+    result = client.submit_training({"id": "777"}, session())
+    assert result["outcome"] == "indeterminate"
+    assert result["attempts"] == 1
+    assert LAST_POST["count"] == 1
 
 
 def test_session_expired_on_post(client):
