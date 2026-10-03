@@ -18,6 +18,10 @@ run).
 5. Batch CLI wiring is folded into **Stage 25** and must be finished before
    checkpointing (Stage 27).
 6. The legacy TypeScript implementation is **not removed** until Stage 34.
+7. Before committing, report the changed files, verification results, status
+   changes, and remaining risks to the operator in the conversation. Wait for
+   explicit commit approval; pushing or opening/updating a PR also requires
+   authorization. Real-portal submissions require separate explicit approval.
 
 ## Stage Status Tracking
 
@@ -36,8 +40,8 @@ run).
 | 11 | Retrieve trainees         | 🟢 Passed     | trainee retrieval               | fixture-verified |
 | 12 | Trainee matching          | 🟢 Passed     | `pytest`                        | permanent suite in `python/tests/` |
 | 13 | Training form             | 🟢 Passed     | form workflow                   | fixture-verified |
-| 14 | Submission                | 🟢 Passed     | Prepare → Commit → Confirm      | 10 outcome branches fixture-verified |
-| 15 | One-trainee milestone     | 🟡 Blocked    | real end-to-end test            | **Gate 1** — awaiting operator |
+| 14 | Submission                | 🟢 Passed     | 46 targeted tests; 63 full Python tests | `d8b0588`: explicit JSON confirmation only; fixture-verified, not live-verified |
+| 15 | One-trainee milestone     | 🟡 Blocked    | real end-to-end test            | **Gate 1** — awaiting verified success-response format and operator approval |
 | 16 | Initialize Rust           | 🟢 Passed     | `cargo check`                   |       |
 | 17 | Rust models               | 🟢 Passed     | `cargo check`                   | `protocol.rs`, `report.rs` |
 | 18 | Rust job                  | 🟢 Passed     | single-job flow                 | `job.example.json` |
@@ -46,7 +50,7 @@ run).
 | 21 | Rust ↔ Python protocol    | 🟢 Passed     | JSON request/response           | `docs/protocol.md` |
 | 22 | Protocol validation       | 🟢 Passed     | invalid-message tests           | bad JSON / unknown op / job_id echo |
 | 23 | Rust → Python connection  | 🟢 Passed     | IPC test                        | spawn + ready + ping |
-| 24 | Real Rust → Python → DSSP | 🟡 Blocked    | one-trainee test                | **Gate 2** — awaiting operator |
+| 24 | Real Rust → Python → DSSP | 🟡 Blocked    | one-trainee test                | **Gate 2** — follows Gate 1; awaiting operator approval |
 | 25 | Rust coordinator          | 🟢 Passed     | `cargo test` (47)               | batch CLI + pre-flight dedupe; `2d2fcf9` |
 | 26 | Retry policy              | 🟢 Passed     | retry tests                     | `decision.rs` + E2E backoff |
 | 27 | Checkpointing             | 🟢 Passed     | `cargo test` (79) + clippy      | port TS `BatchCheckpoint.ts` + store + engine wiring; Gate 3 items → Stage 28 |
@@ -135,6 +139,39 @@ Remain on Stage 14.
 ```
 
 ## Stage Records
+
+### Follow-up — 2026-10-03: submission-confirmation fix (Stage 14)
+
+- **Status:** fixture verification passed; Stages 15 and 24 remain Blocked.
+- **Change:** `d8b0588` (`Fix false-positive submission confirmation`), on
+  `fix/submission-confirmation`; [PR #4](https://github.com/cyberbrolly/dssp-bot/pull/4)
+  targets `migration/python-rust`. GitHub API check on 2026-10-03: open,
+  not merged; migration base still `bb0cf56`. Recheck before a live gate.
+- **Implementation:** removed `_SUCCESS_RE` and confirmation based on text,
+  empty HTTP 200/204 responses, or redirects. Python confirms only a parsed
+  boolean JSON `success: true` (or `Success: true`), after the existing login,
+  duplicate, and rejection checks. Function parameters, `urlparse`, payload
+  handling, and the final `indeterminate` result are preserved. Rust is unchanged.
+- **Regression coverage:** negative wording ("Training was not saved.",
+  "Submission unsuccessful.", "No record was created."), unverified positive
+  HTML wording, empty responses, redirect-only responses, and non-boolean JSON
+  success values remain indeterminate. Explicit success, rejection, duplicate,
+  and expired-session coverage remains. The integration success fixture returns
+  JSON; payload and antiforgery-token assertions remain, and unconfirmed cases
+  assert one attempt and one POST.
+- **Verification during the fix:** before implementation, parser tests reported
+  10 failed / 24 passed, reproducing the false confirmations. After the fix,
+  parser + submission integration tests passed (46); the full Python suite
+  passed (63); `git diff --check` passed. The sandboxed shell had a TTY failure;
+  post-fix tests completed outside that sandbox against the local fixture portal.
+- **Live evidence:** no real submission was made for this fix, and the actual
+  success-response format is still unknown. At this follow-up, `python/.evidence/`
+  is empty in this checkout; the historical Stage 10 evidence is not available
+  here for reinspection. This does not change Stage 10's recorded result.
+- **Next:** verify the actual response format before using the fix on the real
+  portal. Add HTML support only for a verified confirmation signal, with tests;
+  otherwise keep HTML indeterminate. Complete the preflight below, then obtain
+  approval for the single-trainee live gates. Do not start Stage 29 yet.
 
 ```text
 Stage: 10 — Verify DSSP session
@@ -890,9 +927,65 @@ whatever is still Blocked — the live gates at 15 and 24.
 First run is headed so the operator can sign in once; the session persists in
 `python/.pw-profile/` (gitignored). No credentials are ever stored.
 
-**These runs submit real records to the real portal.** Nothing below is a dry
-run. Do them in order and stop at the first failure rather than working around
-it — a worked-around failure is a gate that has not been proven.
+Stage 10 is read-only on the portal. **The submission procedures below write
+real records; they are not dry runs and require explicit operator approval.**
+Do them in order and stop at the first failure rather than working around it —
+a worked-around failure is a gate that has not been proven.
+
+### Preflight before Stages 15 and 24
+
+- [x] Check PR #4's current status: open, not merged (2026-10-03); local
+  `fix/submission-confirmation` contains `d8b0588`.
+- [ ] After review/merge, verify that the migration code selected for the live
+  run includes `d8b0588` or its merged equivalent.
+- [ ] Establish the real success-response format from existing private evidence
+  tied to a portal-verified successful record, or an explicitly approved manual
+  portal operation. Do not use an automated submission to guess the format.
+- [ ] Record the HTTP status, final URL/redirect behavior, content type, and
+  exact confirmation signal privately. Do not paste trainee data, cookies,
+  tokens, or raw responses into chat, commits, or the PR. The worker dump saves
+  the response body, not a complete HTTP trace; collect missing metadata locally.
+- [ ] If success is HTML rather than JSON, document the verified signal and add
+  narrowly scoped parser support and regression tests before the automated gate.
+  Generic success words, empty responses, and redirects are not confirmation.
+- [ ] Select a legitimate training record with the operator, check it has not
+  already been submitted, and obtain explicit approval for that submission.
+- [ ] Enable evidence capture for the run and preserve the result and exit code.
+  Treat any unconfirmed result as a stop requiring portal inspection, never an
+  instruction to retry.
+
+The unchecked items remain open; the repository check is not live verification.
+The live gates stay Blocked until their actual end-to-end verification succeeds.
+
+### Operator procedure: establish the confirmation signal
+
+Use an existing capture of a known successful submission if available. The
+2026-10-03 preflight found `python/.evidence/` empty and no submission-response
+files or HAR captures in the project search. Evidence outside this checkout has
+not been searched; the operator must provide its local path if it exists.
+
+If no suitable capture exists, the following is a **manual, real submission**,
+not permission to perform one. Obtain explicit approval and choose a legitimate
+training record that has not already been submitted before proceeding.
+
+1. In the portal browser, open Developer Tools → Network and enable Preserve
+   log before the approved manual submission. Keep the capture local.
+2. Submit the approved record once through the portal UI. Identify the training
+   form POST and inspect its response and any subsequent redirects; do not use
+   Replay, Resend, or Copy as fetch to repeat the request.
+3. Privately record the status, content type, redirect chain/final URL, and
+   response body. Confirm through the portal's training history that the exact
+   intended record was created; a generic notification alone is insufficient.
+4. Save the relevant evidence under `python/.evidence/`, not in tracked docs.
+   Treat it as sensitive: bodies and URLs may contain trainee data, and a HAR
+   can also contain session cookies and authorization headers. Share only the
+   local path with the agent, not the raw capture in chat or the PR.
+5. If the record is absent or uncertain, stop and investigate. Do not submit
+   again to obtain better evidence. If it is present, use the capture to verify
+   the parser signal and add sanitized regression fixtures as needed.
+6. This manual operation does **not** pass either automated gate. Do not reuse
+   its record for the automated test; obtain separate approval for a different
+   legitimate record after the confirmation format is established.
 
 **Stage 10 — session + retrieval (read-only, writes nothing):** 🟢 ran 2026-09-28,
 see the Stage 10 record. Kept here as the reference for the two gates below,
@@ -923,8 +1016,14 @@ it is never committed, pasted into an issue, or sent anywhere):
 ```bash
 cp job.example.json job.json   # fill in a real trainee + instructor/type
 cd rust
-cargo run -- ../job.json
+DSSP_DUMP_DIR=.evidence cargo run -- ../job.json
 ```
+
+Run each command block from the repository root. Rust starts the worker with
+`python/` as its working directory, so `DSSP_DUMP_DIR=.evidence` writes to
+`python/.evidence/`. Despite the `.html` filename, a response dump may contain
+JSON. Keep dumps private and gitignored; verify they were written because a dump
+failure is logged but does not fail the submission.
 
 Expect `RESULT: confirmed …` (exit 0), `RESULT: duplicate …`, `FAILED: …`, or
 `HALT: indeterminate …`. Immediately before the submit the run prints a warning
@@ -943,7 +1042,7 @@ the batch machinery.
 ```bash
 cp job.batch.example.json job.json   # two real trainees: one by id, one by name
 cd rust
-cargo run -- ../job.json
+DSSP_DUMP_DIR=.evidence cargo run -- ../job.json
 ```
 
 This is the only run that exercises what stages 25–28 were built for:
@@ -956,10 +1055,11 @@ training for. How to read it:
 
 - `python/.evidence/submit-response-*.html` versus §5 of the phase4 spec. The
   `duplicate` classification is a **text match** on that body, and it is the
-  documented second safety layer for the crash window. If the portal's real
-  wording differs from the match list, a genuine duplicate classifies as
-  `confirmed` and Rust reports success on a replay — worth confirming here,
-  because this is the one run that can.
+  documented second safety layer for the crash window. Unmatched wording alone
+  is now `indeterminate`, not `confirmed`. An explicit JSON success flag can
+  still confirm a response whose duplicate wording is not recognized, so verify
+  the real response semantics. Do not deliberately replay a submission just to
+  discover duplicate wording; use existing evidence or an approved operation.
 - `dssp.checkpoint.json` (beside the job file, gitignored) should exist, and
   should name both trainees in `results` with `pending` and `in_flight` empty.
 - **Re-running the same job file is not a second test** — it re-submits both. For
@@ -984,7 +1084,8 @@ and form inline). The live run is the first test of these, and they fail
 | the name is the third `td` | `parsing.py:97` (positional, against the spec's own rule) | an inserted column yields a blank name; a name match then fails as `TRAINEE_NOT_FOUND` |
 | one `pgsize=10000` request returns everything | `constants.py:25` | silent truncation; see the count check above |
 | exactly one `table.table-checkable` | `constants.py:33` | a second matching table merges rows from both |
-| duplicate wording | `parsing.py` `submission_outcome` (text match) | misclassification, in the unsafe direction — see above |
+| duplicate wording | `parsing.py` `submission_outcome` (text match) | unmatched wording alone is indeterminate; a JSON success flag can still mask a duplicate — see above |
+| actual success-response format | `parsing.py` `submission_outcome` | a genuine HTML success remains indeterminate until a verified signal is supported; never retry to obtain confirmation |
 | the login marker | `parsing.py` `is_login_page` / `has_authenticated_marker` | a rewritten login page reads as authenticated, or vice versa |
 
 ### If it fails
