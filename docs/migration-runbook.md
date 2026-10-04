@@ -40,7 +40,7 @@ run).
 | 11 | Retrieve trainees         | 🟢 Passed     | trainee retrieval               | fixture-verified |
 | 12 | Trainee matching          | 🟢 Passed     | `pytest`                        | permanent suite in `python/tests/` |
 | 13 | Training form             | 🟢 Passed     | form workflow                   | fixture-verified |
-| 14 | Submission                | 🟢 Passed     | 46 targeted tests; 63 full Python tests | `d8b0588`: explicit JSON confirmation only; fixture-verified, not live-verified |
+| 14 | Submission                | 🟢 Passed     | 87 focused Python tests after review; 200 full previously | Ordinary-session AJAX contract fixture-verified; final assessments blocked; live POST response still unverified |
 | 15 | One-trainee milestone     | 🟡 Blocked    | real end-to-end test            | **Gate 1** — awaiting verified success-response format and operator approval |
 | 16 | Initialize Rust           | 🟢 Passed     | `cargo check`                   |       |
 | 17 | Rust models               | 🟢 Passed     | `cargo check`                   | `protocol.rs`, `report.rs` |
@@ -139,6 +139,105 @@ Remain on Stage 14.
 ```
 
 ## Stage Records
+
+### Follow-up — 2026-10-04: review corrections for post-response safety
+
+- **Status:** local changes only; Stages 15/24 stay Blocked. No live launch or
+  request, job overwrite, attempt-marker removal, commit, push, or deployment.
+- **Response capture:** allowlisted metadata is now saved immediately after POST
+  returns, before `resp.text()`. Body-read exceptions are converted to
+  `CONFIRMATION_UNKNOWN` with a fixed possibly-delivered message. The original
+  error text is not logged. The worker emits `proves_nothing_submitted:false`;
+  Rust's existing decision logic halts (single path exit 3; batch indeterminate),
+  not Retry. Even a preflight-coded exception during body reading is reclassified.
+- **Identity check:** `parse_qs(..., keep_blank_values=True)` preserves blank
+  query values. Extra blank, first blank, and duplicate same-ID parameters are
+  refused before any POST, including `TraineeId=123&TraineeId=`.
+- **Launcher validation:** all job/build assertions were replaced with explicit
+  checks and `SystemExit`. Tests run only the validation prefix in disposable
+  synthetic directories, with and without `PYTHONOPTIMIZE=1`; invalid jobs/builds
+  stop before Rust or marker creation. Existing synthetic markers remain intact.
+  The actual live launch command has not been executed.
+- **Focused verification:** 63 validation-prefix/worker tests passed; 24 selected
+  offline submission tests passed (39 deselected); 24 Rust decision tests passed.
+  The first parallel submission run timed out after one pass with no failure
+  output; the standalone rerun passed in 72.32s. Cargo repeated its incremental
+  artifact warning but no tests failed. No Rust or worker source changes needed.
+  The earlier full Python suite result (200) predates these review corrections;
+  this follow-up ran focused tests, not a new full suite.
+- **Next:** review `client.py`, current `parsing.py`, launcher checks, and the
+  worker/protocol/Rust halt chain. Preserve all real attempt markers; collect
+  live evidence only after separate session-specific authorization.
+
+### Follow-up — 2026-10-04: final review and live-verification preparation
+
+- **Status:** local preparation only; Stages 15/24 remain Blocked. No live
+  requests, submissions, retries, deployments, commits, or pushes.
+- **Review:** checked nested form encoding, resolved/form ID checks, required
+  control ownership, assessment exclusion/blocking, redirect handling, and retry
+  decisions. Python has one POST call; its redirects are disabled. Installed
+  Playwright 1.62 documents a zero network-retry default. Rust can retry only
+  provably-unsent transient errors, never indeterminate or maybe-delivered ones.
+- **Capture gap fixed:** `DSSP_DUMP_DIR` now also writes
+  `submit-response-<id>.metadata.json` containing only `status`, `content_type`,
+  and `location`; the existing body dump remains. Cookie/Set-Cookie/Authorization
+  headers are not copied. Raw body and Location may be sensitive: keep them
+  private, never in shared logs. Capture remains best-effort, not load-bearing.
+- **Procedure:** [one ordinary-session verification](live-single-verification.md)
+  records prerequisites, offline preparation, the exact authorization-only
+  launch command, one-shot marker, private capture, stop rules, exact before/after
+  history comparison, and separate gate acceptance criteria. Never repeat the
+  already recorded session. No live command from that document was executed.
+- **Verification:** 58 evidence/submission tests passed; full Python suite
+  passed (200). `cargo test --offline decision::tests` passed (24); Cargo reported
+  a corrupt incremental artifact that it ignored/deleted, with no failed tests.
+  Rust source remains unchanged. Diff whitespace and procedure syntax checked.
+- **Next:** operator review/approval of local changes, followed only by separately
+  authorized evidence collection for a genuinely needed unsubmitted ordinary
+  session. Keep both live gates Blocked until response and exact history evidence
+  are reviewed. Missing evidence, duplicates, or ambiguous results do not pass.
+
+### Follow-up — 2026-10-03: AJAX integration correction (offline-verified)
+
+- **Status:** Stage 14's ordinary-session submission implementation is Passed
+  on offline fixtures. Stages 15/24 remain Blocked; this is not live-gate
+  verification. No deployment, live request, submission, retry, or commit.
+- **Implemented from operator-verified findings:** query-string training URLs,
+  preference for training-history links over details links, `TrainingOptionId`
+  selector compatibility, `form#frmtraininglog` scoping/ownership checks, and
+  `#logoutForm` / `/Account/LogOff` authentication markers. JSON parsing accepts
+  `IsSuccessful` (preferred over legacy aliases), with `Message` handling;
+  boolean false rejects, and confirmation requires boolean true plus HTTP 2xx.
+  Non-boolean values, non-2xx success flags, generic text, and empty responses
+  do not confirm. Rejection checks now precede duplicate-text classification.
+- **Evidence gap resolved for implementation:** the file initially labelled
+  training-form was a trainee-list page. The operator subsequently supplied the
+  actual form and JavaScript in the conversation. It has a hidden `TraineeId`
+  inside `form#frmtraininglog`, and option `4` enters the distinct final-assessment
+  flow. Only the structural contract was transcribed into synthetic fixtures;
+  no personal details, real IDs, or raw token from that HTML were saved to code.
+- **Payload/transport completed:** `build_form_payload(soup, session, trainee_id)`
+  now returns encoded-field pairs instead of `(form, payload)`; its client and
+  test callers were updated. The client validates the final form URL and the
+  hidden ID against the resolved record, then posts once to `/Trainee/LogTraining`.
+  The request uses nested `LogDetails[...]` form fields, not JSON. jQuery emits
+  no fields for `FinalAssessments: []`; ordinary sessions therefore omit all
+  assessment inputs, unrelated controls, and the separate logout form's token.
+  Option `4`, final-assessment labels, and nonempty assessment payloads are
+  rejected before POST. Final assessments are deliberately unsupported.
+- **Redirect safety:** POST redirect-following is disabled, preventing 307/308
+  replay. A login Location reports session expiry without being followed;
+  other redirects remain indeterminate, even with success JSON. The script's
+  `location.reload()` is not an HTTP redirect or a confirmation signal.
+- **Offline verification:** 180 targeted parser/URL/submission tests passed;
+  197 tests passed in the full Python suite. Tests cover exact nested bytes,
+  field exclusions, wrong/missing IDs and control ownership, final-assessment
+  blocking, response types/statuses, and no POST replay. Raw evidence remains
+  gitignored; Rust and legacy TypeScript are unchanged. `git diff --check` passed.
+- **Next:** review these local changes before any commit or push. A captured
+  live POST response is still needed for live verification; never retry the
+  already recorded session to obtain it. Do not pass Stages 15/24 from HTML or
+  fixture tests alone.
 
 ### Follow-up — 2026-10-03: submission-confirmation fix (Stage 14)
 
@@ -895,8 +994,9 @@ Hard gates — do not continue past them until they pass.
 ## Current Execution Order
 
 The order the work follows, not a list of what is outstanding: 10 and 25–28 are
-already Passed (see the status table above), and the entry point today is
-whatever is still Blocked — the live gates at 15 and 24.
+already Passed (see the status table above). Stage 14's AJAX correction is now
+offline-verified; the next outstanding verification is the live gates at 15 and
+24, pending a real POST response and explicit operator approval.
 
 ```text
 10  Real DSSP session
@@ -924,6 +1024,11 @@ whatever is still Blocked — the live gates at 15 and 24.
 
 ## Live-Run Procedure (Stages 10, 15, 24)
 
+For the upcoming ordinary-session verification, use the guarded procedure and
+exact launch command in [live-single-verification.md](live-single-verification.md).
+The simple CLI examples below explain the entry points, not permission to run
+or to bypass the one-shot guard. Stages 15/24 remain Blocked.
+
 First run is headed so the operator can sign in once; the session persists in
 `python/.pw-profile/` (gitignored). No credentials are ever stored.
 
@@ -936,15 +1041,18 @@ a worked-around failure is a gate that has not been proven.
 
 - [x] Check PR #4's current status: open, not merged (2026-10-03); local
   `fix/submission-confirmation` contains `d8b0588`.
+- [x] Verify the client-side form/AJAX contract and complete offline regression
+  coverage, including trainee-ID checks and the final-assessment block.
 - [ ] After review/merge, verify that the migration code selected for the live
-  run includes `d8b0588` or its merged equivalent.
+  run includes both `d8b0588` and the subsequent AJAX integration correction
+  (or their merged equivalents).
 - [ ] Establish the real success-response format from existing private evidence
   tied to a portal-verified successful record, or an explicitly approved manual
   portal operation. Do not use an automated submission to guess the format.
 - [ ] Record the HTTP status, final URL/redirect behavior, content type, and
   exact confirmation signal privately. Do not paste trainee data, cookies,
-  tokens, or raw responses into chat, commits, or the PR. The worker dump saves
-  the response body, not a complete HTTP trace; collect missing metadata locally.
+  tokens, or raw responses into chat, commits, or the PR. The worker saves the
+  body and allowlisted status/Content-Type/Location metadata, not a full trace.
 - [ ] If success is HTML rather than JSON, document the verified signal and add
   narrowly scoped parser support and regression tests before the automated gate.
   Generic success words, empty responses, and redirects are not confirmation.
@@ -960,9 +1068,22 @@ The live gates stay Blocked until their actual end-to-end verification succeeds.
 ### Operator procedure: establish the confirmation signal
 
 Use an existing capture of a known successful submission if available. The
-2026-10-03 preflight found `python/.evidence/` empty and no submission-response
-files or HAR captures in the project search. Evidence outside this checkout has
-not been searched; the operator must provide its local path if it exists.
+initial 2026-10-03 preflight found `python/.evidence/` empty. A subsequent local
+check found three gitignored artifacts: trainee-list HTML, a file labelled as
+training-form HTML, and a training-history screenshot. The list parses to 346
+trainees. The screenshot shows one recorded training entry, but cannot establish
+which request created it or the POST response's confirmation format. No saved
+submission-response body or HAR was found in the project scan (including ignored
+files, excluding browser profiles, dependencies, and build directories).
+
+The file labelled training-form was a trainee-list page, not the intended form.
+The operator later supplied the actual form and JavaScript in the conversation;
+it establishes the client-side AJAX contract, now implemented and offline-tested.
+It does not supply a live POST response. Neither that HTML nor the screenshot
+clears Stages 15/24. No portal requests were made during this evidence review.
+
+Evidence outside this checkout has not been searched; the operator must provide
+its local path if it exists.
 
 If no suitable capture exists, the following is a **manual, real submission**,
 not permission to perform one. Obtain explicit approval and choose a legitimate
@@ -1008,8 +1129,10 @@ it is never committed, pasted into an issue, or sent anywhere):
   mismatch means `pgsize=10000` is being capped, and every trainee past the cap
   is invisible to the bot: they surface later as `TRAINEE_NOT_FOUND`, which reads
   as "the portal has no such trainee" for someone who plainly exists.
-- the form HTML from one `get_form_options` call, if run — the POST shape and the
-  `__RequestVerificationToken` assumption can be checked against it.
+- the form HTML from one `get_form_options` call, if run — compare the current
+  controls and script with the mapped AJAX contract. The captured token belongs
+  to the separate logout form, not the observed training request; do not copy it
+  into the training payload.
 
 **Stages 15 + 24 — one trainee through the Rust chain (Gate 1, then Gate 2):**
 

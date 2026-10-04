@@ -8,11 +8,12 @@ cookies, mirroring the old extension's credentialed fetch approach.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlencode, urljoin
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from playwright.sync_api import Page, Playwright, sync_playwright
 from playwright.sync_api import Error as PlaywrightError
@@ -228,9 +229,18 @@ class PortalClient:
             c.training_form_url(resolved["id"]),
             evidence=f"training-form-{resolved['id']}.html",
         )
-        form, payload = parse.build_form_payload(soup, session)
+        expected_url = urlparse(c.training_form_url(resolved["id"]))
+        actual_url = urlparse(form_url)
+        if (
+            (actual_url.scheme, actual_url.netloc, actual_url.path)
+            != (expected_url.scheme, expected_url.netloc, expected_url.path)
+            or parse_qs(actual_url.query, keep_blank_values=True).get("TraineeId")
+                        != [resolved["id"]]
+        ):
+            raise e.portal_structure("The training form URL does not match the current record.")
+        payload = parse.build_form_payload(soup, session, resolved["id"])
 
-        action = urljoin(form_url, form.get("action") or form_url)
+        action = urljoin(c.DSSP_ORIGIN + "/", c.TRAINING_SUBMIT_PATH)
         data = urlencode(payload)
 
         self.start()
@@ -240,22 +250,49 @@ class PortalClient:
                 action,
                 data=data,
                 headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json",
                 },
                 timeout=c.NAV_TIMEOUT_MS,
+                # A 307/308 must never transparently replay a committed POST.
+                max_redirects=0,
             )
         except PlaywrightError as exc:
             raise e.network(
                 f"submitting training for trainee {resolved['id']} failed: {exc}"
             ) from exc
 
-        body = resp.text()
-        # The POST response is the evidence "duplicate" is matched against (see
-        # submission_outcome); the crash-window safety argument leans on it.
+        if c.dump_dir():
+            # Allowlist response metadata; never capture cookies or request headers.
+            self._dump(
+                f"submit-response-{resolved['id']}.metadata.json",
+                json.dumps(
+                    {
+                        "status": resp.status,
+                        "content_type": resp.headers.get("content-type"),
+                        "location": resp.headers.get("location"),
+                    },
+                    indent=2,
+                ),
+                resp.url,
+            )
+        try:
+            body = resp.text()
+        except Exception as exc:
+            # The POST already returned: even a locally classified failure must
+            # not be reported as provably unsent or retried by the coordinator.
+            raise e.confirmation_unknown(
+                "DSSP returned a response, but its body could not be read. "
+                "The submission may have been delivered; inspect training history, do not retry."
+            ) from exc
+        # The POST body is evidence for classification, never permission to replay.
         self._dump(f"submit-response-{resolved['id']}.html", body, resp.url)
-        redirected = resp.url != action
-        outcome = parse.submission_outcome(body, resp.url, resp.status, redirected)
+        redirected = 300 <= resp.status < 400
+        result_url = resp.url
+        if redirected and resp.headers.get("location"):
+            result_url = urljoin(resp.url, resp.headers["location"])
+        outcome = parse.submission_outcome(body, result_url, resp.status, redirected)
 
         log.info(
             "submit trainee=%s name=%r outcome=%s",

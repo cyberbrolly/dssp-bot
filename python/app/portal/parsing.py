@@ -213,16 +213,9 @@ def find_training_date_input(soup: BeautifulSoup) -> Optional[Tag]:
 
 
 def get_form_options(soup: BeautifulSoup) -> dict[str, list[dict[str, str]]]:
-    instructor = find_instructor_select(soup)
-    if instructor is None:
-        raise e.element_not_found("Instructor select")
-
-    training_type = find_training_type_select(soup)
-    if training_type is None:
-        raise e.element_not_found("Training Type select")
-
-    instructors = get_select_options(instructor)
-    training_types = get_select_options(training_type)
+    fields = get_training_form_fields(soup)
+    instructors = get_select_options(fields["instructor"])
+    training_types = get_select_options(fields["training_type"])
 
     if not instructors:
         raise e.missing_data("Instructor options")
@@ -255,27 +248,31 @@ def has_authenticated_marker(soup: BeautifulSoup) -> bool:
 
 
 def get_training_form_fields(soup: BeautifulSoup) -> dict[str, Tag]:
-    """Locate the Log New Training form and its three required controls."""
-    training_date = find_training_date_input(soup)
-    if training_date is None:
-        raise e.element_not_found("Training Date input")
-
-    instructor = find_instructor_select(soup)
-    if instructor is None:
-        raise e.element_not_found("Instructor select")
-
-    training_type = find_training_type_select(soup)
-    if training_type is None:
-        raise e.element_not_found("Training Type select")
-
-    form: Optional[Tag] = None
-    for control in (training_date, instructor, training_type):
-        form = control.find_parent("form")
-        if form is not None:
-            break
-
-    if form is None:
+    """Locate required controls only within the observed training form."""
+    forms = soup.select(c.TRAINING_FORM_SELECTOR)
+    if not forms:
         raise e.element_not_found("Log New Training form")
+    if len(forms) != 1:
+        raise e.portal_structure("Multiple Log New Training forms were found.")
+    form = forms[0]
+    training_date = find_training_date_input(form)
+    instructor = find_instructor_select(form)
+    training_type = find_training_type_select(form)
+
+    for control, name, tag in (
+        (training_date, "Training Date input", "input"),
+        (instructor, "Instructor select", "select"),
+        (training_type, "Training Type select", "select"),
+    ):
+        if control is None:
+            raise e.element_not_found(name)
+        if (
+            control.name != tag
+            or control.find_parent("form") is not form
+            or control.get("form", form["id"]) != form["id"]
+            or control.has_attr("disabled")
+        ):
+            raise e.portal_structure(f"{name} is not an enabled control of the training form.")
 
     return {
         "form": form,
@@ -317,89 +314,59 @@ def select_form_option(
 
 
 def build_form_payload(
-    soup: BeautifulSoup, session: dict[str, str]
-) -> tuple[Tag, list[tuple[str, str]]]:
-    """Virtually fill the training form and build its POST payload.
+    soup: BeautifulSoup, session: dict[str, Any], trainee_id: str
+) -> list[tuple[str, str]]:
+    """Build jQuery's nested form fields for the ordinary LogTraining AJAX call.
 
-    Port of fillTrainingFormFields + validateTrainingForm +
-    buildTrainingFormPayload: every named control (hidden fields and the
-    submitter included) is collected in DOM order, then the three session
-    values are applied."""
+    The endpoint and property names come from the captured script, not the
+    form's action/method or a serialization of all its controls. jQuery omits
+    empty arrays, so FinalAssessments: [] produces no encoded fields.
+    """
     fields = get_training_form_fields(soup)
     form = fields["form"]
+    ids = form.select('input#TraineeId, input[name="TraineeId"]')
+    if len(ids) != 1:
+        raise e.portal_structure("The training form must have one TraineeId control.")
+    identity = ids[0]
+    if (
+        identity.get("id") != "TraineeId"
+        or identity.get("name") != "TraineeId"
+        or identity.get("type", "").lower() != "hidden"
+        or identity.find_parent("form") is not form
+        or identity.get("form", form["id"]) != form["id"]
+        or identity.has_attr("disabled")
+    ):
+        raise e.portal_structure("Invalid training form TraineeId control.")
+    if (
+        not isinstance(trainee_id, str)
+        or not re.fullmatch(r"[0-9]+", trainee_id)
+        or identity.get("value") != trainee_id
+    ):
+        raise e.portal_structure("The training form trainee ID does not match the current record.")
 
-    method = (form.get("method") or "get").strip().upper()
-    if method != "POST":
-        raise e.portal_structure(
-            f"The Log New Training form uses unsupported method {method}."
-        )
+    training_type = select_form_option(
+        fields["training_type"],
+        session["training_type"],
+        session.get("training_type_label"),
+    )
+    # The captured script branches on option 4 before collecting assessment marks.
+    if (
+        training_type["value"] == "4"
+        or re.search(r"final\s*assessment", training_type["label"], re.IGNORECASE)
+        or session.get("final_assessments")
+        or session.get("FinalAssessments")
+    ):
+        raise e.validation("Final-assessment submissions are not supported.")
 
-    payload: list[tuple[str, str]] = []
-
-    for element in form.find_all(["input", "select", "textarea"]):
-        if element.has_attr("disabled"):
-            continue
-        name = element.get("name")
-        if not name:
-            continue
-
-        if element.name == "input":
-            type_ = (element.get("type") or "text").lower()
-            if type_ == "file":
-                raise e.portal_structure(
-                    "The training form contains an unsupported file field."
-                )
-            if type_ in ("checkbox", "radio"):
-                if element.has_attr("checked"):
-                    payload.append((name, element.get("value") or "on"))
-            elif type_ in ("submit", "button", "reset", "image"):
-                continue
-            else:
-                payload.append((name, element.get("value") or ""))
-        elif element.name == "select":
-            selected = [
-                option for option in element.select("option") if option.has_attr("selected")
-            ]
-            if not selected:
-                selected = [
-                    option
-                    for option in element.select("option")
-                    if not option.has_attr("disabled")
-                ][:1]
-            for option in selected:
-                payload.append((name, _option_value(option)))
-        else:  # textarea
-            payload.append((name, element.get_text()))
-
-    submitter = form.select_one(c.SUBMIT_SELECTOR)
-    if submitter is not None and submitter.get("name"):
-        payload.append((submitter["name"], submitter.get("value") or ""))
-
-    date_name = fields["training_date"].get("name")
-    instructor_name = fields["instructor"].get("name")
-    type_name = fields["training_type"].get("name")
-    if not date_name or not instructor_name or not type_name:
-        raise e.portal_structure(
-            "A required training control has no form field name."
-        )
-
-    overrides = {
-        date_name: format_training_date(session["training_date"]),
-        instructor_name: select_form_option(
+    details = {
+        "TraineeId": trainee_id,
+        "TrainingDate": format_training_date(session["training_date"]),
+        "InstructorId": select_form_option(
             fields["instructor"], session["instructor"], session.get("instructor_label")
         )["value"],
-        type_name: select_form_option(
-            fields["training_type"],
-            session["training_type"],
-            session.get("training_type_label"),
-        )["value"],
+        "TrainingOptionId": training_type["value"],
     }
-
-    overridden = set(overrides)
-    payload = [(k, v) for k, v in payload if k not in overridden]
-    payload.extend(overrides.items())
-
-    return form, payload
+    return [(f"LogDetails[{key}]", value) for key, value in details.items()]
 
 
 _DUPLICATE_RE = re.compile(
@@ -425,7 +392,7 @@ def message_from_json(body: str) -> Optional[dict[str, Any]]:
         return None
 
     result: dict[str, Any] = {}
-    success = value.get("success", value.get("Success"))
+    success = value.get("IsSuccessful", value.get("success", value.get("Success")))
     message = value.get("message")
     if message is None:
         message = value.get("Message")
@@ -462,9 +429,6 @@ def submission_outcome(
         json_message.get("message", visible_text) if json_message else visible_text
     )
 
-    if _DUPLICATE_RE.search(message):
-        return {"outcome": "duplicate", "message": message}
-
     validation = validation_message(soup)
 
     if (
@@ -479,7 +443,14 @@ def submission_outcome(
         )
         return {"outcome": "rejected", "message": detail}
 
-    if json_message is not None and json_message.get("success") is True:
+    if _DUPLICATE_RE.search(message):
+        return {"outcome": "duplicate", "message": message}
+
+    if (
+        200 <= status < 300
+        and json_message is not None
+        and json_message.get("success") is True
+    ):
         return {"outcome": "confirmed", "reference": final_url}
 
     return {

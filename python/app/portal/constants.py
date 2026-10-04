@@ -18,24 +18,32 @@ def _flag(name: str, default: str = "0") -> bool:
 
 DSSP_ORIGIN = os.environ.get("DSSP_ORIGIN", "https://dssp.frsc.gov.ng").rstrip("/")
 TRAINEE_PAGE_PATH = "/Trainee"
-TRAINING_FORM_PATH = "/Trainee/TrainingLog/TraineeId="
+TRAINING_FORM_PATH = "/Trainee/TrainingLog?TraineeId="
+TRAINING_SUBMIT_PATH = "/Trainee/LogTraining"
 
 TRAINEE_PAGE_URL = f"{DSSP_ORIGIN}{TRAINEE_PAGE_PATH}"
 TRAINEE_LIST_URL = f"{DSSP_ORIGIN}/Trainee?pgsize=10000&page=1&keywords="
 
 
 def training_form_url(trainee_id: str) -> str:
-    return f"{DSSP_ORIGIN}{TRAINING_FORM_PATH}{quote(trainee_id)}"
+    return f"{DSSP_ORIGIN}{TRAINING_FORM_PATH}{quote(trainee_id, safe='')}"
 
 
 TRAINEE_ROW_SELECTOR = "table.table-checkable tbody tr"
 TRAINEE_ID_LINK_SELECTOR = 'a[href*="TraineeId="]'
-TRAINING_LOG_LINK_SELECTOR = 'a[href*="/Trainee/TrainingLog/"][href*="TraineeId="]'
+TRAINING_LOG_LINK_SELECTOR = (
+    'a[href*="/Trainee/TrainingLog?"][href*="TraineeId="], '
+    'a[href*="/Trainee/TrainingLog/"][href*="TraineeId="]'
+)
+TRAINING_FORM_SELECTOR = "form#frmtraininglog"
 TRAINEE_TABLE_SELECTOR = "table.table-checkable tbody"
 LOGIN_FORM_SELECTOR = '#loginForm, form[action*="/Account/Login"]'
 VALIDATION_MESSAGE_SELECTOR = ".validation-summary-errors, .field-validation-error"
 SUBMIT_SELECTOR = 'button[type="submit"], input[type="submit"]'
-LOGOUT_SELECTOR = 'a[href*="/Account/Logout"], form[action*="/Account/Logout"]'
+LOGOUT_SELECTOR = (
+    'form#logoutForm, a[href*="/Account/LogOff"], form[action*="/Account/LogOff"], '
+    'a[href*="/Account/Logout"], form[action*="/Account/Logout"]'
+)
 
 TRAINING_DATE_SELECTORS = (
     "#TrainingDate",
@@ -52,6 +60,8 @@ INSTRUCTOR_SELECTORS = (
     'select[name="InstructorID"]',
 )
 TRAINING_TYPE_SELECTORS = (
+    "select#TrainingOptionId",
+    'select[name="TrainingOptionId"]',
     "select#TrainingType",
     'select[name="TrainingType"]',
     "select#TrainingTypeId",
