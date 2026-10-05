@@ -369,10 +369,6 @@ def build_form_payload(
     return [(f"LogDetails[{key}]", value) for key, value in details.items()]
 
 
-_DUPLICATE_RE = re.compile(
-    r"duplicate|already\s+(?:logged|recorded|exists?)", re.IGNORECASE
-)
-
 
 def validation_message(soup: BeautifulSoup) -> Optional[str]:
     messages = [
@@ -413,22 +409,22 @@ def submission_outcome(
 ) -> dict[str, str]:
     """Classify a submission response. Port of submissionOutcome.
 
-    Returns {"outcome": "confirmed"|"duplicate"|"rejected"|"indeterminate"}
-    plus reference/message where applicable. Raises SESSION_EXPIRED when the
-    response is the login page. Classification only — never resubmits."""
+    Returns {"outcome": "confirmed"|"rejected"|"indeterminate"}
+    plus reference/message where applicable. Duplicate text is not a verified
+    result contract. A login response raises post-submission SESSION_EXPIRED.
+    Classification only — never resubmits."""
     soup = parse_html(body)
 
     if is_login_page(soup, final_url):
-        raise e.session_expired()
+        raise e.session_expired(submission_attempted=True)
+
+    if 300 <= status < 400:
+        return {
+            "outcome": "indeterminate",
+            "message": f"DSSP returned HTTP {status} without a verified submission result.",
+        }
 
     json_message = message_from_json(body)
-    visible_text = (
-        " ".join(soup.body.get_text().split()) if soup.body else body.strip()
-    )
-    message = (
-        json_message.get("message", visible_text) if json_message else visible_text
-    )
-
     validation = validation_message(soup)
 
     if (
@@ -443,8 +439,6 @@ def submission_outcome(
         )
         return {"outcome": "rejected", "message": detail}
 
-    if _DUPLICATE_RE.search(message):
-        return {"outcome": "duplicate", "message": message}
 
     if (
         200 <= status < 300

@@ -139,10 +139,11 @@ redirect heuristics; this Python-only fix did not change that implementation.
 
 | Outcome              | Selector or signal                                                                                            | Notes                     |
 | -------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| Success confirmation | HTTP 2xx and boolean JSON `IsSuccessful: true` (`success`/`Success` retained), after login, rejection, and duplicate checks | Client-side contract supplied by operator; live POST response still missing |
-| Validation error | `.validation-summary-errors`, `.field-validation-error`, recognized JSON success flag `false`, or HTTP `4xx` | Returned as rejected before duplicate-text checks |
-| Duplicate record     | Response text containing `duplicate`, `already logged`, `already recorded`, or `already exists`               | Returned as duplicate     |
-| Session expired      | Login URL or login form selector                                                                              | Stops the batch           |
+| Success confirmation | HTTP 2xx and boolean JSON `IsSuccessful: true` (`success`/`Success` retained), after login, non-login 3xx, and rejection checks | Client-side contract supplied by operator; live POST response still missing |
+| Validation error | `.validation-summary-errors`, `.field-validation-error`, recognized JSON success flag `false`, or HTTP `4xx` | Returned as rejected unless login or non-login 3xx takes precedence |
+| Duplicate record | No verified structured duplicate-response contract exists | Generic duplicate wording alone is indeterminate; it does not override explicit boolean success |
+| Session expired | Login URL or login form selector | Stops the batch; POST-response detection sets `proves_nothing_submitted=false` |
+| Redirect | Any non-login HTTP 3xx, regardless of body or success flags | Indeterminate; no POST replay |
 | Server error         | HTTP `5xx`                                                                                                    | Returned as rejected      |
 
 A submission counts as successful only when the explicit confirmation signal

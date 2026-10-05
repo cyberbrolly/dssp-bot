@@ -130,7 +130,7 @@ Response (status `ok` — the op ran; the classification is in `outcome`):
 | outcome | meaning | Rust action |
 |---|---|---|
 | `confirmed` | portal accepted the record | done |
-| `duplicate` | portal says already logged | done (report) |
+| `duplicate` | reserved compatibility outcome; Python has no verified duplicate contract and does not emit it from text | done (report) |
 | `rejected` | portal refused (validation/HTTP) | done (report reason) |
 | `indeterminate` | submitted but result unreadable | **STOP — never resubmit**; require investigation |
 
@@ -144,17 +144,22 @@ Mirrors the legacy extension's `ErrorCode` taxonomy, plus protocol-level codes.
 | `TIMEOUT` | operation timed out (may have landed) | false |
 | `NETWORK` | transport failure (may have landed) | false |
 | `PORTAL_UNAVAILABLE` | portal unreachable | false |
-| `SESSION_EXPIRED` | login page / login timeout | true |
+| `SESSION_EXPIRED` | login page / login timeout | true before submission; false when detected in a POST response |
 | `TRAINEE_NOT_FOUND` | no match, or **ambiguous name** | true |
 | `MISSING_DATA` | required data absent | true |
 | `VALIDATION_FAILED` | bad input (date format, option not in list) | true |
 | `DUPLICATE_RECORD` | (reserved; duplicates surface as `outcome`) | — |
 | `PORTAL_STRUCTURE_CHANGED` | form shape unexpected (e.g. not POST) | true |
 | `PORTAL_NOT_MAPPED` | (reserved) | true |
-| `CONFIRMATION_UNKNOWN` | (reserved; surfaces as `outcome:"indeterminate"`) | false |
+| `CONFIRMATION_UNKNOWN` | POST response body could not be read; possibly delivered | false |
 | `SUBMISSION_FAILED` | unexpected worker failure | false |
 | `BAD_REQUEST` | malformed protocol request | true |
 | `UNKNOWN_OP` | unrecognized `op` | true |
+
+Delivery proof depends on phase, not just the error code. `PortalError.submission_attempted`
+is propagated by `Worker.handle()` into `error_response()`; a post-submission error
+always forces `proves_nothing_submitted=false`. Rust halts on `SESSION_EXPIRED`
+regardless of that flag. Neither expiry nor a body-read failure permits another POST.
 
 `BAD_REQUEST` and `UNKNOWN_OP` are protocol-level: they are raised before the
 op reaches the browser, so they can never have touched the portal.

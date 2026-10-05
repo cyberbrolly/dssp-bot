@@ -3,6 +3,11 @@
 import json
 import subprocess
 import sys
+
+import pytest
+
+from app import protocol as p
+from app.portal import errors as e
 from pathlib import Path
 
 PY_ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +26,26 @@ def run_worker(requests, timeout=60):
     # json.loads on every stdout line also proves stdout is protocol-only.
     lines = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
     return lines, proc
+
+
+@pytest.mark.parametrize("attempted", [False, True])
+def test_session_expiry_protocol_hint_tracks_submission_attempt(attempted):
+    error = e.session_expired(submission_attempted=attempted)
+    assert error.submission_attempted is attempted
+    response = p.error_response(
+        "expiry-test", "submit_training", error.error_code, error.message,
+        submission_attempted=error.submission_attempted,
+    )
+    assert response["error_code"] == "SESSION_EXPIRED"
+    assert response["proves_nothing_submitted"] is (not attempted)
+
+
+def test_default_pre_submission_expiry_and_confirmation_unknown_flags():
+    assert e.session_expired().submission_attempted is False
+    assert e.confirmation_unknown("Unverified response").submission_attempted is True
+    assert p.error_response(
+        "expiry-test", "submit_training", "SESSION_EXPIRED", "Session expired",
+    )["proves_nothing_submitted"] is True
 
 
 def test_ping_roundtrip_and_stdout_is_protocol_only():

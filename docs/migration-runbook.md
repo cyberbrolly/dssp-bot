@@ -23,6 +23,27 @@ run).
    explicit commit approval; pushing or opening/updating a PR also requires
    authorization. Real-portal submissions require separate explicit approval.
 
+## Latest offline review — duplicate classification and delivery phase
+
+- Removed unverified duplicate-text acceptance. Non-login HTTP 3xx is always
+  indeterminate, before JSON failure/success or validation-body interpretation.
+  HTTP 2xx plus recognized boolean `true` confirms even when its Message contains
+  incidental duplicate wording. Explicit failures remain rejected outside 3xx.
+- POST-response login detection propagates `submission_attempted=true` through
+  `PortalError`, `Worker.handle()`, and `error_response()`, forcing
+  `proves_nothing_submitted=false`. Pre-submission expiry retains true. Rust
+  halts on expiry and possibly delivered failures; there is no additional POST.
+- Offline validation: focused parser/submission/protocol suite **212 passed**;
+  final expiry assertions **4 passed**; full Python suite **308 passed**;
+  Rust `cargo test --offline decision::tests` **24 passed** (incremental-cache
+  warning, tests successful).
+- Public review snapshot refreshed at `docs/submission-integration-review.txt`.
+  Live launcher remains unexecuted; private jobs, raw evidence, and attempt
+  markers were not accessed or changed during this review. No commit authorized.
+- **Stages 15/24 remain Blocked** pending separately approved live POST evidence
+  and exact history reconciliation for one genuinely needed, unsubmitted ordinary
+  session. Never reuse Joshua's submitted session.
+
 ## Stage Status Tracking
 
 |  # | Stage                     | Status        | Tests / Verification            | Notes |
@@ -40,7 +61,7 @@ run).
 | 11 | Retrieve trainees         | 🟢 Passed     | trainee retrieval               | fixture-verified |
 | 12 | Trainee matching          | 🟢 Passed     | `pytest`                        | permanent suite in `python/tests/` |
 | 13 | Training form             | 🟢 Passed     | form workflow                   | fixture-verified |
-| 14 | Submission                | 🟢 Passed     | 87 focused Python tests after review; 200 full previously | Ordinary-session AJAX contract fixture-verified; final assessments blocked; live POST response still unverified |
+| 14 | Submission                | 🟢 Passed     | 212 focused Python tests; 308 full; 24 Rust decision tests | Ordinary-session AJAX contract fixture-verified; final assessments blocked; live POST response still unverified |
 | 15 | One-trainee milestone     | 🟡 Blocked    | real end-to-end test            | **Gate 1** — awaiting verified success-response format and operator approval |
 | 16 | Initialize Rust           | 🟢 Passed     | `cargo check`                   |       |
 | 17 | Rust models               | 🟢 Passed     | `cargo check`                   | `protocol.rs`, `report.rs` |
@@ -1176,13 +1197,12 @@ checkpoint file, then the JSON `BatchReport` on stdout, exit 0.
 **It submits for real, for both trainees** — pick two you are content to log a
 training for. How to read it:
 
-- `python/.evidence/submit-response-*.html` versus §5 of the phase4 spec. The
-  `duplicate` classification is a **text match** on that body, and it is the
-  documented second safety layer for the crash window. Unmatched wording alone
-  is now `indeterminate`, not `confirmed`. An explicit JSON success flag can
-  still confirm a response whose duplicate wording is not recognized, so verify
-  the real response semantics. Do not deliberately replay a submission just to
-  discover duplicate wording; use existing evidence or an approved operation.
+- `python/.evidence/submit-response-*.html` versus §5 of the phase4 spec.
+  Generic duplicate wording is not a verified response contract and cannot
+  establish acceptance. Non-login 3xx is indeterminate regardless of body;
+  HTTP 2xx plus recognized boolean JSON true confirms, subject to explicit
+  rejection checks. Review actual semantics and exact history. Never replay
+  a submission to discover duplicate wording or obtain confirmation.
 - `dssp.checkpoint.json` (beside the job file, gitignored) should exist, and
   should name both trainees in `results` with `pending` and `in_flight` empty.
 - **Re-running the same job file is not a second test** — it re-submits both. For
@@ -1207,7 +1227,7 @@ and form inline). The live run is the first test of these, and they fail
 | the name is the third `td` | `parsing.py:97` (positional, against the spec's own rule) | an inserted column yields a blank name; a name match then fails as `TRAINEE_NOT_FOUND` |
 | one `pgsize=10000` request returns everything | `constants.py:25` | silent truncation; see the count check above |
 | exactly one `table.table-checkable` | `constants.py:33` | a second matching table merges rows from both |
-| duplicate wording | `parsing.py` `submission_outcome` (text match) | unmatched wording alone is indeterminate; a JSON success flag can still mask a duplicate — see above |
+| duplicate response contract | `parsing.py` `submission_outcome` | no verified duplicate contract; wording alone stays indeterminate; reconcile exact history without replay |
 | actual success-response format | `parsing.py` `submission_outcome` | a genuine HTML success remains indeterminate until a verified signal is supported; never retry to obtain confirmation |
 | the login marker | `parsing.py` `is_login_page` / `has_authenticated_marker` | a rewritten login page reads as authenticated, or vice versa |
 

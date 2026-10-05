@@ -193,10 +193,11 @@ def test_confirmed_payload_and_classification(client):
     assert LAST_POST["accept"] == "application/json"
 
 
-def test_duplicate(client):
+def test_duplicate_text_is_indeterminate(client):
     result = client.submit_training({"id": "456"}, session(training_type="Theory"))
-    assert result["outcome"] == "duplicate"
-    assert "already logged" in result["message"]
+    assert result["outcome"] == "indeterminate"
+    assert result["attempts"] == 1
+    assert LAST_POST["count"] == 1
 
 
 def test_rejected(client):
@@ -230,6 +231,8 @@ def test_session_expired_on_post(client):
             {"id": "666"}, session(instructor="10", training_type="1")
         )
     assert info.value.error_code == "SESSION_EXPIRED"
+    assert info.value.submission_attempted is True
+    assert LAST_POST["count"] == 1
 
 
 def test_unknown_id(client):
@@ -247,7 +250,7 @@ def test_ambiguous_name_never_guesses(client):
 
 def test_name_resolution_to_single_match(client):
     result = client.submit_training({"name": "jane  roe"}, session(instructor="10"))
-    assert result["outcome"] == "duplicate"
+    assert result["outcome"] == "indeterminate"
     assert result["trainee"]["id"] == "456"
 
 
@@ -284,6 +287,7 @@ def test_login_redirect_is_session_expired_without_following(client, status):
         client.submit_training({"id": "123"}, session())
 
     assert info.value.error_code == "SESSION_EXPIRED"
+    assert info.value.submission_attempted is True
     assert LAST_POST["count"] == 1
     assert not any(path.startswith("/Account/Login") for _, path in REQUESTS)
 
@@ -484,6 +488,52 @@ def test_body_read_failure_preserves_metadata_and_worker_reports_possibly_delive
     assert len(read_attempts) == 1
     assert LAST_POST["count"] == 1
     assert not any(path == "/redirect-target" for _, path in REQUESTS)
+
+
+@pytest.mark.parametrize("status, body, expected", [
+    (200, "No duplicate found", "indeterminate"),
+    (200, "Duplicate check pending", "indeterminate"),
+    (302, "Record already recorded", "indeterminate"),
+    (200, json.dumps({"IsSuccessful": True, "Message": "No duplicate found"}), "confirmed"),
+])
+def test_duplicate_wording_never_causes_an_additional_post(client, status, body, expected):
+    SERVER_STATE["post_response"] = (status, body, {"Location": "/redirect-target"})
+    result = client.submit_training({"id": "123"}, session())
+    assert result["outcome"] == expected
+    assert result["attempts"] == 1
+    assert LAST_POST["count"] == 1
+    assert [request for request in REQUESTS if request[0] == "POST"] == [
+        ("POST", "/Trainee/LogTraining")
+    ]
+    assert not any(path == "/redirect-target" for _, path in REQUESTS)
+
+
+@pytest.mark.parametrize("stage", ["pre", "post-body", "post-redirect"])
+def test_session_expiry_worker_delivery_hint_and_post_count(client, stage):
+    from app.worker import Worker
+
+    login = '<form id="loginForm" action="/Account/Login"></form>'
+    if stage == "pre":
+        SERVER_STATE["form"] = login
+    elif stage == "post-body":
+        SERVER_STATE["post_response"] = (200, login, {})
+    else:
+        SERVER_STATE["post_response"] = (
+            302, '{"IsSuccessful": true}', {"Location": "/Account/Login"},
+        )
+    worker = Worker()
+    worker.portal = client
+    result = worker.handle({
+        "job_id": "expiry-test", "op": "submit_training",
+        "trainee": {"id": "123"}, "session": session(),
+    })
+    assert result["status"] == "error"
+    assert result["error_code"] == "SESSION_EXPIRED"
+    assert result["proves_nothing_submitted"] is (stage == "pre")
+    posts = [request for request in REQUESTS if request[0] == "POST"]
+    assert posts == ([] if stage == "pre" else [("POST", "/Trainee/LogTraining")])
+    assert LAST_POST.get("count", 0) == (0 if stage == "pre" else 1)
+    assert not any(path.startswith("/Account/Login") for _, path in REQUESTS)
 
 
 def test_submission_capture_is_opt_in(client, tmp_path, monkeypatch):

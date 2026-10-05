@@ -221,7 +221,7 @@ not an assumption that opening Developer Tools captures the worker's POST.
 | Observed result | Action |
 | --- | --- |
 | `confirmed`, exit 0 | Still inspect metadata and exact history record; not an automatic gate pass. |
-| `duplicate`, exit 0 | Stop. It does not prove a new successful submission and cannot satisfy this verification. Reconcile the preflight history check. |
+| `duplicate`, exit 0 | Reserved compatibility outcome, not currently emitted by Python without a verified contract. Stop and reconcile history; it cannot satisfy verification. Generic duplicate wording alone is indeterminate. |
 | Indeterminate, unknown output, exit 3, timeout, crash, missing receipt | Stop; no retry. Inspect the portal read-only and reconcile the exact record. |
 | Rejected / exit 4 | Stop and inspect response plus history; no repeat under this authorization. |
 | Exit 1 or 2 | Session/setup/job failure; stop and investigate. A new invocation requires review and separate authorization, not deleting the marker. |
@@ -231,6 +231,12 @@ Rust may repeat a *pre-submission* operation if it proves nothing was submitted;
 this is not permission to repeat a delivered POST. The reviewed policy halts on
 unconfirmed results and possibly delivered failures. Do not wrap the launcher
 in any retry loop, supervisor restart, or scheduled task.
+
+A login page or login Location examined after POST raises `SESSION_EXPIRED`
+with `proves_nothing_submitted=false`: delivery remains possible. Pre-submission
+expiry retains `true`; Rust halts on the code in either phase. Response metadata
+is saved before reading the body. A body-read failure raises `CONFIRMATION_UNKNOWN`
+with false delivery proof and halts without another POST.
 
 ## Verify the exact record in training history
 

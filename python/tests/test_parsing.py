@@ -264,11 +264,12 @@ def test_outcome_indeterminate_via_redirect_without_confirmation():
     assert outcome["outcome"] == "indeterminate"
 
 
-def test_outcome_duplicate():
+@pytest.mark.parametrize("message", ["Record already logged", "No duplicate found", "Duplicate check pending"])
+def test_duplicate_text_without_result_contract_is_indeterminate(message):
     outcome = parse.submission_outcome(
-        "<html><body>Record already logged</body></html>", "https://x/post", 200, False
+        f"<html><body>{message}</body></html>", "https://x/post", 200, False
     )
-    assert outcome["outcome"] == "duplicate"
+    assert outcome["outcome"] == "indeterminate"
 
 
 def test_outcome_rejected_validation():
@@ -379,3 +380,22 @@ def test_outcome_login_page_raises_session_expired():
     with pytest.raises(e.PortalError) as info:
         parse.submission_outcome(LOGIN_HTML, "https://x/Account/Login", 200, False)
     assert info.value.error_code == "SESSION_EXPIRED"
+    assert info.value.submission_attempted is True
+
+
+@pytest.mark.parametrize("status", [300, 302, 303, 307, 308, 399])
+@pytest.mark.parametrize("body", [
+    "Record already recorded",
+    json.dumps({"IsSuccessful": False, "Message": "Date is invalid"}),
+    '<div class="validation-summary-errors">Date is invalid</div>',
+    json.dumps({"IsSuccessful": True}),
+])
+def test_nonlogin_3xx_precedes_body_classification(status, body):
+    result = parse.submission_outcome(body, "https://x/post", status, False)
+    assert result["outcome"] == "indeterminate"
+    assert f"HTTP {status}" in result["message"]
+
+
+def test_success_contract_overrides_negative_duplicate_text():
+    body = json.dumps({"IsSuccessful": True, "Message": "No duplicate found"})
+    assert parse.submission_outcome(body, "https://x/post", 200, False)["outcome"] == "confirmed"

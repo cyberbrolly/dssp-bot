@@ -36,8 +36,9 @@ ERR_SUBMISSION_FAILED = "SUBMISSION_FAILED"
 ERR_BAD_REQUEST = "BAD_REQUEST"
 ERR_UNKNOWN_OP = "UNKNOWN_OP"
 
-# Codes that prove nothing reached the portal — mirror of provesNothingSubmitted
-# in AutomationEngine.ts. Rust owns the retry decision; this is only a hint.
+# Codes that can prove nothing reached the portal before a submission attempt.
+# A post-submission error overrides this code-only hint in error_response().
+# Rust owns the retry decision.
 _PROVES_NOTHING = frozenset(
     {
         ERR_ELEMENT_NOT_FOUND,
@@ -67,7 +68,8 @@ def ok_response(job_id: str, op: str, **fields: Any) -> dict[str, Any]:
 
 
 def error_response(
-    job_id: str, op: str, error_code: str, message: str
+    job_id: str, op: str, error_code: str, message: str,
+    *, submission_attempted: bool = False,
 ) -> dict[str, Any]:
     return {
         "v": V,
@@ -76,7 +78,9 @@ def error_response(
         "status": "error",
         "error_code": error_code,
         "message": message,
-        "proves_nothing_submitted": proves_nothing_submitted(error_code),
+        "proves_nothing_submitted": (
+            not submission_attempted and proves_nothing_submitted(error_code)
+        ),
     }
 
 
