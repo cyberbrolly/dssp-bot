@@ -62,7 +62,10 @@ class Worker:
             return handler(req)
         except PortalError as exc:
             log.warning("op %s failed: %s (%s)", op, exc.message, exc.error_code)
-            return p.error_response(job_id, op, exc.error_code, exc.message)
+            return p.error_response(
+                job_id, op, exc.error_code, exc.message,
+                submission_attempted=exc.submission_attempted,
+            )
         except Exception as exc:  # noqa: BLE001 - report, never crash the loop
             log.exception("op %s failed", op)
             return p.error_response(job_id, op, p.ERR_SUBMISSION_FAILED, str(exc))
