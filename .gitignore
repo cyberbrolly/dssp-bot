@@ -1,11 +1,16 @@
 # Python
 python/.venv/
-python/__pycache__/
+__pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
 
 # Playwright persistent profile / auth (live session — never commit)
 python/.pw-profile/
 python/.auth/
+
+# Live-gate evidence dumps (raw portal HTML: trainee data + antiforgery tokens)
+python/.evidence/
 
 # Rust
 rust/target/
@@ -13,6 +18,10 @@ rust/target/
 # Operational job input (may contain trainee data)
 job.json
 rust/job.json
+
+# Batch checkpoint (trainee ids/names — same sensitivity as the job file)
+dssp.checkpoint.json
+rust/dssp.checkpoint.json
 
 # Env
 .env

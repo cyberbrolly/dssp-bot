@@ -8,6 +8,13 @@ dependencies = [
     "lxml>=5.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"

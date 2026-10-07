@@ -43,15 +43,25 @@ or
 
 **`job_id` is echoed on every response** and must stay consistent end to end.
 
+**`v` is compared, not assumed.** Rust reads the version off every response and
+refuses one that is not its own — including the `ready` handshake. The reason is
+`proves_nothing_submitted`: the recovery gate reduces to Rust reading that flag
+correctly, and a worker speaking a different version is free to redefine it while
+every field still deserializes, which is a disagreement nothing else here would
+notice. A mismatch is refused in both directions, and one that arrives mid-submit
+becomes an indeterminate outcome rather than a retryable one — the worker replied,
+so the request was processed and the submission may have landed.
+
 ## Division of responsibility
 
 - **Python reports what happened; Rust decides what to do about it.** The worker
   never retries, never resubmits, never decides retryability.
 - `proves_nothing_submitted` is a hint computed from the error code (see table).
   When `true`, the failure occurred before anything could reach the portal, so
-  re-invoking the op is safe. When `false` (e.g. `NETWORK`, `TIMEOUT`), the
-  request may have landed — Rust must treat it like an indeterminate outcome,
-  not a clean failure.
+  re-invoking the op is safe. When `false` (e.g. `NETWORK`, `TIMEOUT`,
+  `PORTAL_UNAVAILABLE`), the request may have landed — Rust must treat it like an
+  indeterminate outcome, not a clean failure. "The portal did not answer" is not
+  the same as "the portal did not receive it".
 - `submit_training` commits **at most once** per invocation. It performs
   prepare (GET + parse) → commit (single POST) → classify, and reports the
   classified outcome. It is never re-invoked for the same trainee by Rust
@@ -120,7 +130,7 @@ Response (status `ok` — the op ran; the classification is in `outcome`):
 | outcome | meaning | Rust action |
 |---|---|---|
 | `confirmed` | portal accepted the record | done |
-| `duplicate` | portal says already logged | done (report) |
+| `duplicate` | reserved compatibility outcome; Python has no verified duplicate contract and does not emit it from text | done (report) |
 | `rejected` | portal refused (validation/HTTP) | done (report reason) |
 | `indeterminate` | submitted but result unreadable | **STOP — never resubmit**; require investigation |
 
@@ -133,18 +143,33 @@ Mirrors the legacy extension's `ErrorCode` taxonomy, plus protocol-level codes.
 | `ELEMENT_NOT_FOUND` | portal selector missing | true |
 | `TIMEOUT` | operation timed out (may have landed) | false |
 | `NETWORK` | transport failure (may have landed) | false |
-| `PORTAL_UNAVAILABLE` | portal unreachable | true |
-| `SESSION_EXPIRED` | login page / login timeout | true |
+| `PORTAL_UNAVAILABLE` | portal unreachable | false |
+| `SESSION_EXPIRED` | login page / login timeout | true before submission; false when detected in a POST response |
 | `TRAINEE_NOT_FOUND` | no match, or **ambiguous name** | true |
 | `MISSING_DATA` | required data absent | true |
 | `VALIDATION_FAILED` | bad input (date format, option not in list) | true |
 | `DUPLICATE_RECORD` | (reserved; duplicates surface as `outcome`) | — |
 | `PORTAL_STRUCTURE_CHANGED` | form shape unexpected (e.g. not POST) | true |
 | `PORTAL_NOT_MAPPED` | (reserved) | true |
-| `CONFIRMATION_UNKNOWN` | (reserved; surfaces as `outcome:"indeterminate"`) | false |
+| `CONFIRMATION_UNKNOWN` | POST response body could not be read; possibly delivered | false |
 | `SUBMISSION_FAILED` | unexpected worker failure | false |
 | `BAD_REQUEST` | malformed protocol request | true |
 | `UNKNOWN_OP` | unrecognized `op` | true |
+
+Delivery proof depends on phase, not just the error code. `PortalError.submission_attempted`
+is propagated by `Worker.handle()` into `error_response()`; a post-submission error
+always forces `proves_nothing_submitted=false`. Rust halts on `SESSION_EXPIRED`
+regardless of that flag. Neither expiry nor a body-read failure permits another POST.
+
+`BAD_REQUEST` and `UNKNOWN_OP` are protocol-level: they are raised before the
+op reaches the browser, so they can never have touched the portal.
+
+This table is the *contract*; the implementation is `_PROVES_NOTHING` in
+`python/app/protocol.py` (mirroring `provesNothingSubmitted` in
+`AutomationEngine.ts`). `PORTAL_UNAVAILABLE` reads `false` in both, and the table
+said `true` until Stage 38 — a doc bug in a safety-critical direction, since
+`decision.rs` retries only what proves nothing was submitted, so the documented
+value would have licensed a retry the code correctly refuses.
 
 ## Safety rules enforced by this protocol
 
@@ -157,6 +182,10 @@ Mirrors the legacy extension's `ErrorCode` taxonomy, plus protocol-level codes.
 4. **`job_id` consistency** — echoed on every response line.
 5. **Golden rule** — Rust never fixes an automation error by adding retries;
    retryability comes from `proves_nothing_submitted` / the outcome table.
+6. **The version is checked, not trusted** — a response written to a different
+   protocol version is refused rather than read, because `v` is what would signal
+   that a flag like `proves_nothing_submitted` no longer means what it says. See
+   the Envelope section.
 
 ## Configuration (env, read by the worker)
 

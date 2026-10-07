@@ -11,10 +11,13 @@ from .. import protocol as p
 
 
 class PortalError(Exception):
-    def __init__(self, error_code: str, message: str) -> None:
+    def __init__(
+        self, error_code: str, message: str, *, submission_attempted: bool = False
+    ) -> None:
         super().__init__(message)
         self.error_code = error_code
         self.message = message
+        self.submission_attempted = submission_attempted
 
 
 def element_not_found(element: str) -> PortalError:
@@ -25,8 +28,12 @@ def missing_data(field: str) -> PortalError:
     return PortalError(p.ERR_MISSING_DATA, f"Required data is missing: {field}")
 
 
-def session_expired() -> PortalError:
-    return PortalError(p.ERR_SESSION_EXPIRED, "The DSSP session has expired.")
+def session_expired(*, submission_attempted: bool = False) -> PortalError:
+    return PortalError(
+        p.ERR_SESSION_EXPIRED,
+        "The DSSP session has expired.",
+        submission_attempted=submission_attempted,
+    )
 
 
 def network(message: str) -> PortalError:
@@ -57,4 +64,5 @@ def confirmation_unknown(message: str) -> PortalError:
     return PortalError(
         p.ERR_CONFIRMATION_UNKNOWN,
         f"Submitted, but the result could not be confirmed: {message}",
+        submission_attempted=True,
     )

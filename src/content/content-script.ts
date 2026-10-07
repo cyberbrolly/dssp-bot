@@ -60,22 +60,17 @@ function fromError(error: AutomationError): PortalCommandResponse {
 }
 
 /**
- * How long dialog suppression stays armed around a single submitting command.
- *
- * Only an upper bound, not a wait: `withDialogsArmed` disarms as soon as the
- * command settles. It needs to outlast the slowest legitimate submit so the
- * deadline never fires mid-operation, while still being short enough that a
- * crashed content script leaves the page suppressed only briefly.
+ * Upper bound on how long a single submitting command keeps dialog suppression
+ * armed, not a wait — `withDialogsArmed` disarms as soon as the command
+ * settles. Long enough to outlast the slowest legitimate submit, short enough
+ * that a crashed content script suppresses the page only briefly.
  */
 const DIALOG_ARM_MS = 30_000;
 
 /**
- * Commands that can provoke a portal dialog.
- *
- * The portal raises its alert from a jQuery submit handler, and the result read
- * follows immediately after, so both need suppression. Everything else — reads,
- * navigation, form filling — runs with the page's own dialogs intact, so an
- * administrator browsing alongside the extension still sees their own prompts.
+ * The portal raises its alert from a jQuery submit handler and the result read
+ * follows immediately, so both commands need suppression; everything else runs
+ * with the page's own dialogs intact.
  */
 const SUPPRESSES_DIALOGS: ReadonlySet<PortalCommand["type"]> = new Set([
   "PORTAL_SUBMIT_FORM",

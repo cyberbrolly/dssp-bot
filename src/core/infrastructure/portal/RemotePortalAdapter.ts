@@ -17,13 +17,10 @@ export class RemotePortalAdapter implements PortalAdapter {
   private readonly tabs: BrowserTabs;
 
   /**
-   * The tab this batch is driving, fixed at attach time.
-   *
-   * Resolving the active tab per command would let the target move mid-batch:
-   * a batch runs for minutes while the operator is at their desk, and any tab
-   * switch or newly focused window would redirect the next command. With a
-   * second portal tab open that means filling one page and submitting on
-   * another — a real training record written against the wrong trainee.
+   * The tab this batch is driving, fixed at attach time. Resolving the active
+   * tab per command would let a tab switch or newly focused window redirect the
+   * next command mid-batch — with a second portal tab open, a training record
+   * written against the wrong trainee.
    */
   private tabId: number | null = null;
 

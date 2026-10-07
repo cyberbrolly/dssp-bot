@@ -46,9 +46,8 @@ function engineWith(options: FakePortalOptions = {}): {
 }
 
 /**
- * These records are official training logs. A duplicate is worse than a
- * failure, because a failure is visible and a duplicate is not. Every test here
- * exists to keep the retry policy away from the one call that writes.
+ * These records are official training logs. A duplicate is worse than a failure
+ * because it is invisible, so every test here keeps the retry away from the write.
  */
 describe("submission safety", () => {
   // The original bug: RetryPolicy wrapped the whole cycle, so a confirmation

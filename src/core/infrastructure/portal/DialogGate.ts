@@ -1,11 +1,6 @@
 /**
- * Decides whether the page's dialogs are currently suppressed.
- *
- * Split out of the MAIN-world script for two reasons: the decision is the
- * safety-critical part (getting it wrong means auto-accepting the portal's own
- * destructive prompts), and the script around it is untestable — it patches
- * globals at import time.
- *
+ * Decides whether the page's dialogs are currently suppressed. Safety-critical:
+ * getting it wrong means auto-accepting the portal's own destructive prompts.
  * Deliberately free of `chrome.*` and of `window`: the MAIN world has neither.
  */
 

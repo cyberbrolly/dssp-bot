@@ -1,22 +1,17 @@
 import type { TrainingResult } from "../domain/TrainingResult";
 
 /**
- * Lifecycle of a persisted batch.
- *
- * `running` and `paused` are live states, so finding either one in storage on
- * worker startup means the previous worker did not get to write a terminal
- * state — it was killed. `interrupted` records that conclusion.
+ * `running` and `paused` are live; finding either in storage at startup means
+ * the previous worker was killed before writing a terminal state, which
+ * `interrupted` records.
  */
 export type BatchCheckpointStatus =
   "running" | "paused" | "finished" | "interrupted";
 
 /**
- * A durable snapshot of batch progress.
- *
- * The engine keeps its queue and results in service worker memory, which
- * Chromium reclaims after roughly 30 seconds of inactivity. Everything needed
- * to answer "what did this batch already write to the portal?" is mirrored here
- * after every trainee, because that question outlives the worker.
+ * A durable snapshot of batch progress: the engine's queue and results live in
+ * service worker memory, reclaimed after ~30s of inactivity, so everything
+ * needed to answer "what did this batch already write?" is mirrored here.
  */
 export interface BatchCheckpoint {
   status: BatchCheckpointStatus;
@@ -38,12 +33,9 @@ const LIVE_STATUSES: ReadonlySet<BatchCheckpointStatus> = new Set([
 ]);
 
 /**
- * Receives each checkpoint the engine produces.
- *
  * Injected rather than imported so the engine stays free of storage concerns
- * and remains testable without a browser. Implementations own their own error
- * reporting — the engine ignores rejections so a storage fault cannot abort a
- * batch that is otherwise submitting successfully.
+ * and testable without a browser. Implementations own their error reporting:
+ * the engine ignores rejections so a storage fault cannot abort a batch.
  */
 export type CheckpointWriter = (
   checkpoint: BatchCheckpoint,
@@ -55,11 +47,9 @@ export function isLive(checkpoint: BatchCheckpoint): boolean {
 }
 
 /**
- * Re-mark a checkpoint abandoned by a terminated worker.
- *
- * Returns the input unchanged when the status is already terminal, so callers
- * can use referential equality to tell a genuine recovery from a no-op and skip
- * a redundant write.
+ * Re-marks a checkpoint abandoned by a terminated worker. Returns the input
+ * unchanged when the status is already terminal, so callers can use
+ * referential equality to detect a genuine recovery and skip a write.
  */
 export function markInterrupted(checkpoint: BatchCheckpoint): BatchCheckpoint {
   if (!isLive(checkpoint)) {

@@ -265,12 +265,9 @@ async function loadFormOptions(): Promise<void> {
 }
 
 /**
- * Warn about a batch that died with the service worker.
- *
- * Only `interrupted` is shown. A finished batch is already covered by the
- * report, and a live one is covered by the progress counters — but an
- * interrupted one is the only case where records may exist on the portal that
- * nothing in this UI would otherwise account for.
+ * Only `interrupted` is shown: a finished batch is covered by the report, a live
+ * one by the progress counters — but an interrupted one may have left portal
+ * records that nothing else in this UI accounts for.
  */
 function renderRecovery(checkpoint: BatchCheckpoint | null): void {
   if (!checkpoint || checkpoint.status !== "interrupted") {

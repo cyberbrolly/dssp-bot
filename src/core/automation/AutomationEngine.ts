@@ -34,9 +34,8 @@ export interface AutomationEngineOptions {
   retryPolicy?: RetryPolicy;
   interTaskDelayMs?: number;
   /**
-   * Persists progress after every settled trainee. Optional: without it the
-   * engine behaves exactly as before, which is what the unit tests want, but
-   * the service worker must supply one or a batch lost to worker termination
+   * Persists progress after every settled trainee. Optional, but the service
+   * worker must supply one: without it a batch lost to worker termination
    * leaves no record of what it already submitted.
    */
   checkpoint?: CheckpointWriter;
@@ -75,12 +74,8 @@ export class AutomationEngine {
   }
 
   /**
-   * Write the current position to durable storage.
-   *
-   * Failures are swallowed on purpose. A storage error must not abort a batch
-   * that is otherwise succeeding — aborting would strand a trainee mid-flow,
-   * which is worse than a missing checkpoint. Reporting is the writer's job;
-   * it has the logger and knows why its own write failed.
+   * Failures are swallowed on purpose: a storage error must not abort a batch
+   * that is otherwise succeeding, and the writer reports its own failures.
    */
   private async saveCheckpoint(status: BatchCheckpointStatus): Promise<void> {
     if (!this.checkpoint) {
@@ -279,9 +274,8 @@ export class AutomationEngine {
       new Date().toISOString(),
     );
 
-    // Terminal either way: a stopped or crashed batch is as final as a complete
-    // one, and its results are the ones most worth keeping, since they say what
-    // reached the portal before things went wrong.
+    // Terminal either way: a stopped batch is as final as a complete one, and
+    // its results say what reached the portal before things went wrong.
     await this.saveCheckpoint("finished");
 
     if (finalState === "complete") {
@@ -344,11 +338,9 @@ export class AutomationEngine {
       this.machine.transitionTo("paused");
     }
 
-    // The riskiest moment in the batch. A paused engine makes no extension API
-    // calls, so nothing holds the service worker open and it is collected after
-    // roughly 30 seconds — taking the queue and every result with it. Flushing
-    // here means a batch that never wakes up still leaves a record of what it
-    // had already written to the portal.
+    // The riskiest moment in the batch: a paused engine makes no extension API
+    // calls, so the worker is collected after ~30s, taking the queue with it.
+    // Flushing here preserves what was already written to the portal.
     await this.saveCheckpoint("paused");
 
     return new Promise<void>((resolve) => {
@@ -364,15 +356,10 @@ export class AutomationEngine {
   }
 
   /**
-   * Runs one trainee in three phases with deliberately different retry rules:
-   *
-   * 1. prepare — reads and form filling only. Nothing reaches the portal, so the
-   *    whole phase is replayed on a recoverable failure.
-   * 2. commit  — the single submitting call. Never replayed: a second attempt
-   *    would create a second training record.
-   * 3. confirm — reads the outcome back. Safe to retry, but if it never yields
-   *    an answer the result is `indeterminate`, not a failure, because the
-   *    record may already exist.
+   * Runs one trainee in three phases with different retry rules: prepare
+   * (replayable, writes nothing), commit (never retried — a second attempt
+   * would create a second record), and confirm (retryable; no answer means
+   * `indeterminate`, not failure).
    */
   private async processTask(task: BatchTask): Promise<TrainingResult> {
     const { trainee, session } = task;

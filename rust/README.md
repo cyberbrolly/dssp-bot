@@ -1,7 +1,8 @@
 # DSSP-Bot Core (Rust coordinator)
 
-First-milestone coordinator: spawns the Python Playwright worker, drives one
-trainee end to end, and owns every retry/stop decision.
+Coordinator: spawns the Python Playwright worker and owns every retry/stop
+decision. Drives one trainee end to end (the live gates), or a whole batch
+through a single session.
 
 ```
 Rust (this crate) → Python worker (stdio JSON) → Playwright → DSSP → result
@@ -51,6 +52,97 @@ The first run opens a real Chromium window and **waits for you to sign in** to
 DSSP manually. The session is stored in `../python/.pw-profile/` (gitignored),
 so later runs reuse it. Run headless once logged in with `DSSP_HEADLESS=1`.
 
+## Run a batch
+
+Give the job file a `trainees` array instead of a single `trainee`:
+
+```json
+{
+  "trainees": [{ "id": "12345" }, { "name": "Jane Roe" }],
+  "session": {
+    "training_date": "2026-09-14",
+    "instructor": "Jane Smith",
+    "training_type": "Practical"
+  }
+}
+```
+
+```bash
+cargo run -- job.json
+```
+
+Every entry is resolved against the portal's trainee list **before anything is
+submitted**: an explicit `id` must exist, a `name` must match exactly one
+trainee, and an ambiguous name stops the whole batch with the offending entries
+listed. Entries resolving to the same trainee collapse into one submission.
+Progress goes to stderr; the JSON `BatchReport` goes to stdout.
+
+| exit | meaning |
+| ---: | ------- |
+| 0 | every trainee recorded |
+| 1 | the run never got as far as submitting: the worker would not launch, or the session gate failed |
+| 2 | the batch could not be resolved — nothing was submitted |
+| 3 | needs a human: a start refused over an unfinished batch, an indeterminate submission, or a batch aborted mid-run |
+| 4 | definitive failures, safe to re-run |
+
+Exit 1 is the coordinator failing to get going, and it prints no `RESULT:` line —
+only a `dssp-bot:` line on stderr. In a *batch* the same session-gate failure
+exits 3 rather than 1 (the batch path treats a lapsed session as something a
+human has to clear, not as a startup failure). Either way nothing was submitted.
+
+In a batch, exit 4 also covers **already-logged** trainees: a `duplicate` is
+recorded against that row as a failure, so exit 4 means "something needed
+attention", not necessarily "the portal refused a record". A single-trainee run
+still reports a duplicate as `RESULT: duplicate` and exits 0.
+
+## Recovery
+
+A batch keeps its state in a checkpoint file (see `DSSP_CHECKPOINT`). It is
+written before each submission, not only after: the file **names the trainee
+being submitted before the submit is issued**, so a file that does not name a
+trainee is a file for which no submit was sent. That write is fatal if it fails —
+the batch stops *before* submitting rather than submitting unrecorded.
+
+So a crash can only ever leave the file claiming a submission that was never
+issued, never the reverse. That is the safe direction to be wrong in: the cost
+is a human checking the portal, not a second record.
+
+The next start reads that file first, before it connects to anything:
+
+- **May be missing a submission** — a submission that was in flight, a record
+  that was never confirmed, or counts that do not add up. The start is refused
+  with the counts and the ways forward (exit 3), and the file is marked
+  interrupted. The refusal stands until it is acknowledged — recording the
+  interruption does not clear it, and neither does running the command again.
+- **Already landed work** — a batch that stopped early holding records that
+  reached the portal, whether it was killed or aborted itself. A plain start
+  re-queues the job file from the top, so it would ask the portal for those
+  trainees a second time; refused (exit 3), rather than left to the portal's own
+  duplicate match. This is narrower than "being killed": a kill *before* anything
+  landed still starts clean, and a batch that worked through its whole queue is
+  an ordinary re-run, as is a re-run of a completed job file. An aborted batch
+  writes `aborted`, not `finished`, precisely so it is not mistaken for one that
+  closed out.
+- **`DSSP_RESUME=1`** — continue it instead. The never-attempted trainees run;
+  everything the predecessor recorded is carried forward into the new file so it
+  stays whole. Nothing whose submission may already be on the portal is ever
+  submitted again — those are reported and left for you. If there is nothing left
+  to attempt, the run exits 0 when every loose end is settled and 3 when a human
+  is still owed; in the exit-0 case it also writes the batch closed out, so the
+  file stops refusing later starts. The acknowledgement is what lifts the
+  refusal, not a repeat of the original command.
+  A file from a build **older than this one** — written before the checkpoint
+  named a submission in flight — runs none of its queue: it cannot say how far
+  through it got, so every trainee still waiting in it is carried forward as
+  unconfirmed and the run exits 3 with the names. Check the portal for them.
+- **Unreadable** — a corrupt file is not a file that says nothing ran. Refused,
+  never treated as an empty slot.
+
+A checkpoint written by a build older than this stage has no record of what was
+in flight (older builds only wrote after a submission settled), so its first
+unattempted trainee is *presumed* to have reached the portal and is left for you
+rather than resumed.
+
 ## Configuration (environment)
 
 | var | default | purpose |
@@ -61,6 +153,8 @@ so later runs reuse it. Run headless once logged in with `DSSP_HEADLESS=1`.
 | `DSSP_LOGIN_TIMEOUT_MS` | `300000` | how long to wait for manual login |
 | `DSSP_NAV_TIMEOUT_MS` | `30000` | per-request timeout |
 | `DSSP_WORKER_PY` | `../python/.venv/bin/python` | worker interpreter |
+| `DSSP_CHECKPOINT` | `dssp.checkpoint.json` beside the job | where batch state is written |
+| `DSSP_RESUME` | unset | `1`/`true`/`yes`/`on` = continue an interrupted batch; anything else means no |
 
 ## Result & exit codes
 
@@ -73,9 +167,16 @@ The coordinator prints one line to stdout (progress/logs go to stderr):
 | `HALT: SESSION_EXPIRED …` | 3 | session lapsed / portal changed — stop |
 | `FAILED: rejected …` / `FAILED: TRAINEE_NOT_FOUND …` | 4 | definitive failure, no retry |
 
+No row here exits 1: that code means the coordinator never reached a submission
+(worker would not launch, or the session gate failed before the submit loop), so
+there is no classified line to print. A session that lapses *mid-run* is a
+`HALT: SESSION_EXPIRED` and exits 3, as above.
+
 ## Safety
 
 - An **indeterminate** submission is never retried automatically.
 - An **ambiguous** trainee name never resolves to a guess.
+- A batch **never starts over** an unfinished one without you saying so: the
+  record of a submission that may have landed is refused over, not overwritten.
 - No credentials are stored — auth lives only in the browser profile; nothing
   sensitive is logged.

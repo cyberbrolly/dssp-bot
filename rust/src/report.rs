@@ -1,8 +1,8 @@
 //! Batch result + report types. Ports TrainingResult.ts and BatchReport.ts.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Success,
@@ -13,15 +13,15 @@ pub enum Outcome {
     Indeterminate,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingResult {
     pub trainee_id: String,
     pub trainee_name: String,
     pub outcome: Outcome,
     pub attempts: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 
@@ -33,13 +33,25 @@ pub struct BatchReport {
     pub skipped: usize,
     pub indeterminate: usize,
     pub success_rate: f64,
+    /// Whether the run stopped early, rather than by working through its queue.
+    ///
+    /// Recorded separately because the counts cannot answer it: an abort on the
+    /// *last* trainee drains nothing, so `skipped` stays 0 and the run looks like
+    /// one that finished. `batch_exit_code` reads this to distinguish "definitive
+    /// failures, safe to re-run" from "a human is owed a look".
+    pub aborted: bool,
     pub started_at: String,
     pub finished_at: String,
     pub results: Vec<TrainingResult>,
 }
 
 impl BatchReport {
-    pub fn build(results: Vec<TrainingResult>, started_at: String, finished_at: String) -> Self {
+    pub fn build(
+        results: Vec<TrainingResult>,
+        started_at: String,
+        finished_at: String,
+        aborted: bool,
+    ) -> Self {
         let successful = results
             .iter()
             .filter(|r| r.outcome == Outcome::Success)
@@ -70,6 +82,7 @@ impl BatchReport {
             skipped,
             indeterminate,
             success_rate,
+            aborted,
             started_at,
             finished_at,
             results,

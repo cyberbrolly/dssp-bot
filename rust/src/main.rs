@@ -1,37 +1,242 @@
-//! DSSP-Bot coordinator — first milestone: run one trainee end to end.
+//! DSSP-Bot coordinator — one worker, one protocol, two entry points.
 //!
-//! Flow: spawn worker → ready → ensure_session (manual login on first run) →
-//! get_form_options (informational) → submit_training with Rust-owned retry →
-//! print one classified result line.
+//! * **single** (`"trainee"` in the job file) — the runbook's live gates. One
+//!   submission, one classified result line, driven by [`decide_submit`].
+//! * **batch** (`"trainees"`) — the [`BatchEngine`] establishes the session
+//!   once, runs every trainee through the retry policy, and prints a
+//!   [`BatchReport`]. Driven by `settle_submit`.
+//!
+//! Both decision paths live in `decision.rs`; Rust owns every retry/stop
+//! decision either way, and the worker only reports.
 //!
 //! The protocol layer is intentionally complete ahead of full use; unused
-//! members are expected at this milestone.
+//! members are expected while later stages land.
 #![allow(dead_code)]
 
+mod checkpoint;
 mod decision;
 mod engine;
 mod protocol;
 mod queue;
+mod recovery;
 mod report;
 mod state;
+mod store;
 mod worker;
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 use std::process::exit;
 
 use decision::{decide_submit, Decision, RetryPolicy};
-use protocol::{Request, SessionInput, Status, TraineeRef};
+use engine::BatchEngine;
+use protocol::{Request, SessionInput, Status, TraineeInfo, TraineeRef};
+use recovery::Start;
+use report::BatchReport;
 use serde::Deserialize;
+use store::CheckpointStore;
 use worker::WorkerClient;
 
 #[derive(Deserialize)]
 struct Job {
-    trainee: TraineeRef,
+    /// Single-trainee form, used by the runbook's live gates (Stages 15, 24).
+    #[serde(default)]
+    trainee: Option<TraineeRef>,
+    /// Batch form; mutually exclusive with `trainee`.
+    #[serde(default)]
+    trainees: Option<Vec<TraineeRef>>,
     session: SessionInput,
+}
+
+/// What the job file asked for, after validation.
+enum Plan {
+    Single(TraineeRef),
+    Batch(Vec<TraineeRef>),
 }
 
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Spawn the worker and block until it reports ready.
+fn connect() -> Result<WorkerClient, String> {
+    let mut client = WorkerClient::spawn()?;
+    client.wait_ready()?;
+    Ok(client)
+}
+
+/// Stable identity for a trainee reference — the id wins, else the raw name.
+fn key_of(trainee: &TraineeRef) -> Option<String> {
+    trainee.id.clone().or_else(|| trainee.name.clone())
+}
+
+/// Collapse whitespace and upper-case, so "John  Doe" == "JOHN DOE".
+/// Mirrors `normalize_name` in python/app/portal/parsing.py.
+fn normalize_name(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase()
+}
+
+/// Decide single vs batch from the job file, checking everything possible
+/// without the portal: a malformed batch must fail closed rather than submit a
+/// prefix and then discover the problem. Names are resolved and duplicates
+/// dropped later, in [`resolve_trainees`].
+fn plan(job: &Job) -> Result<Plan, String> {
+    match (&job.trainee, &job.trainees) {
+        (Some(_), Some(_)) => {
+            Err("job has both 'trainee' and 'trainees' — use exactly one".to_string())
+        }
+        (Some(trainee), None) => {
+            key_of(trainee).ok_or_else(|| "'trainee' needs an 'id' or a 'name'".to_string())?;
+            Ok(Plan::Single(trainee.clone()))
+        }
+        (None, Some(trainees)) => {
+            if trainees.is_empty() {
+                return Err("'trainees' is empty — nothing to submit".to_string());
+            }
+            for (index, trainee) in trainees.iter().enumerate() {
+                if key_of(trainee).is_none() {
+                    return Err(format!("trainees[{index}] needs an 'id' or a 'name'"));
+                }
+            }
+            Ok(Plan::Batch(trainees.clone()))
+        }
+        (None, None) => Err("job needs 'trainee' or 'trainees'".to_string()),
+    }
+}
+
+/// Why a batch could not be canonicalized.
+enum ResolveFailure {
+    /// The portal could not be read — an operator has to look, as with any HALT.
+    Halt(String),
+    /// The batch itself is unusable. Nothing was submitted.
+    BadBatch(String),
+}
+
+impl ResolveFailure {
+    fn exit_code(&self) -> i32 {
+        match self {
+            ResolveFailure::Halt(_) => 3,
+            ResolveFailure::BadBatch(_) => 2,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            ResolveFailure::Halt(message) | ResolveFailure::BadBatch(message) => message,
+        }
+    }
+}
+
+/// Resolve a batch against an already-fetched trainee list, then dedupe.
+///
+/// Mirrors `PortalClient._resolve_trainee`: an explicit id must exist, a name
+/// must match exactly one trainee, and anything else stops the batch. Deduping
+/// *after* resolution collapses two entries naming one person (one by id, one
+/// by name) into a single submission. Every unresolvable entry is collected
+/// rather than stopping at the first, so one run reports all of them; split out
+/// from [`resolve_trainees`] so the rules are testable without a worker.
+fn resolve_against(
+    available: &[TraineeInfo],
+    trainees: &[TraineeRef],
+) -> Result<Vec<TraineeRef>, Vec<String>> {
+    let mut by_id: HashMap<&str, &TraineeInfo> = HashMap::new();
+    let mut by_name: HashMap<String, Vec<&TraineeInfo>> = HashMap::new();
+    for trainee in available {
+        by_id.insert(trainee.id.as_str(), trainee);
+        by_name
+            .entry(normalize_name(&trainee.name))
+            .or_default()
+            .push(trainee);
+    }
+
+    let mut resolved: Vec<TraineeRef> = Vec::with_capacity(trainees.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut problems: Vec<String> = Vec::new();
+
+    for (index, entry) in trainees.iter().enumerate() {
+        let label = key_of(entry).unwrap_or_else(|| format!("#{index}"));
+
+        // An explicit id wins over a name, exactly as the worker's resolver does.
+        let found = match entry.id.as_deref() {
+            Some(id) => match by_id.get(id).copied() {
+                Some(found) => Ok(found),
+                None => Err(format!("{label}: no trainee with that id on the portal")),
+            },
+            None => {
+                let name = entry.name.clone().unwrap_or_default();
+                let matches = by_name
+                    .get(&normalize_name(&name))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                match matches.len() {
+                    1 => Ok(matches[0]),
+                    0 => Err(format!("{label}: no trainee with that name on the portal")),
+                    count => Err(format!(
+                        "{label}: {count} trainees share that name — give the trainee id"
+                    )),
+                }
+            }
+        };
+
+        match found {
+            Ok(found) => {
+                // Dedupe on the canonical id, so an id and a name for the same
+                // person cannot both be submitted.
+                if seen.insert(found.id.clone()) {
+                    resolved.push(TraineeRef {
+                        id: Some(found.id.clone()),
+                        name: None,
+                    });
+                } else {
+                    eprintln!(
+                        "dssp-bot: {label}: already queued as id {} — skipping",
+                        found.id
+                    );
+                }
+            }
+            Err(problem) => problems.push(problem),
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(problems)
+    }
+}
+
+/// Fetch the portal's trainee list and canonicalize the batch against it.
+///
+/// Needs an authenticated session — the caller establishes one first.
+fn resolve_trainees(
+    client: &mut WorkerClient,
+    trainees: &[TraineeRef],
+) -> Result<Vec<TraineeRef>, ResolveFailure> {
+    let resp = client
+        .send(&Request::list_trainees(new_id()))
+        .map_err(|e| ResolveFailure::Halt(format!("could not list trainees: {e}")))?;
+
+    if resp.status != Status::Ok {
+        // A lapsed session or a changed portal needs a human, not a retry.
+        return Err(ResolveFailure::Halt(format!(
+            "could not list trainees: {}",
+            resp.summary()
+        )));
+    }
+
+    resolve_against(&resp.trainees.unwrap_or_default(), trainees).map_err(|problems| {
+        ResolveFailure::BadBatch(format!(
+            "cannot resolve {} of {} trainee(s):\n  - {}",
+            problems.len(),
+            trainees.len(),
+            problems.join("\n  - ")
+        ))
+    })
 }
 
 fn main() {
@@ -47,34 +252,43 @@ fn main() {
         }
     };
 
-    let mut client = match WorkerClient::spawn() {
+    let code = match plan(&job) {
+        Ok(Plan::Single(trainee)) => run_single(trainee, &job.session),
+        Ok(Plan::Batch(trainees)) => run_batch(&trainees, &job.session, &path),
+        Err(e) => {
+            eprintln!("dssp-bot: {e}");
+            exit(2);
+        }
+    };
+
+    exit(code);
+}
+
+/// One trainee end to end: session gate, informational form options, then a
+/// single submission with Rust-owned retry. Prints one classified line.
+fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
+    let mut client = match connect() {
         Ok(client) => client,
         Err(e) => {
             eprintln!("dssp-bot: {e}");
-            exit(1);
+            return 1;
         }
     };
-    if let Err(e) = client.wait_ready() {
-        eprintln!("dssp-bot: worker never became ready: {e}");
-        exit(1);
-    }
 
-    // 1. Session gate. On the first run this blocks while you log in manually
-    //    in the opened browser window.
+    // On the first run this blocks for manual login in the opened browser window.
     eprintln!("dssp-bot: ensuring portal session…");
     match client.send(&Request::ensure_session(new_id())) {
         Ok(r) if r.status == Status::Ok => eprintln!("dssp-bot: session ok"),
         Ok(r) => {
             eprintln!("dssp-bot: session failed: {}", r.summary());
-            exit(1);
+            return 1;
         }
         Err(e) => {
             eprintln!("dssp-bot: session error: {e}");
-            exit(1);
+            return 1;
         }
     }
 
-    // 2. Informational: show the options the portal actually offers.
     match client.send(&Request::get_form_options(new_id(), None)) {
         Ok(r) if r.status == Status::Ok => eprintln!(
             "dssp-bot: form options — {} instructors, {} training types",
@@ -85,7 +299,15 @@ fn main() {
         Err(e) => eprintln!("dssp-bot: form options error: {e}"),
     }
 
-    // 3. Submit one trainee. Rust owns retry; the same job_id spans attempts.
+    // Rust owns retry; the same job_id spans attempts. Warn once, before the
+    // loop: nothing below is durable, so a death that reports no result cannot
+    // say whether the portal took the record. stderr is unbuffered and so cannot
+    // be lost by the crash it warns about.
+    eprintln!(
+        "dssp-bot: submitting {} now — if this process dies before it reports a result, the \
+         submission may already be on the portal: check there before re-running this job",
+        key_of(&trainee).unwrap_or_else(|| "the trainee".to_string()),
+    );
     let policy = RetryPolicy::default();
     let job_id = new_id();
     let mut attempt = 0u32;
@@ -93,7 +315,7 @@ fn main() {
     let (line, code) = loop {
         attempt += 1;
         let req =
-            Request::submit_training(job_id.clone(), job.trainee.clone(), job.session.clone());
+            Request::submit_training(job_id.clone(), trainee.clone(), session.clone());
 
         let resp = match client.send(&req) {
             Ok(resp) => resp,
@@ -119,6 +341,439 @@ fn main() {
     };
 
     client.shutdown();
+    // Discharge the warning above, or leave it standing: the operator must be
+    // able to tell "the portal answered" from "it did not".
+    if code == 3 {
+        eprintln!("dssp-bot: the submission is not settled by this run — check the portal first");
+    } else {
+        eprintln!("dssp-bot: the submission settled — nothing is left in doubt");
+    }
     println!("{line}");
-    exit(code);
+    code
+}
+
+/// Many trainees, one session. The engine aborts the whole batch — draining what
+/// is still queued as skipped — the moment a result cannot be accounted for.
+///
+/// A batch always checkpoints (the engine will not build without a sink): an
+/// interrupted run has real records on the portal to account for. The checkpoint
+/// is reconciled *before* the worker is spawned, so a refused start opens no
+/// browser and submits nothing.
+fn run_batch(trainees: &[TraineeRef], session: &SessionInput, job_path: &str) -> i32 {
+    // Where a killed batch leaves its record. Named on stderr because the file
+    // is the operator's only account of a run that never printed a report.
+    let checkpoint = CheckpointStore::for_job(Path::new(job_path));
+    eprintln!("dssp-bot: checkpoint → {}", checkpoint.path().display());
+
+    let start = match recovery::guard(&checkpoint, recovery::resume_requested()) {
+        Ok(start) => start,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return 3;
+        }
+    };
+
+    // Qualified: `Plan` already names the job file's shape, a different question.
+    let (wanted, carried) = match start.plan {
+        recovery::Plan::Fresh => {
+            // Only here, where the counts are exactly the file's own: a resume
+            // reports its own records itself, so this line would otherwise be
+            // given a count that misses an untracked suspect.
+            if start.recovered
+                && let Some(previous) = &start.previous
+            {
+                eprintln!("{}", recovery::recovered_line(checkpoint.path(), previous));
+            }
+
+            announce_fresh(&start);
+            (trainees.to_vec(), Vec::new())
+        }
+        recovery::Plan::Resume {
+            roster,
+            carried,
+            owed,
+        } => {
+            if let Some(code) = announce_resume(&checkpoint, &roster, &carried, owed) {
+                return code;
+            }
+            (roster, carried)
+        }
+    };
+
+    let mut client = match connect() {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("dssp-bot: {e}");
+            return 1;
+        }
+    };
+
+    // The trainee list has to be readable before the batch can be canonicalized,
+    // so the session gate comes first; the engine re-checks it for the run.
+    eprintln!("dssp-bot: ensuring portal session…");
+    match client.send(&Request::ensure_session(new_id())) {
+        Ok(r) if r.status == Status::Ok => eprintln!("dssp-bot: session ok"),
+        Ok(r) => {
+            eprintln!("dssp-bot: session failed: {}", r.summary());
+            client.shutdown();
+            return 3;
+        }
+        Err(e) => {
+            eprintln!("dssp-bot: session error: {e}");
+            client.shutdown();
+            return 3;
+        }
+    }
+
+    let resolved = match resolve_trainees(&mut client, &wanted) {
+        Ok(resolved) => resolved,
+        Err(failure) => {
+            eprintln!("dssp-bot: {}", failure.message());
+            client.shutdown();
+            return failure.exit_code();
+        }
+    };
+
+    eprintln!("dssp-bot: batch of {} trainee(s)", resolved.len());
+
+    let mut engine = BatchEngine::new(Box::new(checkpoint)).with_carried(carried);
+    let report = match engine.run(&mut client, session, resolved) {
+        Ok(report) => report,
+        Err(e) => {
+            // The session could not be established, so nothing was written.
+            eprintln!("dssp-bot: batch aborted before any submission: {e}");
+            client.shutdown();
+            return 3;
+        }
+    };
+
+    client.shutdown();
+    print_report(&report);
+    batch_exit_code(&report)
+}
+
+/// Says out loud what a predecessor left un-attempted, so a fresh start does not
+/// drop it in silence. Those trainees are deliberately not carried into the new
+/// batch — the job file decides what runs — but a batch that quietly leaves
+/// people unsubmitted is a gap an operator would otherwise find on the portal.
+fn announce_fresh(start: &Start) {
+    let Some(previous) = &start.previous else {
+        return;
+    };
+
+    let stale = previous.never_attempted();
+
+    if !stale.is_empty() {
+        eprintln!(
+            "dssp-bot: note: the previous checkpoint left {} trainee(s) never attempted ({}) — \
+             this batch runs what the job file names",
+            stale.len(),
+            preview(&stale),
+        );
+    }
+}
+
+/// The resume header, and the one case that is not a batch at all. Returns the
+/// exit code when there is nothing to submit.
+///
+/// `owed` is what decides that code, not the whole carried set: the rows that
+/// landed are carried so the file stays whole, and a batch whose only loose ends
+/// are its own successes is finished, not blocked.
+fn announce_resume(
+    checkpoint: &CheckpointStore,
+    roster: &[TraineeRef],
+    carried: &[crate::report::TrainingResult],
+    owed: usize,
+) -> Option<i32> {
+    eprintln!(
+        "dssp-bot: resuming the batch checkpointed at {}",
+        checkpoint.path().display()
+    );
+
+    // Counted off `carried`, not `owed`: `owed` also counts trainees the file's
+    // own numbers lost track of, which are not in `carried` — using it here would
+    // overstate how many of these records are unconfirmed.
+    let unconfirmed = carried
+        .iter()
+        .filter(|r| r.outcome == crate::report::Outcome::Indeterminate)
+        .count();
+
+    if !carried.is_empty() {
+        eprintln!(
+            "dssp-bot:   carrying {} result(s) forward into this batch — {unconfirmed} of them \
+             unconfirmed and never replayed",
+            carried.len(),
+        );
+    }
+
+    // Printed before anything is submitted so the ids are on screen while the
+    // operator can still stop the run — and printed even when nothing is left to
+    // run, because this list is the only place the crash-window trainee is named.
+    for result in carried
+        .iter()
+        .filter(|r| r.outcome == crate::report::Outcome::Indeterminate)
+    {
+        eprintln!(
+            "dssp-bot:   unconfirmed {}: {}",
+            label(&result.trainee_id, &result.trainee_name),
+            result.message.as_deref().unwrap_or("")
+        );
+    }
+
+    if roster.is_empty() {
+        // No completeness claim: it would be false exactly when `owed` counts
+        // trainees the file's numbers lost track of — the lines above name them.
+        eprintln!(
+            "dssp-bot: nothing to resume — this run would submit nothing from {}",
+            checkpoint.path().display()
+        );
+
+        // Exit 3 only while a human is still owed: those records may exist on the
+        // portal and this run submits nothing. Settled loose ends mean done.
+        return Some(if owed == 0 { 0 } else { 3 });
+    }
+
+    eprintln!(
+        "dssp-bot:   continuing {} trainee(s) that were never attempted",
+        roster.len()
+    );
+
+    None
+}
+
+/// Up to five ids, then a "+N more" count.
+fn preview(ids: &[String]) -> String {
+    let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+
+    match ids.len().checked_sub(5) {
+        Some(rest) if rest > 0 => format!("{shown}, +{rest} more"),
+        _ => shown,
+    }
+}
+
+/// The name when there is one, else the id: what the operator would look up.
+fn label<'a>(id: &'a str, name: &'a str) -> &'a str {
+    if name.is_empty() {
+        id
+    } else {
+        name
+    }
+}
+
+/// Progress on stderr; the machine-readable report alone on stdout.
+fn print_report(report: &BatchReport) {
+    for result in &report.results {
+        let who = label(&result.trainee_id, &result.trainee_name);
+        eprintln!(
+            "dssp-bot: {:?} {who} (attempts={}) {}",
+            result.outcome,
+            result.attempts,
+            result.message.as_deref().unwrap_or("")
+        );
+    }
+    eprintln!("dssp-bot: {}", report.summary_line());
+
+    match serde_json::to_string_pretty(report) {
+        Ok(json) => println!("{json}"),
+        Err(e) => eprintln!("dssp-bot: could not serialize report: {e}"),
+    }
+}
+
+/// An indeterminate record may have been written without a readable
+/// confirmation, and a skipped one sits behind an aborted batch — both need a
+/// human. A definitive failure is terminal but safe to re-run.
+fn batch_exit_code(report: &BatchReport) -> i32 {
+    // `aborted` first, not only the counts: a run that stopped on its last queued
+    // trainee drains nothing, so `skipped` is 0 and its outcome is whatever that
+    // trainee had. Without this it reports "safe to re-run" for a batch that
+    // halted on a lapsed session or a changed portal — the cases needing a human.
+    if report.aborted || report.indeterminate > 0 || report.skipped > 0 {
+        3
+    } else if report.failed > 0 {
+        4
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn portal(rows: &[(&str, &str)]) -> Vec<TraineeInfo> {
+        rows.iter()
+            .map(|(id, name)| TraineeInfo {
+                id: (*id).to_string(),
+                name: (*name).to_string(),
+                sn: String::new(),
+                course: String::new(),
+                training_sessions: String::new(),
+            })
+            .collect()
+    }
+
+    fn want_id(id: &str) -> TraineeRef {
+        TraineeRef {
+            id: Some(id.to_string()),
+            name: None,
+        }
+    }
+
+    fn want_name(name: &str) -> TraineeRef {
+        TraineeRef {
+            id: None,
+            name: Some(name.to_string()),
+        }
+    }
+
+    /// Resolved ids, in order — resolved entries always carry an id and no name.
+    fn ids(refs: &[TraineeRef]) -> Vec<String> {
+        refs.iter()
+            .map(|r| {
+                assert!(r.name.is_none(), "resolved entries submit by id only");
+                r.id.clone().unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn problems(result: Result<Vec<TraineeRef>, Vec<String>>) -> String {
+        result.expect_err("expected a resolution failure").join("; ")
+    }
+
+    #[test]
+    fn normalize_name_collapses_whitespace_and_case() {
+        assert_eq!(normalize_name("  John   Doe "), "JOHN DOE");
+        assert_eq!(normalize_name("jane roe"), "JANE ROE");
+    }
+
+    #[test]
+    fn a_name_resolves_to_its_id() {
+        let available = portal(&[("123", "John Doe"), ("456", "Jane Roe")]);
+        let resolved = resolve_against(&available, &[want_name("john doe")]).unwrap();
+        assert_eq!(ids(&resolved), vec!["123"]);
+    }
+
+    #[test]
+    fn an_unknown_name_is_reported() {
+        let available = portal(&[("123", "John Doe")]);
+        let message = problems(resolve_against(&available, &[want_name("Nobody Here")]));
+        assert!(message.contains("Nobody Here"), "{message}");
+        assert!(message.contains("no trainee with that name"), "{message}");
+    }
+
+    /// The never-guess rule: two trainees sharing a name must not pick one.
+    #[test]
+    fn an_ambiguous_name_is_reported_rather_than_guessed() {
+        let available = portal(&[("123", "John Doe"), ("456", "John Doe")]);
+        let message = problems(resolve_against(&available, &[want_name("John Doe")]));
+        assert!(message.contains("2 trainees share that name"), "{message}");
+    }
+
+    /// The worker rejects an unlisted id too, so the CLI must agree with it.
+    #[test]
+    fn an_unknown_id_is_reported() {
+        let available = portal(&[("123", "John Doe")]);
+        let message = problems(resolve_against(&available, &[want_id("999")]));
+        assert!(message.contains("no trainee with that id"), "{message}");
+    }
+
+    /// The gap this closes: the same person named twice, once by id and once by
+    /// name, must produce ONE submission rather than a duplicate record.
+    #[test]
+    fn the_same_person_by_id_and_by_name_dedupes_to_one() {
+        let available = portal(&[("123", "John Doe"), ("456", "Jane Roe")]);
+        let resolved =
+            resolve_against(&available, &[want_id("123"), want_name("john doe")]).unwrap();
+        assert_eq!(ids(&resolved), vec!["123"]);
+    }
+
+    #[test]
+    fn dedupe_ignores_spacing_and_case_differences() {
+        let available = portal(&[("123", "John Doe")]);
+        let resolved =
+            resolve_against(&available, &[want_name("john doe"), want_name("John  DOE")]).unwrap();
+        assert_eq!(ids(&resolved), vec!["123"]);
+    }
+
+    #[test]
+    fn distinct_trainees_are_all_kept_in_order() {
+        let available = portal(&[("123", "John Doe"), ("456", "Jane Roe")]);
+        let resolved = resolve_against(
+            &available,
+            &[want_id("123"), want_name("jane roe"), want_id("456")],
+        )
+        .unwrap();
+        assert_eq!(ids(&resolved), vec!["123", "456"]);
+    }
+
+    /// An explicit name match wins over a differently-cased id key, and an id
+    /// takes precedence when both are present on one entry.
+    #[test]
+    fn an_id_on_the_entry_wins_over_its_name() {
+        let available = portal(&[("123", "John Doe"), ("456", "Jane Roe")]);
+        let both = TraineeRef {
+            id: Some("456".to_string()),
+            name: Some("John Doe".to_string()),
+        };
+        let resolved = resolve_against(&available, &[both]).unwrap();
+        assert_eq!(ids(&resolved), vec!["456"]);
+    }
+
+    #[test]
+    fn every_unresolvable_entry_is_reported_in_one_pass() {
+        let available = portal(&[("123", "John Doe")]);
+        let message = problems(resolve_against(
+            &available,
+            &[want_name("Nobody"), want_id("999")],
+        ));
+        assert!(message.contains("Nobody"), "{message}");
+        assert!(message.contains("999"), "{message}");
+    }
+
+    #[test]
+    fn a_resolvable_batch_reports_no_problems() {
+        let available = portal(&[("123", "John Doe")]);
+        assert!(resolve_against(&available, &[want_id("123")]).is_ok());
+    }
+
+    fn report_of(outcomes: &[crate::report::Outcome], aborted: bool) -> BatchReport {
+        let results = outcomes
+            .iter()
+            .enumerate()
+            .map(|(i, outcome)| crate::report::TrainingResult {
+                trainee_id: (i + 1).to_string(),
+                trainee_name: String::new(),
+                outcome: *outcome,
+                attempts: 1,
+                error_code: None,
+                message: None,
+            })
+            .collect();
+
+        BatchReport::build(results, "0".to_string(), "1".to_string(), aborted)
+    }
+
+    /// A run that aborted on its last queued trainee drains nothing: its counts
+    /// are a `Failed` with no skips, so it would exit 4 ("definitive failures,
+    /// safe to re-run") when the halt actually needs a human.
+    #[test]
+    fn an_abort_with_nothing_drained_exits_3_not_4() {
+        use crate::report::Outcome::{Failed, Success};
+
+        let aborted = report_of(&[Success, Failed], true);
+        assert_eq!(aborted.skipped, 0, "nothing was left to drain");
+        assert_eq!(batch_exit_code(&aborted), 3);
+
+        // The same counts without the abort flag: a batch that ran to the end
+        // and had one trainee rejected is genuinely safe to re-run.
+        let finished = report_of(&[Success, Failed], false);
+        assert_eq!(batch_exit_code(&finished), 4);
+    }
+
+    #[test]
+    fn a_clean_batch_exits_0() {
+        use crate::report::Outcome::Success;
+
+        assert_eq!(batch_exit_code(&report_of(&[Success, Success], false)), 0);
+    }
 }
