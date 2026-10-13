@@ -11,7 +11,8 @@ export function parsePortalMatches(value: string | undefined): string[] {
   return patterns.length > 0 ? patterns : [FALLBACK_PORTAL_MATCH];
 }
 
-export function createManifest(portalMatches: string[]) {
+// Retain the build configuration signature until legacy modules retire in Stage 34.
+export function createManifest(_portalMatches: string[]) {
   return defineManifest({
     manifest_version: 3,
 
@@ -35,28 +36,13 @@ export function createManifest(portalMatches: string[]) {
       default_title: "DSSP Training Logger",
     },
 
-     background: {
+    background: {
       service_worker: "src/background/service-worker.ts",
       type: "module",
     },
 
-    content_scripts: [
-      {
-        matches: portalMatches,
-        js: ["src/content/main-world.ts"],
-        run_at: "document_start",
-        world: "MAIN",
-      },
-      {
-        matches: portalMatches,
-        js: ["src/content/content-script.ts"],
-        run_at: "document_idle",
-        world: "ISOLATED",
-      },
-    ],
+    permissions: ["storage"],
 
-    permissions: ["storage", "tabs", "activeTab"],
-
-    host_permissions: portalMatches,
+    host_permissions: ["http://127.0.0.1/*"],
   });
 }

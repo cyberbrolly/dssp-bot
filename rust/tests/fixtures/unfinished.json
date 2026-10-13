@@ -1,0 +1,1 @@
+{"status":"running","started_at":"1000","updated_at":"1001","total":3,"results":[{"trainee_id":"fixture-1","trainee_name":"Fixture One","outcome":"success","attempts":1}],"pending":["fixture-2"],"in_flight":"fixture-crash"}

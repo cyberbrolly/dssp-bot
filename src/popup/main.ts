@@ -1,416 +1,297 @@
-import { MessageBus } from "../core/infrastructure/messaging/MessageBus";
-import { ChromiumBrowserAdapter } from "../core/infrastructure/browser/ChromiumBrowserAdapter";
-import { isActive } from "../core/automation/AutomationState";
-import { unreconciled } from "../core/automation/BatchCheckpoint";
-import type { BatchCheckpoint } from "../core/automation/BatchCheckpoint";
-import type {
-  BatchProgress,
-  Message,
-} from "../core/infrastructure/messaging/Messages";
-import type { BatchReport } from "../core/domain/BatchReport";
-import type { AutomationState } from "../core/automation/AutomationState";
-import type {
-  TrainingFormOption,
-  TrainingFormOptions,
-} from "../core/domain/TrainingFormOptions";
-import { formatTrainingDate } from "../core/shared/trainingDate";
+import {
+  DAEMON_SETTINGS_KEY,
+  DEFAULT_DAEMON_PORT,
+  DaemonClient,
+  extensionOrigin,
+  startupCommand,
+  validateSettings,
+} from "../core/infrastructure/daemon/DaemonClient";
+import type { DaemonSettings } from "../core/infrastructure/daemon/DaemonClient";
+import type { TrainingFormOption } from "../core/domain/TrainingFormOptions";
 import { parseTraineeInput } from "../core/shared/parseTraineeInput";
-
-const browser = new ChromiumBrowserAdapter();
-const messageBus = new MessageBus(browser.runtime);
+import {
+  readDaemonView,
+  recoverySummary,
+  reportSummary,
+  sessionLocked,
+} from "./daemonView";
 
 function element<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
-
-  if (!found) {
-    throw new Error(`Missing popup element: #${id}`);
-  }
-
+  if (!found) throw new Error(`Missing popup element: #${id}`);
   return found as T;
 }
-
 const ui = {
+  token: element<HTMLInputElement>("daemon-token"),
+  port: element<HTMLInputElement>("daemon-port"),
+  save: element<HTMLButtonElement>("save-daemon"),
+  connection: element<HTMLParagraphElement>("connection"),
+  help: element<HTMLElement>("daemon-help"),
+  origin: element<HTMLElement>("extension-origin"),
+  command: element<HTMLElement>("daemon-command"),
+  loadOptions: element<HTMLButtonElement>("load-options"),
   state: element<HTMLSpanElement>("state"),
   instructor: element<HTMLSelectElement>("instructor"),
   trainingType: element<HTMLSelectElement>("training-type"),
   trainingDate: element<HTMLInputElement>("training-date"),
   trainees: element<HTMLTextAreaElement>("trainees"),
   current: element<HTMLParagraphElement>("current"),
-  total: element<HTMLSpanElement>("total"),
-  processed: element<HTMLSpanElement>("processed"),
-  successful: element<HTMLSpanElement>("successful"),
-  failed: element<HTMLSpanElement>("failed"),
-  skipped: element<HTMLSpanElement>("skipped"),
-  indeterminate: element<HTMLSpanElement>("indeterminate"),
-  remaining: element<HTMLSpanElement>("remaining"),
   start: element<HTMLButtonElement>("start"),
-  pause: element<HTMLButtonElement>("pause"),
-  resume: element<HTMLButtonElement>("resume"),
-  stop: element<HTMLButtonElement>("stop"),
   status: element<HTMLParagraphElement>("status"),
   recoverySection: element<HTMLElement>("recovery-section"),
   recovery: element<HTMLParagraphElement>("recovery"),
   reportSection: element<HTMLElement>("report-section"),
   report: element<HTMLParagraphElement>("report"),
 };
+const counters = [
+  "total",
+  "processed",
+  "successful",
+  "failed",
+  "skipped",
+  "indeterminate",
+  "remaining",
+] as const;
+const origin = extensionOrigin(chrome.runtime.getURL(""));
+ui.origin.textContent = origin;
+ui.port.value = String(DEFAULT_DAEMON_PORT);
 
-let formOptionsReady = false;
-let cachedFormOptions: TrainingFormOptions | null = null;
-let currentState: AutomationState = "idle";
+let client: DaemonClient | null = null;
+let connected = false;
+let optionsReady = false;
+let polling = false;
+let busy = false;
+let viewGeneration = 0;
 
-function setStatus(text: string, tone: "info" | "error" = "info"): void {
-  console.debug("[DSSP-DEBUG][POPUP] state transition", { text, tone });
+function status(text: string, error = false): void {
   ui.status.textContent = text;
-  ui.status.dataset.tone = tone;
+  ui.status.dataset.tone = error ? "error" : "info";
 }
-
-function parseTraineeIds(): string[] {
-  const raw = ui.trainees.value;
-  const parsed = parseTraineeInput(raw);
-  console.debug("[DSSP:popup] Trainee IDs textarea read", {
-    rawValue: raw,
-    parsedValues: parsed,
-    rawCodePoints: Array.from(raw, (char) => char.codePointAt(0)),
-  });
-  return parsed;
+function controls(): void {
+  const locked =
+    !connected || busy || sessionLocked(ui.state.dataset.state ?? "unknown");
+  ui.start.disabled = locked || !optionsReady;
+  ui.loadOptions.disabled = locked;
+  ui.instructor.disabled = locked || !optionsReady;
+  ui.trainingType.disabled = locked || !optionsReady;
+  ui.trainingDate.disabled = locked;
+  ui.trainees.disabled = locked;
+  ui.save.disabled = busy;
 }
-
-function renderControls(state: AutomationState): void {
-  const running = isActive(state);
-  const sessionLocked = running || state === "paused";
-
-  currentState = state;
-
-  ui.start.disabled = sessionLocked || !formOptionsReady;
-  ui.pause.disabled = !running;
-  ui.resume.disabled = state !== "paused";
-  ui.stop.disabled = !running && state !== "paused";
-  ui.instructor.disabled = sessionLocked || !formOptionsReady;
-  ui.trainingType.disabled = sessionLocked || !formOptionsReady;
-  ui.trainingDate.disabled = sessionLocked;
-  ui.trainees.disabled = sessionLocked;
+function disconnected(reason: string): void {
+  connected = false;
+  ui.connection.textContent = reason;
+  ui.help.hidden = false;
+  ui.state.textContent = "disconnected";
+  delete ui.state.dataset.state;
+  ui.current.textContent = "Daemon state unavailable (execution may continue).";
+  for (const key of counters) element(key).textContent = "—";
+  ui.reportSection.hidden = true;
+  ui.recoverySection.hidden = true;
+  controls();
 }
-
-function renderProgress(progress: BatchProgress): void {
-  ui.state.textContent = progress.state.replace(/_/g, " ");
-  ui.total.textContent = String(progress.total);
-  ui.processed.textContent = String(progress.processed);
-  ui.successful.textContent = String(progress.successful);
-  ui.failed.textContent = String(progress.failed);
-  ui.skipped.textContent = String(progress.skipped);
-  ui.indeterminate.textContent = String(progress.indeterminate);
-  ui.remaining.textContent = String(progress.remaining);
-  ui.current.textContent = progress.currentTraineeName ?? "No batch running";
-
-  renderControls(progress.state);
+function command(port: number): void {
+  // The command contains only validated identity/port, never the secret token.
+  ui.command.textContent = startupCommand(origin, port);
 }
-
-function renderReport(report: BatchReport | null): void {
-  if (!report) {
-    ui.reportSection.hidden = true;
-
-    return;
-  }
-
-  ui.reportSection.hidden = false;
-
-  const rate = Math.round(report.successRate * 100);
-
-  const summary = `${report.successful}/${report.total} recorded, ${report.failed} failed, ${report.skipped} skipped, ${rate}% success rate.`;
-
-  ui.report.textContent =
-    report.indeterminate > 0
-      ? `${summary} ${report.indeterminate} submitted without confirmation — check these on the portal before re-running them.`
-      : summary;
-}
-
-async function send(message: Message): Promise<unknown> {
-  try {
-    const response = await messageBus.send(message);
-
-    if (!response.success) {
-      setStatus(response.error ?? "The request failed.", "error");
-
-      return null;
-    }
-
-    return response.data ?? null;
-  } catch (error) {
-    setStatus(
-      error instanceof Error
-        ? error.message
-        : "The background worker did not respond.",
-      "error",
-    );
-
-    return null;
-  }
-}
-
-function isTrainingFormOption(value: unknown): value is TrainingFormOption {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "value" in value &&
-    typeof value.value === "string" &&
-    "label" in value &&
-    typeof value.label === "string"
-  );
-}
-
-function isTrainingFormOptions(value: unknown): value is TrainingFormOptions {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "instructors" in value &&
-    Array.isArray(value.instructors) &&
-    value.instructors.every(isTrainingFormOption) &&
-    "trainingTypes" in value &&
-    Array.isArray(value.trainingTypes) &&
-    value.trainingTypes.every(isTrainingFormOption)
-  );
-}
-
-function renderSelectOptions(
+function selectOptions(
   select: HTMLSelectElement,
-  options: TrainingFormOption[],
+  values: TrainingFormOption[],
   placeholder: string,
 ): void {
   select.replaceChildren();
-
   const empty = document.createElement("option");
   empty.value = "";
   empty.textContent = placeholder;
-  empty.disabled = true;
-  empty.selected = true;
   select.append(empty);
-
-  for (const option of options) {
-    const element = document.createElement("option");
-    element.value = option.value;
-    element.textContent = option.label;
-    select.append(element);
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value.value;
+    option.textContent = value.label;
+    select.append(option);
   }
 }
-
-async function loadFormOptions(): Promise<void> {
-  if (cachedFormOptions) {
-    renderSelectOptions(
-      ui.instructor,
-      cachedFormOptions.instructors,
-      "Choose instructor",
-    );
-    renderSelectOptions(
-      ui.trainingType,
-      cachedFormOptions.trainingTypes,
-      "Choose training type",
-    );
-    formOptionsReady = true;
-    renderControls(currentState);
-    return;
-  }
-
-  formOptionsReady = false;
-  renderControls(currentState);
-  setStatus("Loading form options.");
-  console.debug("[DSSP-DEBUG][POPUP] requesting GET_FORM_OPTIONS");
-
-  let response: Awaited<ReturnType<typeof messageBus.send>>;
-  try {
-    response = await Promise.race([
-      messageBus.send({ type: "GET_FORM_OPTIONS" }),
-      new Promise<never>((_, reject) =>
-        window.setTimeout(
-          () => reject(new Error("Form options request timed out after 15 seconds.")),
-          15_000,
-        ),
-      ),
-    ]);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    console.error("[DSSP-DEBUG][POPUP] GET_FORM_OPTIONS failed", { reason });
-    renderSelectOptions(ui.instructor, [], "Instructors unavailable");
-    renderSelectOptions(ui.trainingType, [], "Training types unavailable");
-    formOptionsReady = false;
-    renderControls(currentState);
-    setStatus(`Form options failed: ${reason}`, "error");
-    return;
-  }
-
-  console.debug("[DSSP-DEBUG][POPUP] GET_FORM_OPTIONS response", response);
-  const data = response.success ? response.data ?? null : null;
-
-  if (!isTrainingFormOptions(data)) {
-    renderSelectOptions(ui.instructor, [], "Instructors unavailable");
-    renderSelectOptions(ui.trainingType, [], "Training types unavailable");
-    formOptionsReady = false;
-    renderControls(currentState);
-    setStatus(
-      `Form options failed: ${response.success ? "invalid response from DSSP page" : response.error}`,
-      "error",
-    );
-    return;
-  }
-
-  cachedFormOptions = data;
-  renderSelectOptions(ui.instructor, data.instructors, "Choose instructor");
-  renderSelectOptions(
-    ui.trainingType,
-    data.trainingTypes,
-    "Choose training type",
-  );
-  formOptionsReady = true;
-  renderControls(currentState);
-  setStatus("Form options loaded.");
+function resetOptions(): void {
+  optionsReady = false;
+  selectOptions(ui.instructor, [], "Load instructors explicitly");
+  selectOptions(ui.trainingType, [], "Load training types explicitly");
 }
-
-/**
- * Only `interrupted` is shown: a finished batch is covered by the report, a live
- * one by the progress counters — but an interrupted one may have left portal
- * records that nothing else in this UI accounts for.
- */
-function renderRecovery(checkpoint: BatchCheckpoint | null): void {
-  if (!checkpoint || checkpoint.status !== "interrupted") {
-    ui.recoverySection.hidden = true;
-
-    return;
-  }
-
-  const { indeterminate, unprocessed } = unreconciled(checkpoint);
-
-  const parts = [
-    `A batch started ${checkpoint.startedAt.slice(0, 16).replace("T", " ")} did not finish.`,
-    `${checkpoint.results.length} of ${checkpoint.total} trainees were processed.`,
-  ];
-
-  if (indeterminate.length > 0) {
-    parts.push(
-      `${indeterminate.length} were submitted without confirmation (${indeterminate
-        .map((entry) => entry.traineeName)
-        .join(", ")}) — check these on the portal before re-running them.`,
-    );
-  }
-
-  if (unprocessed.length > 0) {
-    parts.push(`${unprocessed.length} were never attempted.`);
-  }
-
-  ui.recovery.textContent = parts.join(" ");
-  ui.recoverySection.hidden = false;
-}
-
 async function refresh(): Promise<void> {
-  const progress = await send({ type: "GET_STATUS" });
-
-  if (progress) {
-    renderProgress(progress as BatchProgress);
-  }
-
-  const report = await send({ type: "GET_REPORT" });
-
-  renderReport((report as BatchReport | null) ?? null);
-
-  const checkpoint = await send({ type: "GET_CHECKPOINT" });
-
-  renderRecovery((checkpoint as BatchCheckpoint | null) ?? null);
-}
-
-function onClick(
-  button: HTMLButtonElement,
-  handler: () => Promise<void>,
-): void {
-  button.addEventListener("click", () => {
-    void handler();
-  });
-}
-
-onClick(ui.start, async () => {
-  const traineeIds = parseTraineeIds();
-
-  if (traineeIds.length === 0) {
-    setStatus("Add at least one trainee ID.", "error");
-
-    return;
-  }
-
-  if (
-    !ui.instructor.value ||
-    !ui.trainingType.value ||
-    !ui.trainingDate.value
-  ) {
-    setStatus("Instructor, training type, and date are required.", "error");
-
-    return;
-  }
-
-  const instructor = ui.instructor.selectedOptions[0];
-  const trainingType = ui.trainingType.selectedOptions[0];
-
-  if (!instructor || !trainingType) {
-    setStatus("Choose an instructor and training type.", "error");
-
-    return;
-  }
-
-  let trainingDate: string;
-
+  if (!client || polling) return;
+  polling = true;
+  const requestedClient = client;
+  const requestedGeneration = viewGeneration;
   try {
-    trainingDate = formatTrainingDate(ui.trainingDate.value);
+    const view = await readDaemonView(requestedClient);
+    if (client !== requestedClient || viewGeneration !== requestedGeneration)
+      return;
+    connected = true;
+    ui.connection.textContent =
+      "Daemon connected. Rust owns execution and recovery.";
+    ui.help.hidden = true;
+    ui.state.textContent = view.progress.state.replace(/_/g, " ");
+    ui.state.dataset.state = view.progress.state;
+    for (const key of counters)
+      element(key).textContent = String(view.progress[key]);
+    ui.current.textContent =
+      view.progress.currentTraineeName ?? "No current trainee reported";
+    ui.reportSection.hidden = view.report === null;
+    ui.report.textContent = view.report ? reportSummary(view.report) : "";
+    const recovery = recoverySummary(view.checkpoint);
+    ui.recoverySection.hidden = recovery === null;
+    ui.recovery.textContent = recovery ?? "";
+    controls();
   } catch (error) {
-    setStatus(
-      error instanceof Error ? error.message : "Training date is invalid.",
-      "error",
-    );
+    if (client === requestedClient && viewGeneration === requestedGeneration)
+      disconnected(
+        error instanceof Error ? error.message : "Daemon unavailable.",
+      );
+  } finally {
+    polling = false;
+  }
+}
 
+ui.save.addEventListener("click", () => {
+  void (async () => {
+    try {
+      const settings = validateSettings({
+        port: Number(ui.port.value),
+        token: ui.token.value.trim(),
+      });
+      // Store connection settings only, never reports, queues, checkpoints or progress.
+      await chrome.storage.local.set({ [DAEMON_SETTINGS_KEY]: settings });
+      client = new DaemonClient(settings);
+      command(settings.port);
+      resetOptions();
+      disconnected("Connecting to daemon…");
+      status("Daemon settings saved. Token stays in extension-local storage.");
+      await refresh();
+    } catch (error) {
+      status(
+        error instanceof Error
+          ? error.message
+          : "Could not save daemon settings.",
+        true,
+      );
+    }
+  })();
+});
+
+ui.loadOptions.addEventListener("click", () => {
+  if (!client || busy) return;
+  const requestedClient = client;
+  busy = true;
+  controls();
+  status(
+    "Loading form options via Rust. This may open the worker and require manual portal login.",
+  );
+  void requestedClient
+    .formOptions()
+    .then((options) => {
+      if (client !== requestedClient) return;
+      selectOptions(ui.instructor, options.instructors, "Choose instructor");
+      selectOptions(
+        ui.trainingType,
+        options.trainingTypes,
+        "Choose training type",
+      );
+      optionsReady =
+        options.instructors.length > 0 && options.trainingTypes.length > 0;
+      status(
+        optionsReady
+          ? "Form options loaded."
+          : "Daemon returned empty form options.",
+        !optionsReady,
+      );
+    })
+    .catch((error: unknown) => {
+      resetOptions();
+      status(
+        error instanceof Error ? error.message : "Form options failed.",
+        true,
+      );
+    })
+    .finally(() => {
+      busy = false;
+      controls();
+      void refresh();
+    });
+});
+
+ui.start.addEventListener("click", () => {
+  if (!client || busy || ui.start.disabled) return;
+  const names = parseTraineeInput(ui.trainees.value);
+  if (
+    !names.length ||
+    !ui.trainingDate.value ||
+    !ui.instructor.value ||
+    !ui.trainingType.value
+  ) {
+    status(
+      "Trainee names, instructor, training type and date are required.",
+      true,
+    );
     return;
   }
+  busy = true;
+  controls();
+  status("Requesting admission. A 202 is not submission confirmation.");
+  void client
+    .start({
+      trainees: names.map((name) => ({ name })),
+      session: {
+        trainingDate: ui.trainingDate.value,
+        instructor: ui.instructor.value,
+        trainingType: ui.trainingType.value,
+      },
+      resume: false,
+    })
+    .then(({ batchId }) => {
+      status(
+        `Batch admitted (${batchId}). Polling Rust for progress and report.`,
+      );
+    })
+    .catch((error: unknown) => {
+      // In particular, a 409 is shown once: no resume acknowledgement or retry.
+      status(
+        error instanceof Error ? error.message : "Batch admission failed.",
+        true,
+      );
+    })
+    .finally(() => {
+      // A read begun before admission completed cannot unlock a second start.
+      viewGeneration += 1;
+      connected = false;
+      busy = false;
+      controls();
+      void refresh();
+    });
+});
 
-  setStatus(`Starting ${traineeIds.length} trainee(s).`);
-
-  const report = await send({
-    type: "START_AUTOMATION",
-    traineeIds,
-    session: {
-      instructorId: ui.instructor.value,
-      instructorLabel: instructor.textContent ?? "",
-      trainingTypeId: ui.trainingType.value,
-      trainingTypeLabel: trainingType.textContent ?? "",
-      trainingDate,
-    },
-  });
-
-  if (report) {
-    renderReport(report as BatchReport);
-    setStatus("Batch finished.");
+command(DEFAULT_DAEMON_PORT);
+resetOptions();
+disconnected("Daemon not configured. Paste its token and save to connect.");
+void (async () => {
+  try {
+    const stored = await chrome.storage.local.get(DAEMON_SETTINGS_KEY);
+    const settings = stored[DAEMON_SETTINGS_KEY] as DaemonSettings | undefined;
+    if (!settings) return;
+    client = new DaemonClient(settings);
+    ui.port.value = String(settings.port);
+    ui.token.value = settings.token;
+    command(settings.port);
+    await refresh();
+  } catch (error) {
+    disconnected(
+      error instanceof Error
+        ? error.message
+        : "Daemon configuration unavailable.",
+    );
   }
-
-  await refresh();
-});
-
-onClick(ui.pause, async () => {
-  await send({ type: "PAUSE_AUTOMATION" });
-  setStatus("Paused after the current trainee.");
-  await refresh();
-});
-
-onClick(ui.resume, async () => {
-  await send({ type: "RESUME_AUTOMATION" });
-  setStatus("Resumed.");
-  await refresh();
-});
-
-onClick(ui.stop, async () => {
-  await send({ type: "STOP_AUTOMATION" });
-  setStatus("Stopping. Remaining trainees are skipped.");
-  await refresh();
-});
-
-const pollTimer = window.setInterval(() => {
+})();
+const timer = window.setInterval(() => {
   void refresh();
 }, 1000);
-
 window.addEventListener("unload", () => {
-  window.clearInterval(pollTimer);
+  window.clearInterval(timer);
 });
-
-void Promise.all([refresh(), loadFormOptions()]);

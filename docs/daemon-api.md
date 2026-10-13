@@ -1,14 +1,14 @@
 # Stage 29 — Extension → Rust daemon API
 
-Status: **designed, not implemented.** Stage 29 is `⬜ Not Started` in the
-runbook's status table. This document exists so the API is settled before code
-is written, following the same discipline as `docs/protocol.md`: the contract is
-recorded, then implemented, not the other way round.
+Status: **implemented; Stage 29 Passed on offline fixture acceptance.** The Rust
+daemon and thin extension client follow this contract. See `rust/README.md` for
+configuration, HTTP wire shapes, and platform limitations.
 
-The daemon is **not** built until the live gates have run. Building it first
-would put a UI on top of batch machinery that has never once been exercised
-against the real portal — the batch path's first honest run should not also be
-the first proof of two stages at once.
+Stages 15/24 established one approved ordinary session through the single Rust
+chain. That run did **not** verify live batch execution, checkpoint recovery, or
+final assessments. Stage 29 uses synthetic workers and jobs only; the former
+"first honest run" wording must not be read as a requirement to submit a live
+batch or as a claim that such a batch was verified.
 
 ## Why a daemon
 
@@ -64,10 +64,13 @@ their meaning.
 }
 ```
 
-Every field maps onto a type that already exists — `TraineeRef`,
-`SessionInput`, and the checkpoint store. `BatchProgress` is emitted exactly as
-`Messages.ts:7` declares it, including `currentTraineeName`, so the popup's
-`renderProgress` (`src/popup/main.ts:94`) needs no reworking.
+Request fields map to existing `TraineeRef`, `SessionInput`, and checkpoint
+machinery. Responses are direct JSON, not extension message envelopes.
+`BatchProgress` preserves the TypeScript field names, including optional
+`currentTraineeName`. Report/checkpoint HTTP keys are camelCase; timestamps are
+epoch-millisecond strings. Checkpoints expose `inFlight` and may be `aborted`.
+The popup preserves these fields and formats timestamps without maintaining its
+own recovery or execution state.
 
 The status codes carry the same meanings as the CLI's exit codes, because they
 answer the same questions:
@@ -112,8 +115,10 @@ job is to display and to send intent.
 **5. Localhost is a real attack surface.** Any page in any browser on the
 machine can reach `127.0.0.1`. The measures:
 
-- **Token**: 32+ bytes of CSPRNG output (`uuid::Uuid::new_v4` twice is 244 bits),
-  generated on first run and written to a `0600` file beside the profile. The
+- **Token**: 32 bytes / 256 bits of CSPRNG output from `/dev/urandom`,
+  hex-encoded on first run and written to an owned `0600` file beside the profile.
+  Symlinks, hardlinks, unsafe permissions and malformed files are refused.
+  `dssp.daemon.token` is gitignored; the token value is never logged or returned. The
   operator pastes it into the extension once; the extension stores it in its own
   storage. There is deliberately **no auto-discovery** — a discovery mechanism
   would hand the token to anything that could read it.
@@ -161,6 +166,36 @@ native messaging rejected.
 - The security measures above are tested, not asserted: a request with no token,
   a request with a foreign `Origin`, and a request with a simple content type
   are each rejected.
+
+## Offline acceptance results
+
+- `cargo test --offline`: **193 passed** (189 coordinator/loopback tests,
+  including 27 daemon tests; 4 fixture-backed binary/CLI integration tests).
+- `cargo clippy --offline --all-targets -- -D warnings`: passed.
+- `pnpm typecheck`: passed; `pnpm test`: **223 passed**.
+- Recovery refusal is driven over HTTP and produces `409` with zero worker
+  starts. Explicit resume, ignored `DSSP_RESUME`, concurrent admission, responsive
+  polling, request caps/timeouts, malformed framing, authentication and Origin
+  rejection are exercised. Worker teardown retains admission until shutdown;
+  panic/error paths release connection slots and preserve uncertain checkpoints.
+- The active extension no longer imports the TypeScript engine, stores execution
+  state, or injects portal content scripts. It stores only manually supplied
+  connection settings; it never starts the daemon or retries batch admission.
+- An existing legacy forwarding test was corrected to call each adapter with its
+  actual typed arguments; no legacy production portal behavior was changed.
+
+## Remaining operational limits
+
+- Token-file hardening is Linux-specific. Installed-browser Origin/permission
+  behavior and Firefox remain later integration/browser checks, not claims made
+  by mocked-fetch tests.
+- Do not run another CLI/daemon against the same profile/checkpoint concurrently:
+  no cross-process ownership lock exists. Only the checkpoint survives restart;
+  in-memory progress/report reset and the start guard reads the durable file.
+- Worker shutdown has no deadline; a stuck worker retains admission (fails
+  closed). The 16-handler cap limits resource use but does not promise polling
+  availability during saturation.
+- Stage 29 does not establish live batch safety or final-assessment support.
 
 ## Not in this design
 

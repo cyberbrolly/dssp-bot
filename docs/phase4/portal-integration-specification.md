@@ -133,13 +133,17 @@ authenticated GET of a real training form and scrapes the returned HTML.
 
 The table below describes the **Python migration worker**, including the local
 `IsSuccessful` / HTTP-status correction following `d8b0588`.
-These are fixture-verified rules, not proof of the real portal's response format.
+The ordinary-session success rule was verified against one explicitly approved
+live run on 2026-10-05: HTTP 200, JSON boolean `IsSuccessful: true`, no Location,
+Rust confirmed / exit 0, and exactly one matching new history entry after
+read-only reconciliation. Other response rules remain fixture-verified;
+no live duplicate-response contract has been established.
 The legacy TypeScript adapter still contains the broader text/empty-response/
 redirect heuristics; this Python-only fix did not change that implementation.
 
 | Outcome              | Selector or signal                                                                                            | Notes                     |
 | -------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| Success confirmation | HTTP 2xx and boolean JSON `IsSuccessful: true` (`success`/`Success` retained), after login, non-login 3xx, and rejection checks | Client-side contract supplied by operator; live POST response still missing |
+| Success confirmation | HTTP 2xx and boolean JSON `IsSuccessful: true` (`success`/`Success` retained), after login, non-login 3xx, and rejection checks | Client contract and one approved live success response verified; raw evidence private |
 | Validation error | `.validation-summary-errors`, `.field-validation-error`, recognized JSON success flag `false`, or HTTP `4xx` | Returned as rejected unless login or non-login 3xx takes precedence |
 | Duplicate record | No verified structured duplicate-response contract exists | Generic duplicate wording alone is indeterminate; it does not override explicit boolean success |
 | Session expired | Login URL or login form selector | Stops the batch; POST-response detection sets `proves_nothing_submitted=false` |
@@ -152,8 +156,9 @@ empty HTTP 200/204 response, or a redirect without confirmation is not success.
 Absent another recognized outcome, the worker returns `indeterminate`, which
 stops automatic resubmission.
 
-Before using the fix on the real portal, establish its actual success-response
-format from private evidence tied to a verified successful record. If it uses
+The approved live run established the ordinary-session JSON success-response
+format from private evidence tied to a verified successful record. This does
+not authorize another submission or establish other response formats. If it uses
 HTML, support only a verified confirmation signal and add regression tests;
 otherwise leave that response `indeterminate`. Do not replay an unconfirmed
 submission to discover the response format.

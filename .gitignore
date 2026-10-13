@@ -9,6 +9,9 @@ __pycache__/
 python/.pw-profile/
 python/.auth/
 
+# Local daemon bearer secret (also covers custom profile parent directories)
+dssp.daemon.token
+
 # Live-gate evidence dumps (raw portal HTML: trainee data + antiforgery tokens)
 python/.evidence/
 

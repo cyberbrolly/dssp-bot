@@ -172,6 +172,119 @@ No row here exits 1: that code means the coordinator never reached a submission
 there is no classified line to print. A session that lapses *mid-run* is a
 `HALT: SESSION_EXPIRED` and exits 3, as above.
 
+## Stage 29: loopback daemon
+
+The CLI above remains unchanged. `cargo run --offline -- --daemon` selects the
+HTTP bridge; the extension never starts or owns this process. Starting a daemon
+alone does not start a worker. Authenticated `/form-options` reads and admitted
+`/batch` requests can start the configured Python worker and contact the portal;
+**do not use production requests as tests**.
+
+Example configuration (replace the extension origin with the installed ID):
+
+```sh
+DSSP_DAEMON_ORIGINS=chrome-extension://your-extension-id cargo run --offline -- --daemon
+```
+
+| variable | default | daemon meaning |
+|---|---|---|
+| `DSSP_DAEMON_PORT` | `8765` | TCP port, `1..65535`; bind is always `127.0.0.1` |
+| `DSSP_DAEMON_ORIGINS` | required | comma-separated **exact** `chrome-extension://id` / `moz-extension://uuid` origins; no whitespace, paths or wildcards |
+| `DSSP_PROFILE_DIR` | `.pw-profile` relative to `python/` | same profile location the worker uses; token is `dssp.daemon.token` beside this directory |
+| `DSSP_CHECKPOINT` | `./dssp.checkpoint.json` | existing checkpoint slot; relative paths use the daemon's working directory |
+| `DSSP_WORKER_PY` | existing worker default | unchanged interpreter override |
+| `DSSP_RESUME` | ignored | startup logs that it is ignored if present; only HTTP `resume` acknowledges recovery |
+
+The profile's parent directory must already exist. On first startup the Linux
+daemon obtains **32 bytes / 256 bits** from `/dev/urandom`, hex-encodes them,
+and creates an owned regular token file with mode `0600`. Later starts reuse it.
+Unsafe permissions, symlinks, hardlinks and malformed token files fail closed.
+The token value is never logged or returned over HTTP. Manually paste the file's
+contents into extension storage; there is no discovery endpoint. This
+implementation's token checks use Linux `/proc/self` and Linux open flags;
+non-Linux daemon portability is not established.
+
+### Extension interface
+
+Base URL: `http://127.0.0.1:8765` (or the configured port). Every request requires
+`Authorization: Bearer <token>`. An absent `Origin` is accepted with a valid
+token; a supplied origin must exactly match the configured allowlist. Responses
+are **direct JSON**, not `{success,data}` messaging envelopes. No CORS allow
+headers are emitted and `OPTIONS` is unsupported.
+
+| method/path | response |
+|---|---|
+| `GET /status` | `200` + `BatchProgress` |
+| `GET /report` | `200` + latest in-memory report, or `null` |
+| `GET /checkpoint` | `200` + durable checkpoint, or `null`; corrupt storage is `500` |
+| `GET /form-options` | `200` + `{instructors: [{value,label}], trainingTypes: [{value,label}]}` |
+| `POST /batch` | `202` + `{batchId}`; recovery refusal `409`; invalid/unresolvable input `422`; active worker `503` |
+| `POST /batch/pause`, `/batch/resume`, `/batch/stop` | `405` (Stages 30/31 unsupported) |
+
+Unknown methods/paths return `405`. Authentication failures are `401`, foreign
+origins `403`, non-JSON batch content types `415`, malformed HTTP `400`, excessive
+headers/bodies `413`, and request read timeout `408`. Worker startup/session/list
+failures return `502`. All errors have shape `{error: string}`. Admission resolves
+the whole roster before returning `202`; no submissions happen on a `422` path.
+A `202` is not submission confirmation; poll status and inspect the report.
+
+`POST /batch` requires `Content-Type: application/json` and this body:
+
+```json
+{
+  "trainees": [{"id": "123"}, {"name": "Jane Roe"}],
+  "session": {
+    "training_date": "2026-09-14",
+    "instructor": "Jane Smith",
+    "training_type": "Practical"
+  },
+  "resume": false
+}
+```
+
+`resume` must be a JSON boolean (omitted means `false`). Explicit `true` uses the
+predecessor's never-attempted roster, not the requested trainees; the operator
+must supply the original session template because the checkpoint does not store
+it. `recovery::guard` runs before any worker creation, including handshake.
+Settled/possibly submitted trainees are carried, never requeued.
+
+`/status` uses the exact TS `BatchProgress` names: `state`, `total`, `processed`,
+`successful`, `failed`, `skipped`, `indeterminate`, `remaining`, and optional
+`currentTraineeName`. Checkpoint writes drive progress during execution; the
+worker's internal browser/form phases are not separately exposed. Report and
+checkpoint keys are camelCase on HTTP and unchanged snake_case on disk/CLI.
+Timestamps remain **epoch-millisecond strings**, not the legacy TS ISO format.
+HTTP checkpoints additionally include `inFlight` and may have status `aborted`;
+reports include `aborted`. Consumers must preserve those recovery semantics.
+`batchId` is an admission identifier, not a durable checkpoint field.
+
+The batch runs on its own thread; status stays available during worker admission
+and execution. Another batch or form-options worker is refused with `503`.
+HTTP/1.1 parsing rejects duplicate headers, transfer encoding (including chunked),
+`Expect`, folded/control-character headers and ambiguous lengths. Request bodies
+are capped at 64 KiB, headers at 16 KiB, with a two-second total read deadline.
+Connections close after one response; pipelining is not supported. At most 16
+connection handlers run at once; excess connections are closed.
+
+Only the checkpoint survives daemon restart: `/status` begins idle and `/report`
+returns null, while `/checkpoint` still exposes the durable predecessor and the
+start guard protects it. Do not run a CLI batch and daemon, or multiple daemons,
+against the same profile/checkpoint concurrently: there is no cross-process
+ownership lock. Graceful pause/stop/shutdown controls are out of Stage 29 scope.
+
+### Offline verification
+
+```sh
+cargo test --offline
+cargo clippy --offline --all-targets -- -D warnings
+```
+
+The socket tests inject fixture transports. Binary/CLI integration tests always
+set `DSSP_WORKER_PY` to `tests/fixtures/worker.py`, which reads only synthetic JSON
+and never imports `app.worker`, launches a browser, or opens a network. All
+mutable fixture input, tokens, checkpoints and protocol traces live in temporary
+scratch directories, not operator job/evidence/marker locations.
+
 ## Safety
 
 - An **indeterminate** submission is never retried automatically.

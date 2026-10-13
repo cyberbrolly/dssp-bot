@@ -13,7 +13,50 @@
       </header>
 
       <section class="section">
+        <h2>Daemon connection</h2>
+        <label for="daemon-port">127.0.0.1 port</label>
+        <input
+          id="daemon-port"
+          type="number"
+          min="1"
+          max="65535"
+          step="1"
+          value="8765"
+        />
+        <label for="daemon-token">Daemon token (paste manually)</label>
+        <input
+          id="daemon-token"
+          type="password"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="save-daemon" type="button">Save and connect</button>
+        <p id="connection" class="status" role="status"></p>
+        <div id="daemon-help">
+          <p>
+            Start manually from the repository's <code>rust/</code> directory:
+          </p>
+          <pre id="daemon-command"></pre>
+          <p>
+            Allow this exact extension origin:
+            <code id="extension-origin"></code>.
+          </p>
+          <p>
+            Paste the token from the file reported by the daemon. No
+            auto-discovery or auto-start. Do not run CLI batches or other
+            daemons against the same profile/checkpoint.
+          </p>
+        </div>
+      </section>
+
+      <section class="section">
         <h2>Session</h2>
+        <button id="load-options" type="button" disabled>
+          Load form options
+        </button>
+        <p class="muted">
+          This explicit request may start the Python worker and contact DSSP.
+        </p>
 
         <label for="instructor">Instructor</label>
         <select id="instructor" disabled>
@@ -63,15 +106,36 @@
 
       <section class="controls">
         <button id="start" type="button">Start batch</button>
-        <button id="pause" type="button" disabled>Pause</button>
-        <button id="resume" type="button" disabled>Resume</button>
-        <button id="stop" type="button" disabled>Stop</button>
+        <button
+          id="pause"
+          type="button"
+          disabled
+          title="Stage 30 — not supported"
+        >
+          Pause (reserved)
+        </button>
+        <button
+          id="resume"
+          type="button"
+          disabled
+          title="Stage 30 — not supported"
+        >
+          Resume (reserved)
+        </button>
+        <button
+          id="stop"
+          type="button"
+          disabled
+          title="Stage 31 — not supported"
+        >
+          Stop (reserved)
+        </button>
       </section>
 
       <p id="status" class="status" role="status"></p>
 
       <section id="recovery-section" class="section" hidden>
-        <h2>Interrupted batch</h2>
+        <h2>Daemon checkpoint / recovery</h2>
         <p id="recovery" class="muted"></p>
       </section>
 

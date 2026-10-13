@@ -158,3 +158,18 @@ button:disabled {
   color: var(--muted);
   margin: 0;
 }
+
+pre,
+code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#daemon-help {
+  color: var(--muted);
+}
+
+#save-daemon,
+#load-options {
+  margin-top: 6px;
+}

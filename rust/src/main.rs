@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 mod checkpoint;
+mod daemon;
 mod decision;
 mod engine;
 mod protocol;
@@ -214,7 +215,7 @@ fn resolve_against(
 ///
 /// Needs an authenticated session — the caller establishes one first.
 fn resolve_trainees(
-    client: &mut WorkerClient,
+    client: &mut impl engine::Transport,
     trainees: &[TraineeRef],
 ) -> Result<Vec<TraineeRef>, ResolveFailure> {
     let resp = client
@@ -241,6 +242,13 @@ fn resolve_trainees(
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| "job.json".to_string());
+    if path == "--daemon" {
+        if let Err(error) = daemon::run() {
+            eprintln!("dssp-bot: {error}");
+            exit(1);
+        }
+        return;
+    }
     let job: Job = match fs::read_to_string(&path)
         .map_err(|e| e.to_string())
         .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
