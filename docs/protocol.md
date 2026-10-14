@@ -16,8 +16,10 @@ Wire protocol between the **Rust coordinator** and the **Python worker**.
   {"v":1,"status":"ready"}
   ```
 
-- Rust closes stdin to shut the worker down; the worker exits 0 after closing
-  its browser context.
+- Rust closes stdin for normal shutdown; a cooperative worker exits after closing
+  its browser context. Rust allows a bounded EOF grace, then kills/reaps the direct
+  worker if needed. That does not guarantee browser-descendant cleanup or rollback
+  of a delivered POST. See the supervision section below.
 
 ## Envelope
 
@@ -41,7 +43,10 @@ or
  "proves_nothing_submitted":true|false}
 ```
 
-**`job_id` is echoed on every response** and must stay consistent end to end.
+**`job_id` and `op` are echoed on every response** and validated by Rust.
+A returned trainee ID, when supplied alongside an explicitly requested ID, must
+match it. Name selectors and omitted trainee payloads retain their existing
+behavior. A mismatched response is not accepted as submission confirmation.
 
 **`v` is compared, not assumed.** Rust reads the version off every response and
 refuses one that is not its own — including the `ready` handshake. The reason is
@@ -56,7 +61,8 @@ so the request was processed and the submission may have landed.
 
 - **Python reports what happened; Rust decides what to do about it.** The worker
   never retries, never resubmits, never decides retryability.
-- `proves_nothing_submitted` is a hint computed from the error code (see table).
+- `proves_nothing_submitted` is a hint computed from error code and submission
+  phase (see table).
   When `true`, the failure occurred before anything could reach the portal, so
   re-invoking the op is safe. When `false` (e.g. `NETWORK`, `TIMEOUT`,
   `PORTAL_UNAVAILABLE`), the request may have landed — Rust must treat it like an
@@ -66,6 +72,24 @@ so the request was processed and the submission may have landed.
   prepare (GET + parse) → commit (single POST) → classify, and reports the
   classified outcome. It is never re-invoked for the same trainee by Rust
   unless the failure proves nothing was submitted.
+
+## Worker supervision and poisoned clients
+
+Rust bounds the ready-line wait (`DSSP_WORKER_READY_TIMEOUT_MS`, default `10000`),
+one-response wait after writing (`DSSP_WORKER_RESPONSE_TIMEOUT_MS`, `360000`), and
+normal EOF shutdown grace (`DSSP_WORKER_SHUTDOWN_TIMEOUT_MS`, `2000`). All values
+must be positive integer milliseconds and representable deadlines; invalid
+configuration refuses worker spawn. These are coordinator settings, not portal
+request timeouts. Increasing manual-login/navigation limits may require reviewing
+the response timeout.
+
+Timeout, malformed response or transport/protocol failure invalidates the client;
+stdin/response receiver are closed and later sends fail before writing. There is
+no automatic restart, late-reply reuse or request resend. Mid-submit failures
+remain indeterminate and halt; a deadline is not proof of non-delivery. Stdin
+writes themselves are synchronous/unbounded, and direct-child termination does
+not prove browser cleanup or portal rollback. The offline matrix and limitations
+are recorded in [Stage 32 error testing](stage32-error-testing.md).
 
 ## Operations
 

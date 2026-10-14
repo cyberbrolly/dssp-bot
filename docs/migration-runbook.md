@@ -23,6 +23,41 @@ run).
    explicit commit approval; pushing or opening/updating a PR also requires
    authorization. Real-portal submissions require separate explicit approval.
 
+## Stage 32 — offline error-boundary acceptance
+
+**Passed for the documented synthetic failure matrix; no live verification.**
+See [Stage 32 error testing](stage32-error-testing.md) for cases and limitations.
+
+- Added subprocess tests for startup/spawn failure, malformed/version/echo errors,
+  EOF, unexpected outcomes/status, missing/false delivery proof, safe bounded
+  retries, rejection continuation, silent/late workers, and hung shutdown.
+  Unsafe submits halt with requested provenance, no retry/later trainee, and
+  checkpoint refusal before another worker start.
+- Two failing-before regressions demonstrated false success when response `op`
+  or an explicitly requested trainee ID mismatched. `WorkerClient` now validates
+  those existing protocol fields; optional trainee payloads/name selectors remain
+  compatible. No new portal contract or duplicate heuristic was invented.
+- Added positive-integer Rust worker supervision settings: ready wait `10000 ms`,
+  per-response wait `360000 ms`, EOF grace `2000 ms`. Timeout/protocol failure
+  invalidates the client before future writes or late-reply consumption. EOF grace
+  is followed by direct-worker kill/reap, not request replay or portal rollback.
+- Python adds 48 fault cases: independent evidence-write failures, GET/form faults
+  before POST, unsafe/redirect response classification, post-response exceptions
+  and body-read failures with false delivery proof. Exactly-once/no-POST assertions
+  remain explicit; no application changes were needed in these tested paths.
+- Full validation: Rust **250 passed** (216 coordinator/loopback plus 34 fixture
+  binary/CLI); Rustfmt and Clippy `-D warnings` passed; Python **356 passed**;
+  `pnpm typecheck` passed; TypeScript **313 passed**. Existing Stage 29–31 security,
+  checkpoint, pause/stop and UI error tests remain green. `git diff --check` passed.
+- Limits: stdin writes lack a deadline; this is not an end-to-end job timeout.
+  Direct-child termination does not prove browser-descendant cleanup/profile
+  release, OS cleanup success or rollback of delivered records. Reader/output
+  resource bounds, cross-process ownership and installed-browser behavior remain
+  later security/integration work. No live batch/recovery/final-assessment claim.
+- Stage 31 is preserved in `04616f2`; Stage 32 changes remain uncommitted. No
+  private evidence/jobs/attempt markers were touched. Next: **33 — Full integration**
+  (**Gate 4**, not started; no automatic live authorization).
+
 ## Stage 31 — offline cooperative Stop acceptance
 
 **Passed on synthetic jobs, fixture workers and mocked UI tests only.**
@@ -212,7 +247,7 @@ run through Rust → Python → Playwright → DSSP → Python → Rust, revisio
 | 29 | Extension → Rust          | 🟢 Passed     | 193 Rust fixture tests; Clippy; pnpm typecheck; 223 TS tests | Guarded loopback daemon + stateless extension; offline acceptance only |
 | 30 | Pause                     | 🟢 Passed     | 205 Rust tests; Clippy; pnpm typecheck; 256 TS tests | Durable safe-boundary pause + same-worker resume; offline fixtures only |
 | 31 | Stop                      | 🟢 Passed     | 215 Rust tests; fmt/Clippy; pnpm typecheck; 313 TS tests | Latched cooperative stop; no later attempts/retries; offline fixtures only |
-| 32 | Error testing             | ⬜ Not Started | failure scenarios               | many paths already covered |
+| 32 | Error testing             | 🟢 Passed     | 250 Rust; 356 Python; 313 TS; typecheck/fmt/Clippy | Offline failure matrix, echo/identity fixes, bounded response/EOF supervision |
 | 33 | Full integration          | ⬜ Not Started | multi-layer test                | **Gate 4** |
 | 34 | Remove old TS automation  | ⬜ Not Started | build + tests                   | **not before this stage** |
 | 35 | Security review           | ⬜ Not Started | credential scan                 | design measures already in place |
@@ -1126,7 +1161,7 @@ them, designed but deliberately unbuilt.
 ## Migration Progress Summary
 
 ```text
-Completed:  32 / 40
+Completed:  33 / 40
 In Progress: 0
 Failed:      0
 Blocked:     0
@@ -1150,8 +1185,9 @@ Hard gates — do not continue past them until they pass.
 The order the work follows, not a list of what is outstanding: 10 and 25–28 are
 already Passed (see the status table above). Stages 15/24 are now Passed after
 one approved live submission and read-only reconciliation on 2026-10-05.
-Stages 29–31 passed offline fixture acceptance. Stage 32 (error testing) is next;
-batch recovery was not tested live.
+Stages 29–32 passed offline fixture acceptance. Stage 33 (full integration,
+Gate 4) is next; no live authorization is implied. Batch recovery was not tested
+live.
 
 ```text
 10  Real DSSP session

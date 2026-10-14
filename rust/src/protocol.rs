@@ -125,7 +125,7 @@ pub struct TraineeResolved {
 }
 
 /// A parsed worker response. Field-level options keep deserialization robust
-/// against ops we never asked about; `job_id` echoing is enforced by
+/// against ops we never asked about; `job_id` and `op` echoing are enforced by
 /// [`crate::worker::WorkerClient::send`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct Response {

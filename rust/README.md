@@ -153,8 +153,33 @@ rather than resumed.
 | `DSSP_LOGIN_TIMEOUT_MS` | `300000` | how long to wait for manual login |
 | `DSSP_NAV_TIMEOUT_MS` | `30000` | per-request timeout |
 | `DSSP_WORKER_PY` | `../python/.venv/bin/python` | worker interpreter |
+| `DSSP_WORKER_READY_TIMEOUT_MS` | `10000` | startup ready-line wait |
+| `DSSP_WORKER_RESPONSE_TIMEOUT_MS` | `360000` | one-response wait after request write; accommodates manual login |
+| `DSSP_WORKER_SHUTDOWN_TIMEOUT_MS` | `2000` | EOF grace before direct-worker kill/reap |
 | `DSSP_CHECKPOINT` | `dssp.checkpoint.json` beside the job | where batch state is written |
 | `DSSP_RESUME` | unset | `1`/`true`/`yes`/`on` = continue an interrupted batch; anything else means no |
+
+### Stage 32: worker failure supervision
+
+Timeout overrides must be positive integer milliseconds and fit a representable
+deadline; invalid configuration is rejected before worker spawn. Rust validates
+version, job-ID/operation echoes and any returned identity against an explicit
+requested trainee ID. Transport/protocol failure or response timeout poisons the
+client: later sends cannot write or consume late replies. Mid-submit failure is
+possibly delivered and halts without retry; no replacement worker is started.
+
+Shutdown closes stdin, allows the configured grace, then kills/reaps the direct
+worker. This does not guarantee browser-descendant cleanup or rollback of a POST.
+Stdin writes remain synchronous/unbounded, and detached pipe readers can outlive
+the direct child when descendants keep handles. The response timer is not a full
+job deadline. Review it when increasing portal login/navigation timeouts.
+
+Offline Stage 32 validation: **250 Rust tests passed** (216 coordinator/loopback,
+34 binary/CLI); formatting and Clippy with warnings denied passed. Startup/submit
+fault matrices, silent/late workers and EOF-ignoring shutdown are exercised with
+synthetic fixtures. See [the failure matrix](../docs/stage32-error-testing.md)
+for coverage, regression evidence and remaining limits. No live batch or recovery
+acceptance is claimed.
 
 ## Result & exit codes
 

@@ -295,16 +295,19 @@ execution still has no controller and retains its existing behavior.
 - Do not run another CLI/daemon against the same profile/checkpoint concurrently:
   no cross-process ownership lock exists. Only the checkpoint survives restart;
   in-memory progress/report reset and the start guard reads the durable file.
-- Worker shutdown has no deadline; a stuck worker retains admission (fails
-  closed). The 16-handler cap limits resource use but does not promise polling
-  availability during saturation.
+- Stage 32 adds ready/response waits and a bounded EOF shutdown grace before
+  killing/reaping the direct worker. Stdin writes still lack a deadline; killing
+  the worker does not guarantee browser-descendant cleanup or profile release.
+  See [the error matrix](stage32-error-testing.md). The 16-handler cap limits
+  resource use but does not promise polling availability during saturation.
 - Stage 29 does not establish live batch safety or final-assessment support.
 
 ## Not in this design
 
-- **Forced cancellation/termination.** Stop is cooperative: it does not interrupt
-  a worker request already admitted or undo a portal record. Hung requests and
-  worker shutdown still need manual investigation, never blind restart/replay.
+- **Portal cancellation/rollback.** Stop remains cooperative: it does not cancel
+  an admitted request or undo a portal record. Rust supervision may terminate a
+  nonresponsive direct worker after its timeout/grace, but a possibly delivered
+  POST still needs manual investigation, never blind restart/replay.
 - **Push instead of poll.** The popup polls `/status` while it is open. A push
   channel is a WebSocket by another name and was rejected with it; if polling
   proves too coarse, that decision can be revisited on its own merits.

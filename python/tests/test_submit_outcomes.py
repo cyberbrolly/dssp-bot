@@ -441,7 +441,7 @@ def test_response_capture_allowlists_metadata_without_logging_secrets(
 
 
 @pytest.mark.parametrize("status", [200, 302, 500])
-@pytest.mark.parametrize("failure", ["playwright", "decode", "preflight-coded"])
+@pytest.mark.parametrize("failure", ["playwright", "decode", "preflight-coded", "session-expired"])
 def test_body_read_failure_preserves_metadata_and_worker_reports_possibly_delivered(
     client, tmp_path, monkeypatch, caplog, status, failure
 ):
@@ -457,6 +457,7 @@ def test_body_read_failure_preserves_metadata_and_worker_reports_possibly_delive
         "playwright": PlaywrightError("SYNTHETIC-PRIVATE-READ-ERROR"),
         "decode": UnicodeError("SYNTHETIC-PRIVATE-READ-ERROR"),
         "preflight-coded": e.element_not_found("SYNTHETIC-PRIVATE-READ-ERROR"),
+        "session-expired": e.session_expired(),
     }
     read_attempts = []
 
