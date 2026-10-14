@@ -13,6 +13,7 @@ import { parseTraineeInput } from "../core/shared/parseTraineeInput";
 import {
   readDaemonView,
   pauseSummary,
+  stopSummary,
   recoverySummary,
   reportSummary,
   sessionLocked,
@@ -76,20 +77,29 @@ function status(text: string, error = false): void {
 }
 function controls(): void {
   const state = progress?.state ?? "unknown";
+  const stopping = !!progress?.stopRequested;
+  // A terminal stop latch is not permission to overwrite a recovery checkpoint.
+  // Only fresh Rust progress (new external admission/restart) clears this UI lock.
   const locked =
-    !connected || busy || sessionLocked(state) || !!progress?.pauseRequested;
+    !connected ||
+    busy ||
+    sessionLocked(state) ||
+    !!progress?.pauseRequested ||
+    stopping;
   // Initializing also covers admission, before Rust installs its controller.
   const active = ["loading_trainee", "submitting", "retrying"].includes(state);
   ui.pause.disabled =
-    !connected || busy || !active || !!progress?.pauseRequested;
+    !connected || busy || stopping || !active || !!progress?.pauseRequested;
   ui.resume.disabled =
     !connected ||
     busy ||
+    stopping ||
     !(
       (state === "paused" && progress?.pauseRequested !== false) ||
       (active && progress?.pauseRequested)
     );
-  ui.stop.disabled = true;
+  ui.stop.disabled =
+    !connected || busy || stopping || !(active || state === "paused");
   ui.start.disabled = locked || !optionsReady;
   ui.loadOptions.disabled = locked;
   ui.instructor.disabled = locked || !optionsReady;
@@ -153,9 +163,9 @@ async function refresh(): Promise<void> {
       return;
     connected = true;
     progress = view.progress;
-    const pause = pauseSummary(progress);
-    ui.pauseStatus.hidden = pause === null;
-    ui.pauseStatus.textContent = pause ?? "";
+    const intent = stopSummary(progress) ?? pauseSummary(progress);
+    ui.pauseStatus.hidden = intent === null;
+    ui.pauseStatus.textContent = intent ?? "";
     ui.connection.textContent =
       "Daemon connected. Rust owns execution and recovery.";
     ui.help.hidden = true;
@@ -167,7 +177,11 @@ async function refresh(): Promise<void> {
       view.progress.currentTraineeName ?? "No current trainee reported";
     ui.reportSection.hidden = view.report === null;
     ui.report.textContent = view.report ? reportSummary(view.report) : "";
-    const recovery = recoverySummary(view.checkpoint, view.progress);
+    const recovery = recoverySummary(
+      view.checkpoint,
+      view.progress,
+      view.report,
+    );
     ui.recoverySection.hidden = recovery === null;
     ui.recovery.textContent = recovery ?? "";
     controls();
@@ -191,7 +205,7 @@ function refreshAfterRequest(): void {
   void refresh();
 }
 
-function control(action: "pause" | "resume"): void {
+function control(action: "pause" | "resume" | "stop"): void {
   if (!client || busy || ui[action].disabled) return;
   const requestedClient = client;
   busy = true;
@@ -199,12 +213,14 @@ function control(action: "pause" | "resume"): void {
   status(
     action === "pause"
       ? "Requesting pause at Rust's safe boundary; this does not cancel an in-flight POST."
-      : "Requesting resume of the same in-memory batch (or cancellation of pending pause), not checkpoint recovery.",
+      : action === "resume"
+        ? "Requesting resume of the same in-memory batch (or cancellation of pending pause), not checkpoint recovery."
+        : "Requesting latched stop in Rust; this does not cancel an in-flight POST or its settlement. Pause and Resume cannot cancel stop.",
   );
   void requestedClient[action]()
     .then(() => {
       status(
-        `${action === "pause" ? "Pause" : "Resume"} request accepted. Refreshing authoritative Rust status.`,
+        `${action === "pause" ? "Pause" : action === "resume" ? "Resume" : "Stop"} request accepted. Refreshing authoritative Rust status.`,
       );
     })
     .catch((error: unknown) => {
@@ -218,6 +234,7 @@ function control(action: "pause" | "resume"): void {
 
 ui.pause.addEventListener("click", () => control("pause"));
 ui.resume.addEventListener("click", () => control("resume"));
+ui.stop.addEventListener("click", () => control("stop"));
 
 ui.save.addEventListener("click", () => {
   void (async () => {
@@ -246,7 +263,7 @@ ui.save.addEventListener("click", () => {
 });
 
 ui.loadOptions.addEventListener("click", () => {
-  if (!client || busy) return;
+  if (!client || busy || ui.loadOptions.disabled) return;
   const requestedClient = client;
   busy = true;
   controls();

@@ -23,6 +23,39 @@ run).
    explicit commit approval; pushing or opening/updating a PR also requires
    authorization. Real-portal submissions require separate explicit approval.
 
+## Stage 31 — offline cooperative Stop acceptance
+
+**Passed on synthetic jobs, fixture workers and mocked UI tests only.**
+
+- Authenticated JSON `{}` `POST /batch/stop` returns `200` raw progress with a
+  one-way `stopRequested` latch. Repeated pending Stop is idempotent; Pause/Resume
+  cannot undo it (`409`). Idle/finished/form-options/admission-before-controller
+  requests are refused without worker creation. Security and request limits are
+  unchanged.
+- Already admitted attempts settle without cancellation. No later submit attempt
+  is admitted after Stop, including retries. Stop interrupts retry backoff and
+  wakes paused execution; actual outcomes and attempt counts remain truthful.
+  Never-attempted trainees become ordered zero-attempt operator-stop skips.
+- Stop boundary and terminal aborted checkpoints must persist; failures halt
+  without later submissions or a fabricated successful report. Status polling
+  remains responsive. Stop-vs-completion ordering preserves last-row outcomes;
+  a stop that wins marks the batch aborted, even if its last trainee succeeded.
+- The thin extension sends Stop once and polls Rust. Pending Stop is not presented
+  as terminal stopped; latched controls/session edits/new Start stay locked.
+  Missing reports, errors and stale/reconnected views require review, not retry.
+  Controls never acknowledge checkpoint recovery or spawn replacement workers.
+- Verification: `cargo fmt --check` passed; full `cargo test --offline`
+  **215 passed** (211 unit/loopback plus 4 fixture binary/CLI tests); Clippy with
+  `-D warnings` passed; `pnpm typecheck` passed; `pnpm test` **313 passed** across
+  20 files. The full Rust inventory completed in one run; earlier split runs
+  were also successful. Fixtures cover stop during blocked attempts, pause and
+  backoff, no duplicates/retries, checkpoint failures, completion/controller races,
+  explicit-only recovery and UI no-retry/error handling.
+- No live portal requests/submissions, private evidence/job/attempt-marker changes,
+  or claims of live batch/recovery/final-assessment verification. Linux,
+  single-process ownership, connection-cap and unbounded shutdown limits remain.
+- Changes remain uncommitted. Next stage: **32 — Error testing** (not started).
+
 ## Stage 30 — offline pause/resume acceptance
 
 **Passed on synthetic jobs, fixture workers and mocked UI tests only.**
@@ -178,7 +211,7 @@ run through Rust → Python → Playwright → DSSP → Python → Rust, revisio
 | 28 | Recovery                  | 🟢 Passed     | `cargo test` (162) + clippy     | **Gate 3** — in-flight record + start gate; independent panel run, 5 defects fixed; the deferred one decided and fixed 2026-09-29 (follow-up), with a second panel over that fix |
 | 29 | Extension → Rust          | 🟢 Passed     | 193 Rust fixture tests; Clippy; pnpm typecheck; 223 TS tests | Guarded loopback daemon + stateless extension; offline acceptance only |
 | 30 | Pause                     | 🟢 Passed     | 205 Rust tests; Clippy; pnpm typecheck; 256 TS tests | Durable safe-boundary pause + same-worker resume; offline fixtures only |
-| 31 | Stop                      | ⬜ Not Started | stop test                       | abort path exists |
+| 31 | Stop                      | 🟢 Passed     | 215 Rust tests; fmt/Clippy; pnpm typecheck; 313 TS tests | Latched cooperative stop; no later attempts/retries; offline fixtures only |
 | 32 | Error testing             | ⬜ Not Started | failure scenarios               | many paths already covered |
 | 33 | Full integration          | ⬜ Not Started | multi-layer test                | **Gate 4** |
 | 34 | Remove old TS automation  | ⬜ Not Started | build + tests                   | **not before this stage** |
@@ -1093,7 +1126,7 @@ them, designed but deliberately unbuilt.
 ## Migration Progress Summary
 
 ```text
-Completed:  31 / 40
+Completed:  32 / 40
 In Progress: 0
 Failed:      0
 Blocked:     0
@@ -1117,7 +1150,7 @@ Hard gates — do not continue past them until they pass.
 The order the work follows, not a list of what is outstanding: 10 and 25–28 are
 already Passed (see the status table above). Stages 15/24 are now Passed after
 one approved live submission and read-only reconciliation on 2026-10-05.
-Stages 29/30 passed offline fixture acceptance. Stage 31 (stop) is next;
+Stages 29–31 passed offline fixture acceptance. Stage 32 (error testing) is next;
 batch recovery was not tested live.
 
 ```text

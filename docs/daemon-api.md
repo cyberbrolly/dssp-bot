@@ -1,6 +1,6 @@
 # Stage 29 — Extension → Rust daemon API
 
-Status: **implemented; Stages 29/30 Passed on offline fixture acceptance.** The Rust
+Status: **implemented; Stages 29–31 Passed on offline fixture acceptance.** The Rust
 daemon and thin extension client follow this contract. See `rust/README.md` for
 configuration, HTTP wire shapes, and platform limitations.
 
@@ -48,7 +48,7 @@ their meaning.
 | `POST` | `/batch` | `START_AUTOMATION` | `202` + batch id, or `409` refusal |
 | `POST` | `/batch/pause` | `PAUSE_AUTOMATION` | `200` + raw progress with pause intent; `409` if no controllable batch |
 | `POST` | `/batch/resume` | `RESUME_AUTOMATION` | `200` + raw progress; same in-memory batch only |
-| `POST` | `/batch/stop` | `STOP_AUTOMATION` | reserved — Stage 31 |
+| `POST` | `/batch/stop` | `STOP_AUTOMATION` | `200` + raw progress with latched stop intent; `409` if no controllable batch |
 
 `POST /batch` body:
 
@@ -213,7 +213,8 @@ limits. A valid control returns `200` with raw `BatchProgress`, including
 - The popup sends intent once, then polls Rust. Session edits and new admission
   stay locked while pause is pending/active. It distinguishes pending pause,
   durable pause, and wake-up; it stores no queue/recovery state. Lost/refused
-  control requests are shown, not automatically retried. Stop remains Stage 31.
+  control requests are shown, not automatically retried. Stage 31's Stop semantics
+  are documented below; a latched stop prevents further Pause/Resume controls.
 
 ### Stage 30 acceptance results
 
@@ -230,6 +231,62 @@ limits. A valid control returns `200` with raw `BatchProgress`, including
 
 All checks are offline; no real training records were submitted for this stage.
 
+## Stage 31 — cooperative, latched stop
+
+`POST /batch/stop` requires authenticated, Origin-validated JSON `{}` and shares
+all request caps/read deadlines with Pause/Resume. It returns `200` raw progress
+with `stopRequested: true`, not a new batch ID or proof that execution has ended.
+Idle, finished/aborted, form-options work, teardown and admission before controller
+installation return `409`; malformed/nonempty control bodies return `422`.
+
+- Stop is latched for that controller. It clears pause intent, wakes a paused
+  engine, and interrupts retry backoff. Repeated pending Stop is idempotent;
+  Pause/Resume after Stop return `409` and cannot undo it. Stale controllers
+  cannot control a newly admitted batch.
+- Already admitted worker requests settle without cancellation. Submit-attempt
+  admission is serialized with Stop: no new attempts, including safe retries,
+  are admitted afterward. This does not claim that an already admitted request
+  can be cancelled before its transport call. Unknown responses still abort
+  without retry or requeue.
+- Actual outcomes and attempts remain intact. A provably-unsent transient error
+  stopped before retry remains failed with its original error context and actual
+  attempts. Never-attempted trainees become ordered zero-attempt skips with
+  `not submitted: operator stop`; counts account for the whole roster.
+- Rust persists an aborted stop boundary with settled results, ordered pending
+  IDs and null `in_flight`, then an aborted terminal checkpoint with drained skips.
+  Both writes are fatal on failure: no later submission or fabricated successful
+  report. Error progress can be stopped with a null report and only last-durable
+  counts, so human review remains necessary.
+- Stop and completion are serialized. If Stop wins, the report is aborted even
+  if the last row succeeded, preserving that success without inventing skips.
+  If completion closes first, late Stop is `409`. Requesting Stop alone never
+  publishes a terminal stopped state; status remains responsive while settling.
+- Stop intent remains visible after terminal/error progress and resets for a new
+  batch or daemon restart. Controls do not acknowledge recovery. Ordinary starts
+  over landed/uncertain work are still refused; only separately reviewed batch
+  admission with explicit `resume: true` acknowledges checkpoint recovery.
+- The thin popup sends Stop once, polls Rust, and distinguishes pending Stop from
+  terminal stopped/aborted. While Stop is latched, Pause/Resume, new Start and
+  session edits remain disabled, including terminal stopped. The UI does not
+  provide recovery admission; external reviewed admission is still guarded by
+  Rust. Missing reports and stale/disconnected views never cause auto-retry.
+
+### Stage 31 acceptance results
+
+- `cargo fmt --check`: passed; full `cargo test --offline`: **215 passed**
+  (211 coordinator/loopback plus 4 fixture binary/CLI tests).
+- `cargo clippy --offline --all-targets -- -D warnings`: passed.
+- `pnpm typecheck`: passed; `pnpm test`: **313 passed** across 20 files.
+- Deterministic fixture coverage includes blocked-request settlement exactly once,
+  no later trainee/retry, paused wake-up, interrupted backoff, irrevocable intent,
+  completion races, checkpoint-write failure, stale-controller refusal, security
+  checks and explicit-only recovery. Mocked client/UI tests cover authenticated
+  encoding, exact `200` acceptance, no automatic retry/fallback, pending/terminal
+  presentation, latched controls, stale responses, reconnect and missing reports.
+
+No live portal/browser requests or training submissions were used. Normal CLI
+execution still has no controller and retains its existing behavior.
+
 ## Remaining operational limits
 
 - Token-file hardening is Linux-specific. Installed-browser Origin/permission
@@ -245,9 +302,9 @@ All checks are offline; no real training records were submitted for this stage.
 
 ## Not in this design
 
-- **Stop** (Stage 31). `/batch/stop` remains unsupported (`405`) and the popup
-  Stop control remains disabled. No cancellation or forced worker termination
-  was added as part of Stage 30.
+- **Forced cancellation/termination.** Stop is cooperative: it does not interrupt
+  a worker request already admitted or undo a portal record. Hung requests and
+  worker shutdown still need manual investigation, never blind restart/replay.
 - **Push instead of poll.** The popup polls `/status` while it is open. A push
   channel is a WebSocket by another name and was rejected with it; if polling
   proves too coarse, that decision can be revisited on its own merits.

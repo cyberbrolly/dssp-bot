@@ -98,18 +98,20 @@ describe("stateless service-worker bridge", () => {
   });
 
   it.each([
-    ["PAUSE_AUTOMATION", "pause", "submitting", true],
-    ["RESUME_AUTOMATION", "resume", "paused", false],
+    ["PAUSE_AUTOMATION", "pause", "submitting", true, false],
+    ["RESUME_AUTOMATION", "resume", "paused", false, false],
+    ["STOP_AUTOMATION", "stop", "submitting", false, true],
+    ["STOP_AUTOMATION", "stop", "paused", false, true],
   ] as const)(
     "proxies %s from extension UI to Rust without admission, storage writes or a local engine",
-    async (type, action, state, pauseRequested) => {
+    async (type, action, state, pauseRequested, stopRequested) => {
       vi.resetModules();
       const listener = vi.fn();
       const storage = {
         get: vi.fn().mockResolvedValue({ [DAEMON_SETTINGS_KEY]: settings }),
         set: vi.fn(),
       };
-      const progress = { ...idle, state, pauseRequested };
+      const progress = { ...idle, state, pauseRequested, stopRequested };
       const fetcher = vi
         .fn<typeof fetch>()
         .mockResolvedValue(new Response(JSON.stringify(progress)));
@@ -157,7 +159,11 @@ describe("stateless service-worker bridge", () => {
     },
   );
 
-  it.each(["PAUSE_AUTOMATION", "RESUME_AUTOMATION"] as const)(
+  it.each([
+    "PAUSE_AUTOMATION",
+    "RESUME_AUTOMATION",
+    "STOP_AUTOMATION",
+  ] as const)(
     "returns %s failures once, never retrying or admitting a batch",
     async (type) => {
       for (const reply of [
@@ -165,6 +171,15 @@ describe("stateless service-worker bridge", () => {
           status: 409,
         }),
         new Response("invalid json"),
+        new Response(JSON.stringify({ ...idle, stopRequested: true }), {
+          status: 202,
+        }),
+        new Response(JSON.stringify({ success: true, data: idle })),
+        new Response(JSON.stringify({ batchId: "not-a-control-result" })),
+        ...[null, 0, 1, "true", "false", {}, []].map(
+          (stopRequested) =>
+            new Response(JSON.stringify({ ...idle, stopRequested })),
+        ),
       ]) {
         const fetcher = vi.fn<typeof fetch>().mockResolvedValue(reply);
         vi.stubGlobal("fetch", fetcher);
@@ -174,6 +189,15 @@ describe("stateless service-worker bridge", () => {
           error: expect.any(String),
         });
         expect(fetcher).toHaveBeenCalledOnce();
+        const action =
+          type === "PAUSE_AUTOMATION"
+            ? "pause"
+            : type === "RESUME_AUTOMATION"
+              ? "resume"
+              : "stop";
+        expect(fetcher.mock.calls[0]?.[0]).toBe(
+          `http://127.0.0.1:8765/batch/${action}`,
+        );
       }
       const fetcher = vi
         .fn<typeof fetch>()
@@ -186,6 +210,32 @@ describe("stateless service-worker bridge", () => {
         error: expect.stringContaining("Outcome unknown"),
       });
       expect(fetcher).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([401, 403, 409, 422, 500, 503])(
+    "preserves stop HTTP %s error details once with no alternate route or fallback",
+    async (code) => {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(
+          new Response(JSON.stringify({ error: "synthetic stop refusal" }), {
+            status: code,
+          }),
+        );
+      vi.stubGlobal("fetch", fetcher);
+      const credentials = vi.fn().mockResolvedValue(settings);
+      expect(
+        await proxyDaemonMessage({ type: "STOP_AUTOMATION" }, credentials),
+      ).toEqual({
+        success: false,
+        error: `Daemon HTTP ${code}: synthetic stop refusal`,
+      });
+      expect(credentials).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(fetcher.mock.calls[0]?.[0]).toBe(
+        "http://127.0.0.1:8765/batch/stop",
+      );
     },
   );
 

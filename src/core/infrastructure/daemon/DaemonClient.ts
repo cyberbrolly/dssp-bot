@@ -132,7 +132,9 @@ export function isDaemonProgress(value: unknown): value is BatchProgress {
     (value.currentTraineeName === undefined ||
       typeof value.currentTraineeName === "string") &&
     (value.pauseRequested === undefined ||
-      typeof value.pauseRequested === "boolean")
+      typeof value.pauseRequested === "boolean") &&
+    (value.stopRequested === undefined ||
+      typeof value.stopRequested === "boolean")
   );
 }
 function isReport(value: unknown): value is DaemonReport | null {
@@ -276,6 +278,9 @@ export class DaemonClient {
   resume(): Promise<BatchProgress> {
     return this.request("/batch/resume", isDaemonProgress, {});
   }
+  stop(): Promise<BatchProgress> {
+    return this.request("/batch/stop", isDaemonProgress, {});
+  }
   start(input: DaemonBatchInput): Promise<{ batchId: string }> {
     if (input.resume !== undefined && typeof input.resume !== "boolean")
       throw new DaemonError("resume must be a boolean.");
@@ -305,12 +310,7 @@ export async function proxyDaemonMessage(
 ): Promise<MessageResponse> {
   if (!message || typeof message.type !== "string")
     return { success: false, error: "Unsupported daemon request." };
-  if (message.type === "STOP_AUTOMATION") {
-    return {
-      success: false,
-      error: "Stop is not supported (reserved for Stage 31).",
-    };
-  }
+
   try {
     const client = new DaemonClient(await settings());
     let data: unknown;
@@ -323,6 +323,9 @@ export async function proxyDaemonMessage(
         break;
       case "RESUME_AUTOMATION":
         data = await client.resume();
+        break;
+      case "STOP_AUTOMATION":
+        data = await client.stop();
         break;
       case "GET_REPORT":
         data = await client.report();

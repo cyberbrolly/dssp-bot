@@ -172,7 +172,8 @@ fn progress(
     let mut value = json!({"state": state, "total": total, "processed": results.len(),
         "successful": count(Outcome::Success), "failed": count(Outcome::Failed),
         "skipped": count(Outcome::Skipped), "indeterminate": count(Outcome::Indeterminate),
-        "remaining": total.saturating_sub(results.len()), "pauseRequested": false});
+        "remaining": total.saturating_sub(results.len()), "pauseRequested": false,
+                "stopRequested": false});
     if let Some(name) = name {
         value["currentTraineeName"] = json!(name);
     }
@@ -224,7 +225,9 @@ impl CheckpointWriter for Sink {
         let name = cp.in_flight.as_ref().and_then(|id| self.names.get(id));
         let mut state = self.state.lock().unwrap();
         let requested = state.progress["pauseRequested"].clone();
+        let stop_requested = state.progress["stopRequested"].clone();
         state.progress = progress(phase, cp.total, &cp.results, name.map(String::as_str));
+        state.progress["stopRequested"] = stop_requested;
         if matches!(phase, "complete" | "stopped") {
             state.control = None;
         } else {
@@ -278,6 +281,7 @@ impl Drop for ControlLease {
 // Field drop order keeps admission closed through worker shutdown, including
 // unwinding and a failed thread spawn. The browser profile is still owned then.
 struct WorkerLease {
+    _control: ControlLease,
     worker: Bridge,
     _busy: Busy,
 }
@@ -360,7 +364,7 @@ impl Daemon {
         if request.method == "POST"
             && matches!(
                 request.path.as_str(),
-                "/batch" | "/batch/pause" | "/batch/resume"
+                "/batch" | "/batch/pause" | "/batch/resume" | "/batch/stop"
             )
             && !request.headers.get("content-type").is_some_and(|s| {
                 s.split(';')
@@ -390,17 +394,25 @@ impl Daemon {
                 };
                 self.start(req)
             }
-            ("POST", "/batch/pause" | "/batch/resume") => {
+            ("POST", "/batch/pause" | "/batch/resume" | "/batch/stop") => {
                 match serde_json::from_slice::<Value>(&request.body) {
                     Ok(Value::Object(map)) if map.is_empty() => {}
                     _ => return error(422, "control body must be JSON {}"),
                 }
-                self.control(request.path == "/batch/pause")
+                self.apply_control(if request.path == "/batch/stop" {
+                    None
+                } else {
+                    Some(request.path == "/batch/pause")
+                })
             }
-            _ => error(405, "method/endpoint not implemented (stop reserved)"),
+            _ => error(405, "method/endpoint not implemented"),
         }
     }
+    #[cfg(test)]
     fn control(&self, pause: bool) -> Reply {
+        self.apply_control(Some(pause))
+    }
+    fn apply_control(&self, pause: Option<bool>) -> Reply {
         let control = self.state.lock().unwrap().control.clone();
         let Some(control) = control else {
             return error(
@@ -408,6 +420,9 @@ impl Daemon {
                 "no controllable batch (idle, finished, form-options, or admission)",
             );
         };
+        self.control_captured(&control, pause)
+    }
+    fn control_captured(&self, control: &Arc<BatchControl>, pause: Option<bool>) -> Reply {
         let mut requested = control
             .pause_requested
             .lock()
@@ -418,12 +433,23 @@ impl Daemon {
         if !state
             .control
             .as_ref()
-            .is_some_and(|c| Arc::ptr_eq(c, &control))
+            .is_some_and(|c| Arc::ptr_eq(c, control))
+            || control.closed.load(Ordering::SeqCst)
         {
             return error(409, "batch is no longer controllable");
         }
-        *requested = pause;
-        state.progress["pauseRequested"] = json!(pause);
+        if let Some(pause) = pause {
+            if control.stop_requested.load(Ordering::SeqCst) {
+                return error(409, "operator stop is already requested");
+            }
+            *requested = pause;
+            state.progress["pauseRequested"] = json!(pause);
+        } else {
+            control.stop_requested.store(true, Ordering::SeqCst);
+            *requested = false;
+            state.progress["pauseRequested"] = json!(false);
+            state.progress["stopRequested"] = json!(true);
+        }
         control.changed.notify_all();
         (200, state.progress.clone())
     }
@@ -550,6 +576,7 @@ impl Daemon {
         let control = Arc::new(BatchControl::default());
         state.lock().unwrap().control = Some(control.clone());
         let lease = WorkerLease {
+            _control: ControlLease(state.clone()),
             worker,
             _busy: busy,
         };
@@ -557,7 +584,7 @@ impl Daemon {
             .name("dssp-batch".into())
             .spawn(move || {
                 let mut lease = lease;
-                let _control_lease = ControlLease(state.clone());
+
                 let sink = Sink {
                     store,
                     state: state.clone(),
@@ -573,6 +600,7 @@ impl Daemon {
                         report.aborted |= owed > 0;
                         let mut state = state.lock().unwrap();
                         state.control = None;
+                        let stop_requested = state.progress["stopRequested"].clone();
                         state.progress = progress(
                             if report.aborted || owed > 0 {
                                 "stopped"
@@ -583,6 +611,7 @@ impl Daemon {
                             &report.results,
                             None,
                         );
+                        state.progress["stopRequested"] = stop_requested;
                         state.report = Some(report);
                     }
                     Err(e) => {

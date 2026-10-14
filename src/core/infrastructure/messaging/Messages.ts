@@ -20,6 +20,8 @@ export interface BatchProgress {
   currentTraineeName?: string;
   /** Daemon intent only; paused is published after the safe checkpoint boundary. */
   pauseRequested?: boolean;
+  /** Latched daemon intent; stopped is published only by the engine. */
+  stopRequested?: boolean;
 }
 
 export type Message =

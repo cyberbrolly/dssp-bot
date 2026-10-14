@@ -412,7 +412,7 @@ fn pause_pending_settles_once_then_resume_keeps_the_same_worker_and_queue() {
     assert_eq!(server.request("POST", "/batch", BATCH).0, 503);
     assert_eq!(server.request("GET", "/form-options", "").0, 503);
     assert_eq!(server.request("GET", "/report", "").1, Value::Null);
-    assert_eq!(server.request("POST", "/batch/stop", "{}").0, 405);
+    assert_eq!(server.request("GET", "/batch/stop", "{}").0, 405);
     let (code, resumed, _) = server.request("POST", "/batch/resume", "{}");
     assert_eq!(code, 200);
     assert_eq!(resumed["pauseRequested"], false);
@@ -453,7 +453,7 @@ fn pause_pending_settles_once_then_resume_keeps_the_same_worker_and_queue() {
 fn resume_is_idempotent_while_active_and_cancels_a_pending_pause() {
     let server = Server::new(None, true);
     let idle = server.request("GET", "/status", "").1;
-    for path in ["/batch/pause", "/batch/resume"] {
+    for path in ["/batch/pause", "/batch/resume", "/batch/stop"] {
         assert_eq!(server.request("POST", path, "{}").0, 409);
     }
     assert_eq!(server.request("GET", "/status", "").1, idle);
@@ -548,12 +548,12 @@ fn paused_restart_requires_explicit_batch_recovery_with_zero_workers_on_refusal(
 }
 
 #[test]
-fn pause_resume_share_auth_origin_content_and_body_limits_without_effects() {
+fn controls_share_auth_origin_content_and_body_limits_without_effects() {
     let server = Server::new(None, true);
     assert_eq!(server.request("POST", "/batch", BATCH).0, 202);
     wait_until(|| server.probe.submissions() == ["fixture-1"]);
     let before = server.request("GET", "/status", "").1;
-    for path in ["/batch/pause", "/batch/resume"] {
+    for path in ["/batch/pause", "/batch/resume", "/batch/stop"] {
         assert_eq!(server.raw(&format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}")).0, 401);
         assert_eq!(server.raw(&format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: https://foreign.example\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}")).0, 403);
         assert_eq!(server.raw(&format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}")).0, 415);
@@ -629,7 +629,7 @@ fn controls_during_form_options_are_409_without_state_change() {
     });
     wait_until(|| admission.arrived.load(Ordering::SeqCst));
     let before = server.request("GET", "/status", "").1;
-    for path in ["/batch/pause", "/batch/resume"] {
+    for path in ["/batch/pause", "/batch/resume", "/batch/stop"] {
         assert_eq!(server.request("POST", path, "{}").0, 409);
     }
     assert_eq!(server.request("GET", "/status", "").1, before);
@@ -661,8 +661,13 @@ impl Drop for SettleFault {
 }
 
 #[test]
-fn pending_pause_transport_error_and_panic_clear_controls_before_worker_teardown() {
-    for panic in [false, true] {
+fn pending_controls_transport_error_and_panic_clear_before_worker_teardown() {
+    for (panic, path) in [
+        (false, "/batch/pause"),
+        (true, "/batch/pause"),
+        (false, "/batch/stop"),
+        (true, "/batch/stop"),
+    ] {
         let probe = Arc::new(Probe::default());
         *probe.held.lock().unwrap() = true;
         let teardown = Gate::new();
@@ -680,14 +685,14 @@ fn pending_pause_transport_error_and_panic_clear_controls_before_worker_teardown
         let _release = ReleaseOnDrop(teardown.clone());
         assert_eq!(server.request("POST", "/batch", BATCH).0, 202);
         wait_until(|| probe.submissions() == ["fixture-1"]);
-        assert_eq!(server.request("POST", "/batch/pause", "{}").0, 200);
+        assert_eq!(server.request("POST", path, "{}").0, 200);
         probe.unblock();
         wait_until(|| teardown.arrived.load(Ordering::SeqCst));
         let status = server.request("GET", "/status", "").1;
         assert_eq!(status["state"], "stopped");
         assert_eq!(status["pauseRequested"], false);
         assert!(status.get("currentTraineeName").is_none());
-        for path in ["/batch/pause", "/batch/resume"] {
+        for path in ["/batch/pause", "/batch/resume", "/batch/stop"] {
             assert_eq!(server.request("POST", path, "{}").0, 409);
         }
         assert_eq!(server.request("POST", "/batch", BATCH).0, 503);
@@ -739,7 +744,7 @@ fn reserved_and_unknown_endpoints_remain_unsupported() {
     for (method, path) in [
         ("GET", "/batch/pause"),
         ("GET", "/batch/resume"),
-        ("POST", "/batch/stop"),
+        ("GET", "/batch/stop"),
         ("OPTIONS", "/batch"),
         ("GET", "/batch"),
         ("PUT", "/batch"),
@@ -993,6 +998,194 @@ fn failed_pre_submission_checkpoint_write_prevents_worker_submission() {
     assert_eq!(state.report.as_ref().unwrap().skipped, 2);
 }
 
+#[test]
+fn stop_blocked_submission_latches_settles_once_and_never_starts_the_next() {
+    for outcome in ["confirmed", "indeterminate"] {
+        let server = Server::new(None, true);
+        *server.probe.outcome.lock().unwrap() = Some(outcome.into());
+        assert_eq!(server.request("POST", "/batch", BATCH).0, 202);
+        wait_until(|| server.probe.submissions() == ["fixture-1"]);
+        let before = server.request("GET", "/checkpoint", "").1;
+        assert_eq!(server.request("POST", "/batch/pause", "{}").0, 200);
+        let (code, pending, _) = server.request("POST", "/batch/stop", "{}");
+        assert_eq!(code, 200);
+        assert_eq!(pending["state"], "submitting");
+        assert_eq!(pending["stopRequested"], true);
+        assert_eq!(pending["pauseRequested"], false);
+        assert_eq!(pending["processed"], 0);
+        assert!(pending.get("batchId").is_none());
+        for _ in 0..3 {
+            assert_eq!(server.request("POST", "/batch/stop", "{}").1, pending);
+            for path in ["/batch/pause", "/batch/resume"] {
+                assert_eq!(server.request("POST", path, "{}").0, 409);
+            }
+            assert_eq!(server.request("GET", "/status", "").1, pending);
+            assert_eq!(server.request("GET", "/checkpoint", "").1, before);
+        }
+        assert_eq!(server.request("POST", "/batch", BATCH).0, 503);
+        server.probe.unblock();
+        wait_until(|| !server.daemon.state.lock().unwrap().busy);
+        let stopped = server.request("GET", "/status", "").1;
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["stopRequested"], true);
+        assert_eq!(stopped["processed"], 2);
+        assert_eq!(stopped["skipped"], 1);
+        assert_eq!(stopped["remaining"], 0);
+        assert_eq!(stopped["successful"], usize::from(outcome == "confirmed"));
+        assert_eq!(
+            stopped["indeterminate"],
+            usize::from(outcome == "indeterminate")
+        );
+        let report = server.request("GET", "/report", "").1;
+        assert_eq!(report["aborted"], true);
+        assert_eq!(report["results"][0]["attempts"], 1);
+        assert_eq!(report["results"][1]["attempts"], 0);
+        assert_eq!(report["results"][1]["message"], OPERATOR_STOP_MESSAGE);
+        let checkpoint = server.request("GET", "/checkpoint", "").1;
+        assert_eq!(checkpoint["status"], "aborted");
+        assert_eq!(checkpoint["pending"], json!([]));
+        assert_eq!(checkpoint["inFlight"], Value::Null);
+        assert_eq!(server.probe.submissions(), ["fixture-1"]);
+        for path in ["/batch/stop", "/batch/pause", "/batch/resume"] {
+            assert_eq!(server.request("POST", path, "{}").0, 409);
+        }
+        assert_eq!(server.request("POST", "/batch", BATCH).0, 409);
+        assert_eq!(server.probe.starts.load(Ordering::SeqCst), 1);
+    }
+}
+
+const OPERATOR_STOP_MESSAGE: &str = "not submitted: operator stop";
+
+#[test]
+fn stop_wakes_paused_batch_and_restart_requires_explicit_recovery_without_replay() {
+    let original = Server::new(None, true);
+    assert_eq!(original.request("POST", "/batch", BATCH).0, 202);
+    wait_until(|| original.probe.submissions() == ["fixture-1"]);
+    let stale = original
+        .daemon
+        .state
+        .lock()
+        .unwrap()
+        .control
+        .clone()
+        .unwrap();
+    assert_eq!(original.request("POST", "/batch/pause", "{}").0, 200);
+    original.probe.unblock();
+    original.wait_for(|v| v["state"] == "paused");
+    assert_eq!(original.request("POST", "/batch/stop", "{}").0, 200);
+    wait_until(|| !original.daemon.state.lock().unwrap().busy);
+    assert_eq!(original.probe.submissions(), ["fixture-1"]);
+    assert_eq!(
+        original.request("GET", "/status", "").1["stopRequested"],
+        true
+    );
+    let saved = fs::read_to_string(original.scratch.checkpoint()).unwrap();
+    let restarted = Server::new(Some(&saved), true);
+    assert_eq!(
+        restarted.request("GET", "/status", "").1["stopRequested"],
+        false
+    );
+    for path in ["/batch/stop", "/batch/pause", "/batch/resume"] {
+        assert_eq!(restarted.request("POST", path, "{}").0, 409);
+    }
+    assert_eq!(restarted.request("POST", "/batch", BATCH).0, 409);
+    assert_eq!(restarted.probe.starts.load(Ordering::SeqCst), 0);
+    let mut resume: Value = serde_json::from_str(BATCH).unwrap();
+    resume["resume"] = json!(true);
+    assert_eq!(
+        restarted.request("POST", "/batch", &resume.to_string()).0,
+        202
+    );
+    wait_until(|| restarted.probe.submissions() == ["fixture-2"]);
+    assert_eq!(
+        restarted.request("GET", "/status", "").1["stopRequested"],
+        false
+    );
+    restarted.probe.unblock();
+    restarted.wait_for(|v| v["state"] == "complete");
+    assert_eq!(restarted.probe.submissions(), ["fixture-2"]);
+
+    // A stale handle captured by a previous request cannot stop the new controller.
+    *original.probe.held.lock().unwrap() = true;
+    assert_eq!(
+        original.request("POST", "/batch", &resume.to_string()).0,
+        202
+    );
+    wait_until(|| original.probe.submissions() == ["fixture-1", "fixture-2"]);
+    let before = original.request("GET", "/status", "").1;
+    assert_eq!(before["stopRequested"], false);
+    assert_eq!(original.daemon.control_captured(&stale, None).0, 409);
+    assert_eq!(original.daemon.control_captured(&stale, Some(false)).0, 409);
+    assert_eq!(original.request("GET", "/status", "").1, before);
+    original.probe.unblock();
+    original.wait_for(|v| v["state"] == "complete");
+    assert_eq!(original.request("POST", "/batch/stop", "{}").0, 409);
+    assert_eq!(original.request("GET", "/report", "").1["aborted"], false);
+}
+
+#[test]
+fn failed_stop_checkpoint_preserves_old_record_and_never_claims_safe_settlement() {
+    for paused in [false, true] {
+        let server = Server::new(None, true);
+        assert_eq!(server.request("POST", "/batch", BATCH).0, 202);
+        wait_until(|| server.probe.submissions() == ["fixture-1"]);
+        if paused {
+            assert_eq!(server.request("POST", "/batch/pause", "{}").0, 200);
+            server.probe.unblock();
+            server.wait_for(|v| v["state"] == "paused");
+        }
+        let old = fs::read_to_string(server.scratch.checkpoint()).unwrap();
+        // Obstruct the temporary write, not the checkpoint: existing information
+        // must survive both a failed settlement and a failed stop boundary.
+        let temp = server
+            .scratch
+            .0
+            .join(format!("checkpoint.json.{}.tmp", std::process::id()));
+        fs::create_dir(&temp).unwrap();
+        assert_eq!(server.request("POST", "/batch/stop", "{}").0, 200);
+        server.probe.unblock();
+        wait_until(|| !server.daemon.state.lock().unwrap().busy);
+        assert_eq!(
+            fs::read_to_string(server.scratch.checkpoint()).unwrap(),
+            old
+        );
+        let status = server.request("GET", "/status", "").1;
+        assert_eq!(status["state"], "stopped");
+        assert_eq!(status["stopRequested"], true);
+        assert_eq!(status["skipped"], 0);
+        assert_eq!(status["processed"], usize::from(paused));
+        assert_eq!(server.request("GET", "/report", "").1, Value::Null);
+        assert_eq!(server.probe.submissions(), ["fixture-1"]);
+        assert_eq!(server.request("POST", "/batch/stop", "{}").0, 409);
+        fs::remove_dir(temp).unwrap();
+        assert_eq!(server.request("POST", "/batch", BATCH).0, 409);
+        assert_eq!(server.probe.starts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn stop_has_shared_header_cap_and_read_deadline_without_setting_intent() {
+    let server = Server::new(None, true);
+    assert_eq!(server.request("POST", "/batch", BATCH).0, 202);
+    wait_until(|| server.probe.submissions() == ["fixture-1"]);
+    let before = server.request("GET", "/status", "").1;
+    let oversized = format!(
+        "POST /batch/stop HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\nX-Pad: {}\r\n\r\n",
+        "x".repeat(HEADER_LIMIT)
+    );
+    assert_eq!(server.raw(&oversized).0, 413);
+    let mut stream = TcpStream::connect(server.address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(6)))
+        .unwrap();
+    stream.write_all(format!("POST /batch/stop HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{").as_bytes()).unwrap();
+    assert_eq!(server.request("GET", "/status", "").1, before);
+    assert_eq!(response(stream).0, 408);
+    assert_eq!(server.request("GET", "/status", "").1, before);
+    server.probe.unblock();
+    server.wait_for(|v| v["state"] == "complete");
+}
+
 fn wait_until(condition: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition() {
@@ -1176,7 +1369,7 @@ fn status_is_responsive_while_admission_waits_for_session() {
     assert_eq!(server.request("GET", "/form-options", "").0, 503);
     assert!(probe.submissions().is_empty());
     let before = server.request("GET", "/status", "").1;
-    for path in ["/batch/pause", "/batch/resume"] {
+    for path in ["/batch/pause", "/batch/resume", "/batch/stop"] {
         let reply = server.request("POST", path, "{}");
         assert_eq!(reply.0, 409);
         assert!(reply.1["error"].as_str().unwrap().contains("admission"));

@@ -33,8 +33,28 @@ export function displayTimestamp(value: string): string {
 export function recoverySummary(
   checkpoint: DaemonCheckpoint | null,
   progress?: BatchProgress,
+  report?: DaemonReport | null,
 ): string | null {
-  if (!checkpoint) return null;
+  const stopped = progress?.state === "stopped";
+  const stopping = !!progress?.stopRequested;
+  const missingReport = stopped && report === null;
+  if (!checkpoint && !stopping && !missingReport) return null;
+  const parts: string[] = [];
+  if (stopping) {
+    parts.push(
+      stopped
+        ? "Rust reports stopped with stop latched, not successful completion. Human review of actual outcomes and the last durable checkpoint is required."
+        : "Stop is latched in Rust and still pending. Pause and Resume cannot cancel it or start checkpoint recovery. An admitted attempt must settle before Rust publishes stopped.",
+    );
+    parts.push(
+      "Start and session edits stay locked while Rust reports stopRequested. This popup does not admit checkpoint recovery; any new batch requires explicit external admission after human review, subject to Rust's recovery guards. Nothing is retried automatically.",
+    );
+  }
+  if (missingReport)
+    parts.push(
+      "No final report is available. A checkpoint write or execution failure may have prevented finalization; progress counts may reflect only the last durable checkpoint. Human review is required; there is no automatic recovery.",
+    );
+  if (!checkpoint) return parts.join(" ");
   const unconfirmed = checkpoint.results.filter(
     (row) => row.outcome === "indeterminate",
   ).length;
@@ -42,13 +62,15 @@ export function recoverySummary(
     checkpoint.status === "finished" &&
     !unconfirmed &&
     !checkpoint.inFlight &&
-    !checkpoint.pending.length
+    !checkpoint.pending.length &&
+    !stopping &&
+    !missingReport
   )
     return null;
-  const parts = [
+  parts.push(
     `Daemon checkpoint: ${checkpoint.status}; started ${displayTimestamp(checkpoint.startedAt)}.`,
     `${checkpoint.results.length} of ${checkpoint.total} results recorded; ${checkpoint.pending.length} pending in the daemon (not proof they were never submitted).`,
-  ];
+  );
   if (checkpoint.inFlight)
     parts.push(
       `In flight: ${checkpoint.inFlight} — may have reached the portal; verify before another start.`,
@@ -57,7 +79,15 @@ export function recoverySummary(
     parts.push(
       `${unconfirmed} submitted without confirmation — verify on the portal.`,
     );
-  if (progress && sessionLocked(progress.state)) {
+  if (stopping) return parts.join(" ");
+  if (stopped) {
+    parts.push(
+      "Rust reports stopped, not successful completion. Inspect the report and last durable checkpoint; stopping or an execution error may have aborted the batch. Controls cannot recover it or retry trainees.",
+    );
+    parts.push(
+      "Recovery requires explicit batch admission with resume: true and the original session template after human review; no terminal batch is retried automatically.",
+    );
+  } else if (progress && sessionLocked(progress.state)) {
     parts.push(
       progress.state === "paused"
         ? "Rust reports an in-memory paused batch, not an interrupted batch. Resume continues that same batch without new admission or a new worker."
@@ -86,7 +116,16 @@ export function reportSummary(report: DaemonReport): string {
   return parts.join(" ");
 }
 
+export function stopSummary(progress: BatchProgress): string | null {
+  if (progress.state === "stopped")
+    return "Rust reports stopped, not successful completion. Review the report and durable checkpoint for aborted work and actual outcomes; nothing is retried automatically.";
+  if (progress.stopRequested)
+    return "Stop pending — latched in Rust. This does not cancel an in-flight POST or its settlement. No new attempt or safe retry is admitted after stop. Waiting for Rust to publish stopped; Pause and Resume cannot cancel stop.";
+  return null;
+}
+
 export function pauseSummary(progress: BatchProgress): string | null {
+  if (progress.stopRequested) return null;
   if (progress.state === "paused")
     return progress.pauseRequested === false
       ? "Resume requested; waiting for Rust to persist the running checkpoint before further submissions."

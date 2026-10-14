@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { DAEMON_SETTINGS_KEY } from "../../src/core/infrastructure/daemon/DaemonClient";
-import type { DaemonCheckpoint } from "../../src/core/infrastructure/daemon/DaemonClient";
+import type {
+  DaemonCheckpoint,
+  DaemonReport,
+} from "../../src/core/infrastructure/daemon/DaemonClient";
 import type { BatchProgress } from "../../src/core/infrastructure/messaging/Messages";
 
 // Minimal DOM fixture: no new dependency and no browser/portal requests.
@@ -98,13 +101,15 @@ async function boot(
   const daemon = {
     progress: initialProgress,
     checkpoint: null as DaemonCheckpoint | null,
+    report: null as DaemonReport | null,
   };
   const fetcher = vi
     .fn<typeof fetch>()
     .mockImplementation(async (url, init) => {
       if (
         String(url).endsWith("/batch/pause") ||
-        String(url).endsWith("/batch/resume")
+        String(url).endsWith("/batch/resume") ||
+        String(url).endsWith("/batch/stop")
       )
         return response(daemon.progress);
       if (init?.method === "POST")
@@ -125,7 +130,7 @@ async function boot(
                 instructors: [{ value: "i", label: "Fixture Instructor" }],
                 trainingTypes: [{ value: "t", label: "Fixture Type" }],
               }
-            : null;
+            : daemon.report;
       return new Response(JSON.stringify(value));
     });
   const interval = vi.fn().mockReturnValue(1);
@@ -162,8 +167,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("Stage 30 popup wiring (offline DOM fixture)", () => {
-  it("polls only read-only state at startup; wires pause/resume but keeps idle controls disabled and stop reserved", async () => {
+describe("Stages 30–31 popup wiring (offline DOM fixture)", () => {
+  it("polls only read-only state at startup; wires controls but keeps them disabled while idle", async () => {
     const { get, fetcher, storage } = await boot();
     expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
       "http://127.0.0.1:8765/status",
@@ -181,7 +186,7 @@ describe("Stage 30 popup wiring (offline DOM fixture)", () => {
       expect(html).toMatch(new RegExp(`id="${id}"[^>]*disabled`));
       expect(get(id).disabled).toBe(true);
       get(id).click();
-      expect(get(id).listeners.click === undefined).toBe(id === "stop");
+      expect(get(id).listeners.click).toBeTypeOf("function");
     }
   });
 
@@ -283,7 +288,7 @@ describe("Stage 30 popup wiring (offline DOM fixture)", () => {
     ]);
     expect(posts().every(([, init]) => init?.body === "{}")).toBe(true);
     expect(storage.set).not.toHaveBeenCalled();
-    expect(get("stop").disabled).toBe(true);
+    expect(get("stop").disabled).toBe(false);
   });
 
   it("resume cancels pending pause without new admission or a local state transition", async () => {
@@ -355,11 +360,14 @@ describe("Stage 30 popup wiring (offline DOM fixture)", () => {
     ["resume", "late idle"],
     ["pause", "late error"],
     ["resume", "late error"],
+    ["stop", "late idle"],
+    ["stop", "late active"],
+    ["stop", "late error"],
   ] as const)(
     "ignores stale %s reads (%s), even when a pre-result read is still in flight",
     async (action, outcome) => {
       const initial =
-        action === "pause"
+        action !== "resume"
           ? active
           : { ...active, state: "paused" as const, pauseRequested: true };
       const { get, fetcher, daemon, poll, posts } = await boot(
@@ -374,7 +382,9 @@ describe("Stage 30 popup wiring (offline DOM fixture)", () => {
       daemon.progress =
         action === "pause"
           ? { ...active, state: "paused", pauseRequested: true }
-          : active;
+          : action === "stop"
+            ? { ...active, state: "retrying", stopRequested: true }
+            : active;
       get(action).click();
       // A fresh generation must poll without waiting for the stale request.
       await vi.waitFor(() =>
@@ -385,7 +395,7 @@ describe("Stage 30 popup wiring (offline DOM fixture)", () => {
       const before = get("pause-status").textContent;
       if (outcome === "late error")
         stale.reject(new TypeError("old connection lost"));
-      else stale.resolve(response(idle));
+      else stale.resolve(response(outcome === "late active" ? active : idle));
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       expect(get("state").textContent).toBe(
         daemon.progress.state.replace(/_/g, " "),
@@ -397,12 +407,12 @@ describe("Stage 30 popup wiring (offline DOM fixture)", () => {
     },
   );
 
-  it.each(["pause", "resume"] as const)(
+  it.each(["pause", "resume", "stop"] as const)(
     "does not retry %s on 409, HTTP errors or connection loss; polls authoritative state",
     async (action) => {
       for (const failure of [409, 500, "offline"] as const) {
         const initial =
-          action === "pause"
+          action !== "resume"
             ? active
             : { ...active, state: "paused" as const, pauseRequested: true };
         const { get, fetcher, poll, posts } = await boot(true, false, initial);
@@ -453,7 +463,11 @@ describe("Stage 30 popup wiring (offline DOM fixture)", () => {
       });
       expect(get("pause").disabled).toBe(!canPause);
       expect(get("resume").disabled).toBe(!canResume);
-      expect(get("stop").disabled).toBe(true);
+      expect(get("stop").disabled).toBe(
+        !["loading_trainee", "submitting", "retrying", "paused"].includes(
+          state,
+        ),
+      );
     },
   );
 
@@ -599,4 +613,349 @@ describe("Stage 30 popup wiring (offline DOM fixture)", () => {
     expect(get("daemon-help").hidden).toBe(false);
     expect(get("daemon-command").textContent).not.toContain(token);
   });
+});
+
+const sessionControls = [
+  "start",
+  "load-options",
+  "instructor",
+  "training-type",
+  "training-date",
+  "trainees",
+] as const;
+const batchControls = ["pause", "resume", "stop"] as const;
+const successfulReport: DaemonReport = {
+  total: 1,
+  successful: 1,
+  failed: 0,
+  skipped: 0,
+  indeterminate: 0,
+  successRate: 1,
+  aborted: false,
+  startedAt: "1789382400000",
+  finishedAt: "1789382401000",
+  results: [
+    {
+      traineeId: "a",
+      traineeName: "Fixture A",
+      outcome: "success",
+      attempts: 1,
+    },
+  ],
+};
+
+describe("Stage 31 latched stop (offline DOM fixture)", () => {
+  it.each([
+    ["submitting", false],
+    ["submitting", true],
+    ["retrying", false],
+    ["paused", true],
+    ["paused", false],
+  ] as const)(
+    "stops from %s (pauseRequested=%s), waits for authoritative terminal publication, and retains the terminal lock",
+    async (state, pauseRequested) => {
+      const { get, fetcher, daemon, poll, posts, storage } = await boot();
+      get("load-options").click();
+      await vi.waitFor(() => expect(get("start").disabled).toBe(false));
+      daemon.progress = { ...active, state, pauseRequested };
+      daemon.checkpoint = pausedCheckpoint;
+      poll();
+      await vi.waitFor(() => expect(get("state").textContent).toBe(state));
+      const read = fetcher.getMockImplementation()!;
+      const stop = deferred<Response>();
+      fetcher.mockImplementation((url, init) =>
+        init?.method === "POST" ? stop.promise : read(url, init),
+      );
+      get("stop").click();
+      get("stop").click();
+      for (const id of [...sessionControls, ...batchControls, "save-daemon"])
+        expect(get(id).disabled).toBe(true);
+      expect(get("status").textContent).toContain(
+        "does not cancel an in-flight POST",
+      );
+      expect(get("state").textContent).toBe(state);
+      // Even a terminal control body must not publish a local terminal state.
+      daemon.progress = {
+        ...active,
+        state,
+        pauseRequested: false,
+        stopRequested: true,
+      };
+      stop.resolve(response({ ...daemon.progress, state: "stopped" }));
+      await vi.waitFor(() =>
+        expect(get("pause-status").textContent).toContain("Stop pending"),
+      );
+      expect(get("state").textContent).toBe(state);
+      expect(get("pause-status").textContent).not.toContain("Resume continues");
+      expect(get("recovery").textContent).not.toContain("resume: true");
+      for (const id of [...sessionControls, ...batchControls]) {
+        expect(get(id).disabled).toBe(true);
+        get(id).click();
+      }
+      // A dispatched event must not bypass the disabled form-options guard.
+      get("load-options").listeners.click?.();
+      expect(posts()).toHaveLength(1);
+      expect(posts()[0]).toEqual([
+        "http://127.0.0.1:8765/batch/stop",
+        expect.objectContaining({
+          method: "POST",
+          body: "{}",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        }),
+      ]);
+      expect(
+        fetcher.mock.calls.filter(([url]) =>
+          String(url).endsWith("/form-options"),
+        ),
+      ).toHaveLength(1);
+      daemon.progress = {
+        ...daemon.progress,
+        state: "stopped",
+        processed: 2,
+        skipped: 1,
+        remaining: 0,
+      };
+      daemon.report = {
+        ...successfulReport,
+        total: 2,
+        skipped: 1,
+        successRate: 0.5,
+        aborted: true,
+        results: [
+          ...successfulReport.results,
+          {
+            traineeId: "b",
+            traineeName: "Fixture B",
+            outcome: "skipped",
+            attempts: 0,
+            message: "not submitted: operator stop",
+          },
+        ],
+      };
+      daemon.checkpoint = {
+        ...pausedCheckpoint,
+        status: "aborted",
+        pending: [],
+        results: daemon.report.results,
+      };
+      poll();
+      await vi.waitFor(() => expect(get("state").textContent).toBe("stopped"));
+      expect(get("pause-status").textContent).toContain(
+        "Rust reports stopped, not successful completion",
+      );
+      expect(get("report").textContent).toContain(
+        "1/2 recorded, 0 failed, 1 skipped, 50% success rate",
+      );
+      expect(get("report").textContent).toContain(
+        "Batch aborted; human review",
+      );
+      expect(get("recovery").textContent).toContain(
+        "Start and session edits stay locked",
+      );
+      expect(get("recovery").textContent).not.toContain("resume: true");
+      for (const id of [...sessionControls, ...batchControls])
+        expect(get(id).disabled).toBe(true);
+      expect(storage.set).not.toHaveBeenCalled();
+      expect(posts()).toHaveLength(1);
+      // Only new authoritative progress, not a control acknowledgement, clears the latch lock.
+      daemon.progress = { ...active, stopRequested: false };
+      daemon.report = null;
+      poll();
+      await vi.waitFor(() => expect(get("pause").disabled).toBe(false));
+      expect(get("start").disabled).toBe(true);
+      daemon.progress = { ...idle, state: "complete", stopRequested: false };
+      poll();
+      await vi.waitFor(() => expect(get("start").disabled).toBe(false));
+      expect(get("training-date").disabled).toBe(false);
+      expect(posts()).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    "idle",
+    "initializing",
+    "loading_trainee",
+    "submitting",
+    "retrying",
+    "paused",
+    "stopped",
+    "complete",
+  ] as const)(
+    "never unlocks execution or editing while stopRequested is true, even in %s",
+    async (state) => {
+      const { get, posts } = await boot(true, false, {
+        ...active,
+        state,
+        stopRequested: true,
+        pauseRequested: true,
+      });
+      for (const id of [...sessionControls, ...batchControls]) {
+        expect(get(id).disabled).toBe(true);
+        get(id).listeners.click?.();
+      }
+      expect(posts()).toHaveLength(0);
+    },
+  );
+
+  it.each(["running", "paused", "finished", "missing"] as const)(
+    "shows missing-report human review and preserves the last durable %s checkpoint after stop finalization failure",
+    async (durableState) => {
+      const { get, daemon, poll, posts } = await boot(true, false, {
+        ...active,
+        stopRequested: true,
+      });
+      daemon.checkpoint =
+        durableState === "missing"
+          ? null
+          : {
+              ...pausedCheckpoint,
+              status: durableState,
+              // Retain uncertainty from a prior running write; never clear it locally.
+              inFlight: durableState === "running" ? "b" : null,
+            };
+      const before = JSON.stringify(daemon.checkpoint);
+      daemon.progress = { ...active, state: "stopped", stopRequested: true };
+      poll();
+      await vi.waitFor(() => expect(get("state").textContent).toBe("stopped"));
+      expect(get("successful").textContent).toBe("1");
+      expect(get("processed").textContent).toBe("1");
+      expect(get("remaining").textContent).toBe("1");
+      expect(get("report-section").hidden).toBe(true);
+      expect(get("report").textContent).toBe("");
+      expect(get("recovery-section").hidden).toBe(false);
+      expect(get("recovery").textContent).toContain(
+        "No final report is available",
+      );
+      expect(get("recovery").textContent).toContain(
+        "checkpoint write or execution failure",
+      );
+      expect(get("recovery").textContent).toContain("Human review is required");
+      expect(get("recovery").textContent).toContain("no automatic recovery");
+      expect(get("recovery").textContent).not.toContain("resume: true");
+      if (durableState === "running")
+        expect(get("recovery").textContent).toContain(
+          "b — may have reached the portal",
+        );
+      for (const id of [...sessionControls, ...batchControls])
+        expect(get(id).disabled).toBe(true);
+      expect(JSON.stringify(daemon.checkpoint)).toBe(before);
+      expect(posts()).toHaveLength(0);
+    },
+  );
+
+  it.each([true, false])(
+    "renders actual last-row success when stop wins=%s, without inventing skips or relabeling completion",
+    async (stopWins) => {
+      const { get, daemon, fetcher, poll, posts } = await boot(
+        true,
+        false,
+        active,
+      );
+      const stop = deferred<Response>();
+      const read = fetcher.getMockImplementation()!;
+      fetcher.mockImplementation((url, init) =>
+        init?.method === "POST" ? stop.promise : read(url, init),
+      );
+      get("stop").click();
+      daemon.progress = {
+        ...idle,
+        state: stopWins ? "stopped" : "complete",
+        total: 1,
+        processed: 1,
+        successful: 1,
+        stopRequested: stopWins,
+      };
+      daemon.report = { ...successfulReport, aborted: stopWins };
+      daemon.checkpoint = {
+        ...pausedCheckpoint,
+        status: stopWins ? "aborted" : "finished",
+        total: 1,
+        pending: [],
+      };
+      poll();
+      await vi.waitFor(() =>
+        expect(get("state").textContent).toBe(
+          stopWins ? "stopped" : "complete",
+        ),
+      );
+      // This is stale progress. Only the subsequent fresh reads may update the UI.
+      stop.resolve(
+        stopWins
+          ? response({ ...active, stopRequested: true })
+          : response({ error: "batch has no active controller" }, 409),
+      );
+      await vi.waitFor(() =>
+        expect(get("status").textContent).toContain(
+          stopWins ? "Stop request accepted" : "Daemon HTTP 409",
+        ),
+      );
+      await vi.waitFor(() => expect(get("save-daemon").disabled).toBe(false));
+      expect(get("state").textContent).toBe(stopWins ? "stopped" : "complete");
+      expect(get("report-section").hidden).toBe(false);
+      expect(get("report").textContent).toContain(
+        "1/1 recorded, 0 failed, 0 skipped, 100% success rate",
+      );
+      expect(get("report").textContent?.includes("Batch aborted")).toBe(
+        stopWins,
+      );
+      expect(get("pause-status").hidden).toBe(!stopWins);
+      expect(daemon.report.results[0]?.outcome).toBe("success");
+      expect(get("training-date").disabled).toBe(stopWins);
+      expect(posts()).toHaveLength(1);
+    },
+  );
+
+  it.each(["success", "409", "network loss"] as const)(
+    "keeps a fresh disconnection authoritative over a late stop response (%s), then reconnects only by polling",
+    async (outcome) => {
+      const { get, daemon, fetcher, poll, posts, storage } = await boot(
+        true,
+        false,
+        active,
+      );
+      const read = fetcher.getMockImplementation()!;
+      const stop = deferred<Response>();
+      let offline = false;
+      fetcher.mockImplementation((url, init) =>
+        init?.method === "POST"
+          ? stop.promise
+          : offline
+            ? Promise.reject(new TypeError("offline"))
+            : read(url, init),
+      );
+      get("stop").click();
+      offline = true;
+      poll();
+      await vi.waitFor(() =>
+        expect(get("state").textContent).toBe("disconnected"),
+      );
+      if (outcome === "network loss")
+        stop.reject(new TypeError("late control disconnect"));
+      else
+        stop.resolve(
+          outcome === "409"
+            ? response({ error: "no active controller" }, 409)
+            : response({ ...active, stopRequested: false }),
+        );
+      await vi.waitFor(() => expect(get("save-daemon").disabled).toBe(false));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(get("state").textContent).toBe("disconnected");
+      expect(get("pause-status").hidden).toBe(true);
+      expect(get("report-section").hidden).toBe(true);
+      for (const id of [...sessionControls, ...batchControls])
+        expect(get(id).disabled).toBe(true);
+      offline = false;
+      daemon.progress = { ...active, state: "retrying", stopRequested: true };
+      poll();
+      await vi.waitFor(() => expect(get("state").textContent).toBe("retrying"));
+      expect(get("pause-status").textContent).toContain("Stop pending");
+      for (const id of [...sessionControls, ...batchControls])
+        expect(get(id).disabled).toBe(true);
+      expect(posts()).toHaveLength(1);
+      expect(storage.set).not.toHaveBeenCalled();
+    },
+  );
 });

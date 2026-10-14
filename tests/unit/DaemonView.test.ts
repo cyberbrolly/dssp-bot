@@ -9,6 +9,7 @@ import {
   displayTimestamp,
   readDaemonView,
   pauseSummary,
+  stopSummary,
   recoverySummary,
   reportSummary,
   sessionLocked,
@@ -215,5 +216,112 @@ describe("daemon UI projections", () => {
       pauseSummary({ ...idle, state: "submitting", pauseRequested: false }),
     ).toBeNull();
     expect(pauseSummary(idle)).toBeNull();
+  });
+
+  it.each(["loading_trainee", "submitting", "retrying", "paused"] as const)(
+    "describes latched stop in %s as pending, never as a durable terminal or a resumable pause",
+    (state) => {
+      const progress = {
+        ...idle,
+        state,
+        stopRequested: true,
+        pauseRequested: true,
+      };
+      const before = JSON.stringify(progress);
+      expect(stopSummary(progress)).toContain("Stop pending");
+      expect(stopSummary(progress)).toContain(
+        "does not cancel an in-flight POST",
+      );
+      expect(stopSummary(progress)).toContain("No new attempt or safe retry");
+      expect(stopSummary(progress)).not.toContain("Rust reports stopped");
+      expect(pauseSummary(progress)).toBeNull();
+      const text = recoverySummary(
+        { ...checkpoint, status: "paused" },
+        progress,
+      );
+      expect(text).toContain("still pending");
+      expect(text).toContain("Pause and Resume cannot cancel");
+      expect(text).not.toContain("Resume continues");
+      expect(text).not.toContain("resume: true");
+      expect(JSON.stringify(progress)).toBe(before);
+    },
+  );
+
+  it.each(["running", "paused", "aborted", "finished"] as const)(
+    "keeps human-review and UI lock guidance for a terminal latch despite a %s checkpoint",
+    (status) => {
+      const durable = { ...checkpoint, status, pending: [], inFlight: null };
+      const text = recoverySummary(durable, {
+        ...idle,
+        state: "stopped",
+        stopRequested: true,
+      });
+      expect(text).toContain(
+        "stopped with stop latched, not successful completion",
+      );
+      expect(text).toContain("Start and session edits stay locked");
+      expect(text).toContain("explicit external admission after human review");
+      expect(text).toContain("Rust's recovery guards");
+      expect(text).not.toContain("resume: true");
+      expect(text).not.toContain("still pending");
+      expect(
+        stopSummary({ ...idle, state: "stopped", stopRequested: true }),
+      ).toContain("Rust reports stopped");
+    },
+  );
+
+  it("warns on null reports after checkpoint failure without fabricating results or assuming a missing checkpoint is safe", () => {
+    const progress = {
+      ...idle,
+      state: "stopped" as const,
+      stopRequested: true,
+    };
+    for (const durable of [checkpoint, null]) {
+      const before = JSON.stringify(durable);
+      const text = recoverySummary(durable, progress, null);
+      expect(text).toContain("No final report is available");
+      expect(text).toContain("checkpoint write or execution failure");
+      expect(text).toContain(
+        "counts may reflect only the last durable checkpoint",
+      );
+      expect(text).toContain("Human review is required");
+      expect(text).toContain("no automatic recovery");
+      expect(text).not.toContain("resume: true");
+      expect(JSON.stringify(durable)).toBe(before);
+    }
+    expect(
+      recoverySummary(null, { ...idle, state: "stopped" }, null),
+    ).toContain("No final report");
+    expect(recoverySummary(null, idle, null)).toBeNull();
+    expect(
+      recoverySummary(null, { ...idle, state: "paused", stopRequested: true }),
+    ).toContain("still pending");
+  });
+
+  it("preserves last-row success in an aborted report and never relabels normal completion", () => {
+    const completed: DaemonReport = {
+      ...report,
+      successful: 1,
+      failed: 0,
+      successRate: 1,
+      aborted: false,
+      results: [{ ...report.results[0]!, outcome: "success" }],
+    };
+    const before = JSON.stringify(completed);
+    expect(reportSummary(completed)).toBe(
+      "1/1 recorded, 0 failed, 0 skipped, 100% success rate.",
+    );
+    const stopped = { ...completed, aborted: true };
+    expect(reportSummary(stopped)).toContain(
+      "1/1 recorded, 0 failed, 0 skipped, 100% success rate.",
+    );
+    expect(reportSummary(stopped)).toContain(
+      "Batch aborted; human review is required, even if no trainees were skipped",
+    );
+    expect(stopped.results[0]?.outcome).toBe("success");
+    expect(JSON.stringify(completed)).toBe(before);
+    expect(
+      stopSummary({ ...idle, state: "complete", stopRequested: false }),
+    ).toBeNull();
   });
 });

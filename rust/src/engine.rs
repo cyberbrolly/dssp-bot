@@ -8,6 +8,7 @@
 //! testable without a subprocess or a browser.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -98,12 +99,16 @@ fn dedupe(trainees: Vec<TraineeRef>) -> Vec<(String, TraineeRef)> {
     unique
 }
 
-/// Optional daemon-only intent. The engine checks it between trainees, never
-/// inside a submission or its retry/settlement path.
+/// Optional daemon-only intent. The pause mutex serializes controls, attempt
+/// admission and terminal completion. An admitted round trip is never cancelled.
 #[derive(Default)]
 pub struct BatchControl {
     pub(crate) pause_requested: Mutex<bool>,
     pub(crate) changed: Condvar,
+    pub(crate) stop_requested: AtomicBool,
+    pub(crate) closed: AtomicBool,
+    #[cfg(test)]
+    pub(crate) backoff_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 pub struct BatchEngine {
@@ -155,7 +160,7 @@ impl BatchEngine {
 
     /// Write the current position to durable storage.
     ///
-    /// Pre-submission and pause/resume boundary writes are fatal on failure.
+    /// Pre-submission and pause/resume/stop boundary writes are fatal on failure.
     /// Settlement/terminal writes retain the CLI's existing best-effort behavior;
     /// a safe boundary never strands a trainee mid-flow.
     fn save_checkpoint(
@@ -182,15 +187,15 @@ impl BatchEngine {
         self.checkpoint.write(&snapshot)
     }
 
-    fn pause_boundary(
+    fn control_boundary(
         &mut self,
         started_at: &str,
         total: usize,
         results: &[TrainingResult],
         queue: &TaskQueue<TraineeRef>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let Some(control) = self.control.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         // Serialize intent with durable publication, so resume cannot race a
         // paused write. The daemon never holds its state lock while acquiring
@@ -199,8 +204,12 @@ impl BatchEngine {
             .pause_requested
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if control.stop_requested.load(Ordering::SeqCst) {
+            self.stop_checkpoint(started_at, total, results, queue)?;
+            return Ok(true);
+        }
         if !*requested {
-            return Ok(());
+            return Ok(false);
         }
         self.save_checkpoint(
             CheckpointStatus::Paused,
@@ -212,11 +221,15 @@ impl BatchEngine {
         )
         .map_err(|e| format!("pause checkpoint: {e}"))?;
         self.machine.transition_to(AutomationState::Paused)?;
-        while *requested {
+        while *requested && !control.stop_requested.load(Ordering::SeqCst) {
             requested = control
                 .changed
                 .wait(requested)
                 .unwrap_or_else(|e| e.into_inner());
+        }
+        if control.stop_requested.load(Ordering::SeqCst) {
+            self.stop_checkpoint(started_at, total, results, queue)?;
+            return Ok(true);
         }
         self.save_checkpoint(
             CheckpointStatus::Running,
@@ -229,7 +242,25 @@ impl BatchEngine {
         .map_err(|e| format!("resume checkpoint: {e}"))?;
         self.machine
             .transition_to(AutomationState::LoadingTrainee)?;
-        Ok(())
+        Ok(false)
+    }
+
+    fn stop_checkpoint(
+        &mut self,
+        started_at: &str,
+        total: usize,
+        results: &[TrainingResult],
+        queue: &TaskQueue<TraineeRef>,
+    ) -> Result<(), String> {
+        self.save_checkpoint(
+            CheckpointStatus::Aborted,
+            started_at,
+            total,
+            results,
+            queue,
+            None,
+        )
+        .map_err(|e| format!("stop checkpoint: {e}"))
     }
 
     /// Run a batch: one shared session, one training template, many trainees.
@@ -273,8 +304,24 @@ impl BatchEngine {
         let mut aborted = false;
 
         while !queue.is_empty() {
-            self.pause_boundary(&started_at, total, &results, &queue)?;
+            if self.control_boundary(&started_at, total, &results, &queue)? {
+                drain_skipped(&mut queue, &mut results, OPERATOR_STOP);
+                aborted = true;
+                let _ = self.machine.transition_to(AutomationState::Stopped);
+                break;
+            }
+            let control = self.control.clone();
+            let dequeue_guard = control
+                .as_ref()
+                .map(|c| c.pause_requested.lock().unwrap_or_else(|e| e.into_inner()));
+            if control
+                .as_ref()
+                .is_some_and(|c| c.stop_requested.load(Ordering::SeqCst))
+            {
+                continue; // The next boundary persists the unchanged queue.
+            }
             let task = queue.dequeue().expect("queue was not empty");
+            drop(dequeue_guard);
             // Taken before the submission, not after. From here the trainee is in
             // no other group, so if the process dies now this write is the only
             // thing that can say a submission may have reached the portal; its
@@ -323,12 +370,42 @@ impl BatchEngine {
 
             let last = results.last().expect("just pushed");
             if should_abort(last) {
-                let reason = abort_reason(last);
+                let mut reason = abort_reason(last);
+                // A stop still requires a durable safe boundary, even when the
+                // settled result independently requires an indeterminate abort.
+                if self
+                    .control
+                    .as_ref()
+                    .is_some_and(|c| c.stop_requested.load(Ordering::SeqCst))
+                {
+                    self.stop_checkpoint(&started_at, total, &results, &queue)?;
+                    reason = OPERATOR_STOP.into();
+                }
                 drain_skipped(&mut queue, &mut results, &reason);
                 aborted = true;
                 let _ = self.machine.transition_to(AutomationState::Stopped);
                 break;
             }
+        }
+
+        // Completion and a late stop have one ordering point. A stop observed
+        // here aborts even on the last row, preserving its actual result. Once
+        // closed, a late control is refused rather than relabeling success.
+        let control = self.control.clone();
+        let _completion = control
+            .as_ref()
+            .map(|c| c.pause_requested.lock().unwrap_or_else(|e| e.into_inner()));
+        let stopped = control
+            .as_ref()
+            .is_some_and(|c| c.stop_requested.load(Ordering::SeqCst));
+        if stopped && !aborted {
+            self.stop_checkpoint(&started_at, total, &results, &queue)?;
+            drain_skipped(&mut queue, &mut results, OPERATOR_STOP);
+            aborted = true;
+            let _ = self.machine.transition_to(AutomationState::Stopped);
+        }
+        if let Some(control) = &control {
+            control.closed.store(true, Ordering::SeqCst);
         }
 
         if self.machine.state() != AutomationState::Stopped {
@@ -341,7 +418,7 @@ impl BatchEngine {
         // had already landed still on the portal, so it is written as `Aborted` and
         // the start gate refuses a plain re-run over it. Calling both `Finished` left
         // the gate's one landed-work exemption covering the case it was written for.
-        let _ = self.save_checkpoint(
+        let terminal = self.save_checkpoint(
             if aborted {
                 CheckpointStatus::Aborted
             } else {
@@ -354,6 +431,9 @@ impl BatchEngine {
             None,
         );
 
+        if stopped {
+            terminal.map_err(|e| format!("stop terminal checkpoint: {e}"))?;
+        }
         Ok(BatchReport::build(results, started_at, now_ms(), aborted))
     }
 
@@ -370,9 +450,30 @@ impl BatchEngine {
         let fallback_id = trainee.id.clone().unwrap_or_default();
         let fallback_name = trainee.name.clone().unwrap_or_default();
         let mut attempts = 0u32;
+        let mut retry_result = None;
 
         loop {
+            // Admission, not the entire blocking send, is serialized with stop.
+            // Releasing this lock keeps controls responsive during the round trip.
+            let control = self.control.clone();
+            let admission = control
+                .as_ref()
+                .map(|c| c.pause_requested.lock().unwrap_or_else(|e| e.into_inner()));
+            if control
+                .as_ref()
+                .is_some_and(|c| c.stop_requested.load(Ordering::SeqCst))
+            {
+                return retry_result.unwrap_or_else(|| TrainingResult {
+                    trainee_id: fallback_id.clone(),
+                    trainee_name: fallback_name.clone(),
+                    outcome: Outcome::Skipped,
+                    attempts: 0,
+                    error_code: None,
+                    message: Some(OPERATOR_STOP.into()),
+                });
+            }
             attempts += 1;
+            drop(admission);
             let _ = self.machine.transition_to(AutomationState::Submitting);
 
             let req = Request::submit_training(job_id.clone(), trainee.clone(), session.clone());
@@ -443,8 +544,34 @@ impl BatchEngine {
                             message: Some(format!("gave up after {attempts} attempts: {message}")),
                         };
                     }
+                    retry_result = Some(TrainingResult {
+                        trainee_id: id,
+                        trainee_name: name,
+                        outcome: Outcome::Failed,
+                        attempts,
+                        error_code: Some(code),
+                        message: Some(format!("operator stop before retry: {message}")),
+                    });
                     let _ = self.machine.transition_to(AutomationState::Retrying);
-                    thread::sleep(self.policy.delay_for_attempt(attempts));
+                    let delay = self.policy.delay_for_attempt(attempts);
+                    if let Some(control) = &self.control {
+                        let guard = control
+                            .pause_requested
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        #[cfg(test)]
+                        if let Some(notice) = control.backoff_started.lock().unwrap().take() {
+                            notice.send(()).unwrap();
+                        }
+                        let _wait = control
+                            .changed
+                            .wait_timeout_while(guard, delay, |_| {
+                                !control.stop_requested.load(Ordering::SeqCst)
+                            })
+                            .unwrap_or_else(|e| e.into_inner());
+                    } else {
+                        thread::sleep(delay);
+                    }
                 }
             }
         }
@@ -487,6 +614,7 @@ fn abort_reason(result: &TrainingResult) -> String {
 /// Distinct from an abort's reason: an abort means the portal refused something,
 /// this means the run never asked — a local fault the operator can clear.
 const NOT_SUBMITTED: &str = "not submitted: the run stopped before reaching it";
+const OPERATOR_STOP: &str = "not submitted: operator stop";
 
 fn drain_skipped(
     queue: &mut TaskQueue<TraineeRef>,
@@ -514,6 +642,253 @@ mod tests {
     use std::rc::Rc;
 
     use crate::checkpoint::{BatchCheckpoint, CheckpointStatus, CheckpointWriter};
+
+    fn request_stop(control: &BatchControl) {
+        let _guard = control.pause_requested.lock().unwrap();
+        control.stop_requested.store(true, Ordering::SeqCst);
+        control.changed.notify_all();
+    }
+
+    struct StopSink {
+        recorder: Recorder,
+        control: Arc<BatchControl>,
+        stop_on_in_flight: bool,
+        stop_on_settlement: bool,
+        fail_aborted: usize,
+        aborted_writes: usize,
+    }
+    impl CheckpointWriter for StopSink {
+        fn write(&mut self, cp: &BatchCheckpoint) -> Result<(), String> {
+            if cp.status == CheckpointStatus::Aborted {
+                self.aborted_writes += 1;
+                if self.aborted_writes == self.fail_aborted {
+                    return Err("synthetic stop checkpoint failure".into());
+                }
+            }
+            self.recorder.write(cp)?;
+            if cp.status == CheckpointStatus::Running
+                && ((self.stop_on_in_flight && cp.in_flight.is_some())
+                    || (self.stop_on_settlement && cp.in_flight.is_none()))
+            {
+                request_stop(&self.control);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stop_before_first_attempt_records_skips_and_ordered_aborted_boundary() {
+        let recorder = Recorder::default();
+        let control = Arc::new(BatchControl::default());
+        let sink = StopSink {
+            recorder: recorder.clone(),
+            control: control.clone(),
+            stop_on_in_flight: true,
+            stop_on_settlement: false,
+            fail_aborted: 0,
+            aborted_writes: 0,
+        };
+        let mut engine = BatchEngine::new(Box::new(sink)).with_control(control);
+        let mut worker = FakeTransport::new(true, vec![]);
+        let report = engine
+            .run(&mut worker, &session(), refs(&["a", "b", "c"]))
+            .unwrap();
+        assert!(report.aborted);
+        assert_eq!(worker.submit_calls, 0);
+        assert_eq!(report.skipped, 3);
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|r| r.attempts == 0 && r.message.as_deref() == Some(OPERATOR_STOP))
+        );
+        let writes = recorder.written();
+        let boundary = writes
+            .iter()
+            .find(|cp| cp.status == CheckpointStatus::Aborted)
+            .unwrap();
+        assert_eq!(boundary.pending, ["b", "c"]);
+        assert!(boundary.in_flight.is_none());
+        assert_eq!(boundary.results[0].trainee_id, "a");
+        assert_eq!(writes.last().unwrap().results.len(), 3);
+    }
+
+    #[test]
+    fn stop_already_latched_wakes_initial_pause_without_dequeue_or_post() {
+        let recorder = Recorder::default();
+        let control = Arc::new(BatchControl::default());
+        *control.pause_requested.lock().unwrap() = true;
+        request_stop(&control);
+        let mut engine = with_recorder(&recorder).with_control(control);
+        let mut worker = FakeTransport::new(true, vec![]);
+        let report = engine
+            .run(&mut worker, &session(), refs(&["a", "b"]))
+            .unwrap();
+        assert!(report.aborted);
+        assert_eq!(worker.submit_calls, 0);
+        assert_eq!(report.skipped, 2);
+        let writes = recorder.written();
+        assert_eq!(writes[0].status, CheckpointStatus::Aborted);
+        assert_eq!(writes[0].pending, ["a", "b"]);
+        assert!(writes[0].results.is_empty());
+        assert!(writes[0].in_flight.is_none());
+    }
+
+    #[test]
+    fn stop_before_finish_on_last_success_preserves_success_but_records_abort() {
+        let recorder = Recorder::default();
+        let control = Arc::new(BatchControl::default());
+        let sink = StopSink {
+            recorder: recorder.clone(),
+            control: control.clone(),
+            stop_on_in_flight: false,
+            stop_on_settlement: true,
+            fail_aborted: 0,
+            aborted_writes: 0,
+        };
+        let mut engine = BatchEngine::new(Box::new(sink)).with_control(control.clone());
+        let mut worker = FakeTransport::new(true, vec![confirmed("a", "A")]);
+        let report = engine.run(&mut worker, &session(), refs(&["a"])).unwrap();
+        assert!(report.aborted);
+        assert_eq!(report.successful, 1);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.results[0].attempts, 1);
+        assert!(control.closed.load(Ordering::SeqCst));
+        assert_eq!(
+            recorder.written().last().unwrap().status,
+            CheckpointStatus::Aborted
+        );
+    }
+
+    #[test]
+    fn both_stop_boundary_and_stop_terminal_write_fail_closed() {
+        for fail_aborted in [1, 2] {
+            let recorder = Recorder::default();
+            let control = Arc::new(BatchControl::default());
+            let sink = StopSink {
+                recorder: recorder.clone(),
+                control: control.clone(),
+                stop_on_in_flight: false,
+                stop_on_settlement: true,
+                fail_aborted,
+                aborted_writes: 0,
+            };
+            let mut engine = BatchEngine::new(Box::new(sink)).with_control(control);
+            let mut worker = FakeTransport::new(true, vec![confirmed("a", "A")]);
+            let error = engine
+                .run(&mut worker, &session(), refs(&["a", "b", "c"]))
+                .unwrap_err();
+            assert!(error.contains("stop"), "{error}");
+            assert_eq!(worker.submit_calls, 1);
+            let writes = recorder.written();
+            let old = writes.last().unwrap();
+            assert_eq!(old.results.len(), 1);
+            assert_eq!(old.results[0].outcome, Outcome::Success);
+            assert_eq!(old.pending, ["b", "c"]);
+            assert!(old.in_flight.is_none());
+            assert_eq!(
+                old.status,
+                if fail_aborted == 1 {
+                    CheckpointStatus::Running
+                } else {
+                    CheckpointStatus::Aborted
+                }
+            );
+        }
+    }
+
+    struct StopAfterResponse {
+        worker: FakeTransport,
+        control: Arc<BatchControl>,
+    }
+    impl Transport for StopAfterResponse {
+        fn send(&mut self, req: &Request) -> Result<Response, String> {
+            let response = self.worker.send(req)?;
+            if req.op == crate::protocol::op::SUBMIT_TRAINING {
+                request_stop(&self.control);
+            }
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn stop_after_provably_unsent_response_preserves_failure_and_actual_attempts() {
+        let control = Arc::new(BatchControl::default());
+        let mut worker = StopAfterResponse {
+            worker: FakeTransport::new(
+                true,
+                vec![resp(
+                    r#"{"v":1,"status":"error","error_code":"ELEMENT_NOT_FOUND","message":"safe fixture error","proves_nothing_submitted":true}"#,
+                )],
+            ),
+            control: control.clone(),
+        };
+        let report = fast_engine()
+            .with_control(control)
+            .run(&mut worker, &session(), refs(&["a", "b"]))
+            .unwrap();
+        assert!(report.aborted);
+        assert_eq!(worker.worker.submit_calls, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.results[0].attempts, 1);
+        assert_eq!(
+            report.results[0].error_code.as_deref(),
+            Some("ELEMENT_NOT_FOUND")
+        );
+        assert_eq!(
+            report.results[0].message.as_deref(),
+            Some("operator stop before retry: safe fixture error")
+        );
+    }
+
+    #[test]
+    fn stop_interrupts_current_backoff_without_waiting_or_admitting_retry() {
+        let control = Arc::new(BatchControl::default());
+        let (notice, waiting) = std::sync::mpsc::channel();
+        *control.backoff_started.lock().unwrap() = Some(notice);
+        let c = control.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let thread = thread::spawn(move || {
+            let recorder = Recorder::default();
+            let mut worker = FakeTransport::new(
+                true,
+                vec![resp(
+                    r#"{"v":1,"status":"error","error_code":"TIMEOUT","message":"safe timeout","proves_nothing_submitted":true}"#,
+                )],
+            );
+            let mut engine = BatchEngine::with_policy(
+                RetryPolicy {
+                    max_attempts: 3,
+                    initial_delay_ms: 60_000,
+                    max_delay_ms: 60_000,
+                    backoff_factor: 2,
+                },
+                Box::new(recorder.clone()),
+            )
+            .with_control(c);
+            let report = engine
+                .run(&mut worker, &session(), refs(&["a", "b"]))
+                .unwrap();
+            done.send((report, worker.submit_calls, recorder.written()))
+                .unwrap();
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        request_stop(&control);
+        let (report, calls, writes) = result
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(report.aborted);
+        assert_eq!(calls, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.results[0].attempts, 1);
+        assert_eq!(report.results[0].error_code.as_deref(), Some("TIMEOUT"));
+        assert_eq!(writes.last().unwrap().status, CheckpointStatus::Aborted);
+    }
 
     struct BoundarySink {
         recorder: Recorder,

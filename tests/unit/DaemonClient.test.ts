@@ -4,7 +4,6 @@ import {
   DaemonError,
   extensionOrigin,
   isDaemonProgress,
-  proxyDaemonMessage,
   startupCommand,
 } from "../../src/core/infrastructure/daemon/DaemonClient";
 import type { DaemonSettings } from "../../src/core/infrastructure/daemon/DaemonClient";
@@ -205,21 +204,28 @@ describe("authenticated loopback daemon client", () => {
       "identity",
     );
   });
-  it("reserves STOP without fetching credentials or executing anything", async () => {
-    const load = vi.fn();
-    expect(await proxyDaemonMessage({ type: "STOP_AUTOMATION" }, load)).toEqual(
-      {
-        success: false,
-        error: "Stop is not supported (reserved for Stage 31).",
-      },
-    );
-    expect(load).not.toHaveBeenCalled();
+  it("returns repeated explicit pending stops unchanged, without inventing a terminal state", async () => {
+    const pending = { ...progress, pauseRequested: false, stopRequested: true };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => response(pending));
+    const client = new DaemonClient(settings, fetcher);
+    expect(await client.stop()).toEqual(pending);
+    expect(await client.stop()).toEqual(pending);
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:8765/batch/stop",
+      "http://127.0.0.1:8765/batch/stop",
+    ]);
   });
 
-  it.each(["pause", "resume"] as const)(
+  it.each(["pause", "resume", "stop"] as const)(
     "%s sends authenticated JSON {} and returns raw progress on 200, never admission",
     async (action) => {
-      const value = { ...progress, pauseRequested: action === "pause" };
+      const value = {
+        ...progress,
+        pauseRequested: action === "pause",
+        stopRequested: action === "stop",
+      };
       const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response(value));
       expect(await new DaemonClient(settings, fetcher)[action]()).toEqual(
         value,
@@ -243,7 +249,7 @@ describe("authenticated loopback daemon client", () => {
     },
   );
 
-  it.each(["pause", "resume"] as const)(
+  it.each(["pause", "resume", "stop"] as const)(
     "%s rejects 202, envelopes, batch IDs, malformed JSON and malformed progress without retry",
     async (action) => {
       for (const reply of [
@@ -252,6 +258,9 @@ describe("authenticated loopback daemon client", () => {
         response({ batchId: "not-a-control-result" }),
         new Response("not json"),
         response({ ...progress, pauseRequested: "true" }),
+        ...[null, 0, 1, "true", "false", {}, []].map((stopRequested) =>
+          response({ ...progress, stopRequested }),
+        ),
       ]) {
         const fetcher = vi.fn<typeof fetch>().mockResolvedValue(reply);
         await expect(
@@ -272,7 +281,7 @@ describe("authenticated loopback daemon client", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
-  it.each(["pause", "resume"] as const)(
+  it.each(["pause", "resume", "stop"] as const)(
     "%s surfaces every control refusal and unknown network outcome once without retry",
     async (action) => {
       for (const code of [401, 403, 405, 409, 415, 422, 500, 502, 503]) {
@@ -329,6 +338,29 @@ describe("authenticated loopback daemon client", () => {
     );
   });
 
+  it("validates optional stop intent without inferring state or rejecting older daemons", () => {
+    for (const state of [
+      "idle",
+      "initializing",
+      "loading_trainee",
+      "submitting",
+      "retrying",
+      "paused",
+      "stopped",
+      "complete",
+    ]) {
+      for (const stopRequested of [true, false, undefined])
+        expect(isDaemonProgress({ ...progress, state, stopRequested })).toBe(
+          true,
+        );
+    }
+    for (const stopRequested of [null, 0, 1, "false", {}, []])
+      expect(isDaemonProgress({ ...progress, stopRequested })).toBe(false);
+    expect(isDaemonProgress({ ...progress, state: "stop_pending" })).toBe(
+      false,
+    );
+  });
+
   it("parses paused, pending and waking states without inferring pause from intent", () => {
     for (const state of [
       "paused",
@@ -347,6 +379,54 @@ describe("authenticated loopback daemon client", () => {
       ).toBe(false);
     expect(isDaemonProgress({ ...progress, state: "pause_pending" })).toBe(
       false,
+    );
+  });
+
+  it.each([null, 0, 1, "true", "false", {}, []])(
+    "rejects non-boolean stopRequested=%s on status polling without retry or fallback",
+    async (stopRequested) => {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(response({ ...progress, stopRequested }));
+      await expect(
+        new DaemonClient(settings, fetcher).status(),
+      ).rejects.toMatchObject({
+        status: 200,
+        message: "Daemon returned an unexpected response.",
+      });
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(fetcher.mock.calls[0]?.[0]).toBe("http://127.0.0.1:8765/status");
+    },
+  );
+
+  it("does not turn pause/resume refusals after stop into cancellation, recovery or admission", async () => {
+    const pending = {
+      ...progress,
+      state: "paused",
+      pauseRequested: false,
+      stopRequested: true,
+    };
+    const terminal = { ...pending, state: "stopped" };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(response(pending))
+      .mockResolvedValueOnce(response({ error: "stop already requested" }, 409))
+      .mockResolvedValueOnce(response({ error: "stop already requested" }, 409))
+      .mockResolvedValueOnce(response(terminal))
+      .mockResolvedValueOnce(response({ error: "no active controller" }, 409));
+    const client = new DaemonClient(settings, fetcher);
+    expect(await client.stop()).toEqual(pending);
+    for (const action of ["pause", "resume"] as const)
+      await expect(client[action]()).rejects.toMatchObject({
+        status: 409,
+        message: "Daemon HTTP 409: stop already requested",
+      });
+    expect(await client.status()).toEqual(terminal);
+    await expect(client.stop()).rejects.toMatchObject({ status: 409 });
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual(
+      ["batch/stop", "batch/pause", "batch/resume", "status", "batch/stop"].map(
+        (route) => `http://127.0.0.1:8765/${route}`,
+      ),
     );
   });
 });

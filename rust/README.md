@@ -172,7 +172,7 @@ No row here exits 1: that code means the coordinator never reached a submission
 there is no classified line to print. A session that lapses *mid-run* is a
 `HALT: SESSION_EXPIRED` and exits 3, as above.
 
-## Stages 29–30: loopback daemon
+## Stages 29–31: loopback daemon
 
 The CLI above remains unchanged. `cargo run --offline -- --daemon` selects the
 HTTP bridge; the extension never starts or owns this process. Starting a daemon
@@ -220,7 +220,7 @@ headers are emitted and `OPTIONS` is unsupported.
 | `GET /form-options` | `200` + `{instructors: [{value,label}], trainingTypes: [{value,label}]}` |
 | `POST /batch` | `202` + `{batchId}`; recovery refusal `409`; invalid/unresolvable input `422`; active worker `503` |
 | `POST /batch/pause`, `/batch/resume` | `200` + raw `BatchProgress`; no controllable batch `409` |
-| `POST /batch/stop` | `405` (Stage 31 unsupported) |
+| `POST /batch/stop` | `200` + raw `BatchProgress` with latched stop intent; no controllable batch `409` |
 
 Unknown methods/paths return `405`. Authentication failures are `401`, foreign
 origins `403`, non-JSON batch/control content types `415`, malformed HTTP `400`, excessive
@@ -251,7 +251,7 @@ Settled/possibly submitted trainees are carried, never requeued.
 
 `/status` uses the exact TS `BatchProgress` names: `state`, `total`, `processed`,
 `successful`, `failed`, `skipped`, `indeterminate`, `remaining`, and optional
-`currentTraineeName`, plus `pauseRequested: boolean`. Checkpoint writes drive progress during execution; the
+`currentTraineeName`, plus `pauseRequested: boolean` and `stopRequested: boolean`. Checkpoint writes drive progress during execution; the
 worker's internal browser/form phases are not separately exposed. Report and
 checkpoint keys are camelCase on HTTP and unchanged snake_case on disk/CLI.
 Timestamps remain **epoch-millisecond strings**, not the legacy TS ISO format.
@@ -271,7 +271,7 @@ Only the checkpoint survives daemon restart: `/status` begins idle and `/report`
 returns null, while `/checkpoint` still exposes the durable predecessor and the
 start guard protects it. Do not run a CLI batch and daemon, or multiple daemons,
 against the same profile/checkpoint concurrently: there is no cross-process
-ownership lock. Stop and graceful daemon shutdown remain out of scope.
+ownership lock. Graceful daemon shutdown remains out of scope.
 
 ### Stage 30: cooperative pause/resume
 
@@ -317,6 +317,68 @@ progress, not an envelope or a new batch ID.
 Normal CLI execution has no controller and is unchanged. These are synthetic,
 offline semantics, not a claim of live batch acceptance.
 
+### Stage 31: cooperative, latched stop
+
+`POST /batch/stop` requires the same bearer authentication, allowed Origin,
+`Content-Type: application/json`, header/body caps and read deadline as the other
+controls. Its body must be an empty JSON object `{}` (surrounding whitespace is
+allowed). Empty bytes, malformed JSON, non-object values or nonempty objects
+return `422`. Success is `200` with raw `BatchProgress`, not an envelope or
+`batchId`.
+
+- **Stop is a one-way latch on the installed controller.** It sets
+  `stopRequested: true`, clears pause intent and wakes the condition variable.
+  Repeated stop while that controller remains active returns `200`. Pause and
+  in-memory resume after stop return `409` and cannot clear the latch. Idle,
+  finished/aborted batches, form-options, admission before installation, and
+  worker teardown return `409` without spawning a worker. A stale captured
+  controller cannot affect a subsequent batch.
+- **An admitted attempt settles; no new attempt is admitted after stop.** Stop
+  does not cancel the blocking worker round trip. Submit-attempt admission is
+  serialized with the latch; an attempt admitted before stop is in flight even
+  if its transport call has not yet returned. Safe retries are new attempts and
+  are prohibited after stop. Retry backoff waits on the same condition variable,
+  so stop interrupts it immediately rather than waiting for the backoff deadline.
+  Pause alone still permits the existing safe retry policy. An indeterminate or
+  ambiguous transport result still aborts exactly once, without retry/requeue.
+- **Results remain truthful.** A completed request retains its actual outcome and
+  attempt count. A provably-unsent transient error stopped before retry is
+  `failed` with its actual attempts and original error code/message context, not
+  `skipped`, success, or indeterminate. Never-attempted trainees are drained in
+  queue order as `skipped`, with zero attempts and message
+  `not submitted: operator stop`. Report counts include all rows and
+  `report.aborted` is true for an observed stop.
+- **Stopping has a durable boundary.** Before dequeuing another trainee (also
+  when waking from pause), Rust must persist `status: aborted`, settled results,
+  ordered pending IDs, and `in_flight: null` before publishing `state: stopped`.
+  The final aborted checkpoint includes the drained skips. Both stop-boundary
+  and final stop-checkpoint failures are fatal: no later submission or fallback
+  terminal write, and no fabricated successful report. Error progress is
+  `stopped`, but may retain the last durable counts; inspect the checkpoint.
+  Atomic storage leaves the prior checkpoint intact on a failed replacement.
+- **Completion has an ordering point.** Stop and terminal completion are
+  serialized. If stop is observed before completion closes the controller, the
+  batch is aborted even if the last row succeeded; that row remains a success
+  and no nonexistent skipped row is invented. If completion closes first,
+  late stop is `409` and cannot relabel a fully processed successful batch.
+  The active state (or already durable `paused` state) remains visible while
+  stop is pending; requesting stop alone never publishes `stopped`.
+- **Cleanup and recovery are distinct.** Controls close on completion, error or
+  panic before worker teardown; admission stays busy until worker shutdown ends.
+  `stopRequested` remains true in the stopped batch's progress, including an
+  error after stop, and resets to false on a newly admitted batch or daemon
+  restart. Restart creates no controller. Stop/pause/resume cannot acknowledge
+  recovery or replay trainees. The existing guard still refuses a fresh start
+  over landed/uncertain work. Only explicit reviewed `POST /batch` with
+  `resume: true` acknowledges recovery and creates a new worker when there are
+  never-attempted rows to run; settled/uncertain rows are carried, never rerun.
+
+The CLI still has no controller and its behavior is unchanged. This stage uses
+only synthetic offline tests, not live portal acceptance. The thin extension
+sends Stop once and polls Rust; it never cancels a worker, requeues trainees or
+acknowledges recovery. While stop is latched, new Start, session edits and
+Pause/Resume remain locked. Stopped progress with no report requires human review.
+
 ### Offline verification
 
 ```sh
@@ -332,7 +394,24 @@ scratch directories, not operator job/evidence/marker locations. Stage 30 tests
 cover a blocked submission with pending pause, durable safe-boundary publication,
 responsive polling, same-worker resume without duplicates, idempotent/cancelled
 intent, controller cleanup, shared request security, paused recovery refusal with
-zero worker starts, and fatal pause/resume checkpoint failures.
+zero worker starts, and fatal pause/resume checkpoint failures. Stage 31 adds
+blocked-submit stop with exactly-once settlement, paused wake without another
+POST, interruptible long backoff with no retry, immutable stop intent,
+idempotence, stale-controller refusal/fresh-controller reset, idle/admission/
+form-options refusal, preserved checkpoint information on stop write failure,
+ambiguous/indeterminate abort, shared control security/caps/deadlines, and
+explicit-only recovery without replay. Engine tests cover both boundary and
+terminal stop write failures and stop observed before last-row completion.
+
+Stage 31 offline validation: **215 tests passed** (211 unit/loopback tests and
+4 fixture binary/CLI tests); Rustfmt and Clippy `--all-targets -- -D warnings`
+passed. The full unfiltered Rust suite subsequently completed successfully in
+one run. Earlier validation used complementary runs after a 120-second limit:
+
+```sh
+cargo test --offline -- --skip engine::tests::probe_crash_matrix
+cargo test --offline engine::tests::probe_crash_matrix
+```
 
 ## Safety
 
