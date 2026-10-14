@@ -1,6 +1,6 @@
 # Stage 29 — Extension → Rust daemon API
 
-Status: **implemented; Stage 29 Passed on offline fixture acceptance.** The Rust
+Status: **implemented; Stages 29/30 Passed on offline fixture acceptance.** The Rust
 daemon and thin extension client follow this contract. See `rust/README.md` for
 configuration, HTTP wire shapes, and platform limitations.
 
@@ -46,8 +46,8 @@ their meaning.
 | `GET` | `/checkpoint` | `GET_CHECKPOINT` | `BatchCheckpoint` or `null` |
 | `GET` | `/form-options` | `GET_FORM_OPTIONS` | `TrainingFormOptions` |
 | `POST` | `/batch` | `START_AUTOMATION` | `202` + batch id, or `409` refusal |
-| `POST` | `/batch/pause` | `PAUSE_AUTOMATION` | reserved — Stage 30 |
-| `POST` | `/batch/resume` | `RESUME_AUTOMATION` | reserved — Stage 30 |
+| `POST` | `/batch/pause` | `PAUSE_AUTOMATION` | `200` + raw progress with pause intent; `409` if no controllable batch |
+| `POST` | `/batch/resume` | `RESUME_AUTOMATION` | `200` + raw progress; same in-memory batch only |
 | `POST` | `/batch/stop` | `STOP_AUTOMATION` | reserved — Stage 31 |
 
 `POST /batch` body:
@@ -184,6 +184,52 @@ native messaging rejected.
 - An existing legacy forwarding test was corrected to call each adapter with its
   actual typed arguments; no legacy production portal behavior was changed.
 
+## Stage 30 — cooperative pause and in-memory resume
+
+Both control endpoints require the existing bearer token, allowed Origin, JSON
+content type, and an empty JSON object `{}`. They share request caps/read
+limits. A valid control returns `200` with raw `BatchProgress`, including
+`pauseRequested`; it never returns a new batch ID or admits another worker.
+
+- Pause is a request, not cancellation. During a trainee's submission, retries
+  allowed by the existing safe policy, and settlement, the active state remains
+  visible with `pauseRequested: true`. Never cancel/requeue an in-flight POST.
+- With work still pending, the engine persists a paused checkpoint **before
+  dequeuing** the next trainee and before publishing `state: paused`. Settled
+  results and queue order are preserved; `in_flight` is null. Rust waits on a
+  condition variable; status polling stays responsive and new starts return `503`.
+- Resume clears pause intent and wakes the same engine/worker. The response can
+  remain `paused` until Rust durably writes `running`. A failed pause or resume
+  checkpoint halts before any later submission. Unknown outcomes still abort;
+  exhausted-queue completion wins over pause.
+- Repeated pause/resume is idempotent within the same controllable batch. Resume
+  can cancel a pending pause. Admission before controller installation, idle,
+  finished/aborted, teardown, and form-options work return `409` without changing
+  execution. Stale controllers cannot alter another batch.
+- These controls do **not** acknowledge restart recovery. After restart, a paused
+  checkpoint has no live controller: `/batch/resume` returns `409`, and ordinary
+  batch admission is still guarded. Only reviewed `POST /batch` with explicit
+  `resume: true` and the original session template acknowledges recovery.
+- The popup sends intent once, then polls Rust. Session edits and new admission
+  stay locked while pause is pending/active. It distinguishes pending pause,
+  durable pause, and wake-up; it stores no queue/recovery state. Lost/refused
+  control requests are shown, not automatically retried. Stop remains Stage 31.
+
+### Stage 30 acceptance results
+
+- `cargo test --offline`: **205 passed** (201 coordinator/loopback tests plus
+  4 fixture binary/CLI tests); Clippy `--all-targets -- -D warnings` passed.
+- `pnpm typecheck`: passed; `pnpm test`: **256 passed** across 20 files.
+- Deterministic fixtures cover pending pause during a blocked submission,
+  exactly-once settlement, unchanged pending queue, responsive polling, same-worker
+  resume, cancellation/idempotence, indeterminate abort, fatal checkpoint failures,
+  restart refusal with zero worker starts, and controller cleanup.
+- Mocked UI/client tests cover authenticated JSON control bodies, `200` versus
+  admission `202`, stale polling responses, disconnect/reconnect, disabled controls,
+  no automatic retries/fallback, and the distinction from checkpoint recovery.
+
+All checks are offline; no real training records were submitted for this stage.
+
 ## Remaining operational limits
 
 - Token-file hardening is Linux-specific. Installed-browser Origin/permission
@@ -199,9 +245,9 @@ native messaging rejected.
 
 ## Not in this design
 
-- **Pause / resume / stop** (Stages 30, 31). The endpoints are reserved so the
-  `Message` union maps cleanly, but the engine has no API for them yet and the
-  spec forbids building ahead of the stage.
+- **Stop** (Stage 31). `/batch/stop` remains unsupported (`405`) and the popup
+  Stop control remains disabled. No cancellation or forced worker termination
+  was added as part of Stage 30.
 - **Push instead of poll.** The popup polls `/status` while it is open. A push
   channel is a WebSocket by another name and was rejected with it; if polling
   proves too coarse, that decision can be revisited on its own merits.

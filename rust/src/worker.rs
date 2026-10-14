@@ -179,7 +179,10 @@ mod tests {
         let error = check_version(&response(V + 1)).expect_err("a version this build cannot read");
 
         assert!(error.contains("protocol version mismatch"), "{error}");
-        assert!(error.contains("speaks v2"), "names the worker's version: {error}");
+        assert!(
+            error.contains("speaks v2"),
+            "names the worker's version: {error}"
+        );
         assert!(error.contains("speaks v1"), "and this build's: {error}");
     }
 

@@ -65,9 +65,9 @@ pub struct BatchCheckpoint {
 /// remains testable without a filesystem — the unit tests pass a recorder, the
 /// CLI passes [`crate::store::CheckpointStore`].
 ///
-/// Implementations own their own error reporting. The engine drops the error on
-/// purpose: a storage fault must not abort a batch that is otherwise submitting
-/// successfully, so the sink is the only place a failed write becomes visible.
+/// Implementations own their own error reporting. Pre-submission and cooperative
+/// pause/resume boundary writes must succeed before execution can advance;
+/// settlement and terminal writes remain best-effort.
 pub trait CheckpointWriter {
     fn write(&mut self, checkpoint: &BatchCheckpoint) -> Result<(), String>;
 }
@@ -76,7 +76,10 @@ impl BatchCheckpoint {
     /// True while the batch that wrote this checkpoint was still expected to
     /// run.
     pub fn is_live(&self) -> bool {
-        matches!(self.status, CheckpointStatus::Running | CheckpointStatus::Paused)
+        matches!(
+            self.status,
+            CheckpointStatus::Running | CheckpointStatus::Paused
+        )
     }
 
     /// Re-mark a checkpoint abandoned by a terminated process.
@@ -391,8 +394,7 @@ pub const IN_FLIGHT_MESSAGE: &str =
 pub const LEGACY_PENDING_CODE: &str = "CRASH_UNTRACKED_PENDING";
 
 /// Why that record is unconfirmed, in the operator's terms.
-pub const LEGACY_PENDING_MESSAGE: &str =
-    "was next in queue when a build without in-flight tracking died — the submission may have \
+pub const LEGACY_PENDING_MESSAGE: &str = "was next in queue when a build without in-flight tracking died — the submission may have \
      reached the portal";
 
 /// Error code on the synthesized record for a trainee left *behind* the head of a
@@ -405,8 +407,7 @@ pub const LEGACY_PENDING_MESSAGE: &str =
 pub const LEGACY_QUEUE_CODE: &str = "CRASH_UNTRACKED_QUEUE";
 
 /// Why that record is unconfirmed, in the operator's terms.
-pub const LEGACY_QUEUE_MESSAGE: &str =
-    "was still queued in a file that cannot say how far it had got — the submission may have \
+pub const LEGACY_QUEUE_MESSAGE: &str = "was still queued in a file that cannot say how far it had got — the submission may have \
      reached the portal";
 
 #[derive(Debug, Clone, Serialize)]
@@ -599,7 +600,8 @@ mod tests {
             interrupted_mid_submission(),
             checkpoint(CheckpointStatus::Finished),
         ] {
-            let accounted = cp.results.len() + cp.pending.len() + usize::from(cp.in_flight.is_some());
+            let accounted =
+                cp.results.len() + cp.pending.len() + usize::from(cp.in_flight.is_some());
 
             assert_eq!(accounted, cp.total, "{cp:?}");
         }
@@ -640,7 +642,11 @@ mod tests {
         ];
         cp.pending = Vec::new();
 
-        assert!(cp.never_attempted().is_empty(), "{:?}", cp.never_attempted());
+        assert!(
+            cp.never_attempted().is_empty(),
+            "{:?}",
+            cp.never_attempted()
+        );
     }
 
     /// A live checkpoint is a killed process; its last trainee's outcome may be
@@ -772,7 +778,10 @@ mod tests {
         cp.in_flight = None;
 
         assert_eq!(cp.unaccounted(), 2);
-        assert!(cp.blocks_start(), "two of its four trainees are in no group");
+        assert!(
+            cp.blocks_start(),
+            "two of its four trainees are in no group"
+        );
     }
 
     /// The counterweight, so the check cannot be satisfied by blocking always.
@@ -935,7 +944,8 @@ mod tests {
     /// build wrote this".
     #[test]
     fn an_idle_checkpoint_serializes_a_null_in_flight() {
-        let json = serde_json::to_string(&checkpoint(CheckpointStatus::Running)).expect("serializes");
+        let json =
+            serde_json::to_string(&checkpoint(CheckpointStatus::Running)).expect("serializes");
 
         assert!(json.contains("\"in_flight\":null"), "{json}");
     }

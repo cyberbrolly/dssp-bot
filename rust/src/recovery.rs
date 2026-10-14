@@ -464,10 +464,8 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "dssp-bot-recovery-{}-{name}",
-                uuid::Uuid::new_v4()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("dssp-bot-recovery-{}-{name}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&dir).expect("scratch dir");
 
             Self { dir }
@@ -566,7 +564,9 @@ mod tests {
     fn a_live_checkpoint_refuses_a_start() {
         let scratch = Scratch::new("live");
         let store = scratch.store();
-        store.save(&unfinished(CheckpointStatus::Running)).expect("saves");
+        store
+            .save(&unfinished(CheckpointStatus::Running))
+            .expect("saves");
 
         let refusal = guard(&store, false).expect_err("a killed run must not be overwritten");
 
@@ -580,7 +580,9 @@ mod tests {
     fn a_refused_start_marks_the_live_checkpoint_interrupted() {
         let scratch = Scratch::new("mark");
         let store = scratch.store();
-        store.save(&unfinished(CheckpointStatus::Running)).expect("saves");
+        store
+            .save(&unfinished(CheckpointStatus::Running))
+            .expect("saves");
 
         let _ = guard(&store, false).expect_err("refused");
 
@@ -640,7 +642,10 @@ mod tests {
         // this path returns without ever constructing the engine, so nothing else
         // would write the terminal status and every later plain start would refuse
         // over a batch with no loose ends left.
-        let after = CheckpointStore::new(store.path()).load().expect("reads").expect("there");
+        let after = CheckpointStore::new(store.path())
+            .load()
+            .expect("reads")
+            .expect("there");
         assert_eq!(after.status, CheckpointStatus::Finished);
 
         let start = guard(&store, false).expect("the batch is closed out");
@@ -666,11 +671,17 @@ mod tests {
         let start = guard(&store, false).expect("nothing was sent");
 
         assert_fresh(&start);
-        assert!(start.recovered, "but the kill is still recorded and reported");
+        assert!(
+            start.recovered,
+            "but the kill is still recorded and reported"
+        );
 
         // Nothing landed, so this one *is* an ordinary next start: the batch it
         // belonged to is gone and the job file runs from the top, as it should.
-        let after = CheckpointStore::new(store.path()).load().expect("reads").expect("there");
+        let after = CheckpointStore::new(store.path())
+            .load()
+            .expect("reads")
+            .expect("there");
         assert_eq!(after.status, CheckpointStatus::Interrupted);
     }
 
@@ -707,14 +718,21 @@ mod tests {
         assert!(refusal.contains("running the job file again"), "{refusal}");
 
         // And the way forward still runs only what was never attempted.
-        let Plan::Resume { roster, carried, owed } =
-            guard(&store, true).expect("the override").plan
+        let Plan::Resume {
+            roster,
+            carried,
+            owed,
+        } = guard(&store, true).expect("the override").plan
         else {
             panic!("expected a resume");
         };
 
         let ids: Vec<&str> = roster.iter().filter_map(|r| r.id.as_deref()).collect();
-        assert_eq!(ids, vec!["3"], "trainee 1 landed, trainee 2 was answered for");
+        assert_eq!(
+            ids,
+            vec!["3"],
+            "trainee 1 landed, trainee 2 was answered for"
+        );
         assert_eq!(owed, 0, "{carried:?}");
     }
 
@@ -749,18 +767,33 @@ mod tests {
         .expect("writes");
 
         let refusal = guard(&store, false).expect_err("a legacy file with a queue is refused");
-        assert!(refusal.contains("could not record a submission in flight"), "{refusal}");
+        assert!(
+            refusal.contains("could not record a submission in flight"),
+            "{refusal}"
+        );
         assert!(refusal.contains('2'), "and it names the trainee: {refusal}");
 
         // Run 2, exactly as the refusal advises: trainee 2 must not be run.
         let start = guard(&store, true).expect("the override");
-        let Plan::Resume { roster, carried, owed } = start.plan else {
+        let Plan::Resume {
+            roster,
+            carried,
+            owed,
+        } = start.plan
+        else {
             panic!("expected a resume");
         };
 
         let ids: Vec<&str> = roster.iter().filter_map(|r| r.id.as_deref()).collect();
-        assert_eq!(ids, vec!["3"], "only the trainee the dead build never reached");
-        assert!(carried.iter().any(|r| r.trainee_id == "2"), "2 is carried, not run");
+        assert_eq!(
+            ids,
+            vec!["3"],
+            "only the trainee the dead build never reached"
+        );
+        assert!(
+            carried.iter().any(|r| r.trainee_id == "2"),
+            "2 is carried, not run"
+        );
         assert_eq!(owed, 1, "and it is still owed an answer");
     }
 
@@ -836,13 +869,19 @@ mod tests {
     /// A terminal status is not enough: this record may already exist on the
     /// portal, and the new batch's first write would drop it.
     #[test]
-    fn an_unconfirmed_record_refuses_a_start_from_a_finished_batch() {        let scratch = Scratch::new("unconfirmed");
+    fn an_unconfirmed_record_refuses_a_start_from_a_finished_batch() {
+        let scratch = Scratch::new("unconfirmed");
         let store = scratch.store();
-        store.save(&unfinished(CheckpointStatus::Finished)).expect("saves");
+        store
+            .save(&unfinished(CheckpointStatus::Finished))
+            .expect("saves");
 
         let refusal = guard(&store, false).expect_err("must not be overwritten");
 
-        assert!(refusal.contains("may already exist on the portal"), "{refusal}");
+        assert!(
+            refusal.contains("may already exist on the portal"),
+            "{refusal}"
+        );
         assert!(refusal.contains("DSSP_RESUME=1"), "{refusal}");
     }
 
@@ -863,14 +902,18 @@ mod tests {
     /// A corrupt file cannot be allowed to read as "no batch ran" — the one
     /// conclusion that invites a second submission.
     #[test]
-    fn an_unreadable_checkpoint_refuses_a_start() {        let scratch = Scratch::new("corrupt");
+    fn an_unreadable_checkpoint_refuses_a_start() {
+        let scratch = Scratch::new("corrupt");
         let store = scratch.store();
         fs::write(store.path(), r#"{"status":"running","resul"#).expect("write partial json");
 
         let refusal = guard(&store, false).expect_err("must not be read as nothing");
 
         assert!(refusal.contains("cannot be read"), "{refusal}");
-        assert!(!refusal.contains("DSSP_RESUME"), "resuming cannot fix it: {refusal}");
+        assert!(
+            !refusal.contains("DSSP_RESUME"),
+            "resuming cannot fix it: {refusal}"
+        );
     }
 
     /// The acknowledgement must not be a way to overwrite an unreadable file
@@ -896,7 +939,11 @@ mod tests {
         let start = guard(&store, true).expect("the override");
 
         match start.plan {
-            Plan::Resume { roster, carried, owed } => {
+            Plan::Resume {
+                roster,
+                carried,
+                owed,
+            } => {
                 let ids: Vec<String> = roster.iter().filter_map(|r| r.id.clone()).collect();
 
                 assert_eq!(ids, vec!["5", "3", "4"], "drained skips, then the queue");
@@ -927,7 +974,9 @@ mod tests {
         let start = guard(&store, true).expect("the override");
 
         match start.plan {
-            Plan::Resume { roster, carried, .. } => {
+            Plan::Resume {
+                roster, carried, ..
+            } => {
                 assert_eq!(roster.len() + carried.len(), total);
             }
             other => panic!("expected a resume, got {other:?}"),
@@ -940,11 +989,17 @@ mod tests {
     fn a_resume_never_offers_an_unconfirmed_trainee() {
         let scratch = Scratch::new("no-replay");
         let store = scratch.store();
-        store.save(&unfinished(CheckpointStatus::Finished)).expect("saves");
+        store
+            .save(&unfinished(CheckpointStatus::Finished))
+            .expect("saves");
 
         let start = guard(&store, true).expect("the override");
         let (roster, carried, _) = match start.plan {
-            Plan::Resume { roster, carried, owed } => (roster, carried, owed),
+            Plan::Resume {
+                roster,
+                carried,
+                owed,
+            } => (roster, carried, owed),
             other => panic!("expected a resume, got {other:?}"),
         };
         let ids: Vec<String> = roster.iter().filter_map(|r| r.id.clone()).collect();
@@ -962,13 +1017,21 @@ mod tests {
 
         let start = guard(&store, true).expect("the override");
         let (roster, carried, _) = match start.plan {
-            Plan::Resume { roster, carried, owed } => (roster, carried, owed),
+            Plan::Resume {
+                roster,
+                carried,
+                owed,
+            } => (roster, carried, owed),
             other => panic!("expected a resume, got {other:?}"),
         };
         let ids: Vec<String> = roster.iter().filter_map(|r| r.id.clone()).collect();
 
         assert_eq!(ids, vec!["3", "4"], "the never-attempted, and only those");
-        assert_eq!(carried.len(), 2, "the one that settled, and the one in flight");
+        assert_eq!(
+            carried.len(),
+            2,
+            "the one that settled, and the one in flight"
+        );
 
         let in_flight = carried
             .iter()
@@ -985,7 +1048,9 @@ mod tests {
     fn a_resume_skips_what_already_settled() {
         let scratch = Scratch::new("settled-skip");
         let store = scratch.store();
-        store.save(&unfinished(CheckpointStatus::Finished)).expect("saves");
+        store
+            .save(&unfinished(CheckpointStatus::Finished))
+            .expect("saves");
 
         let start = guard(&store, true).expect("the override");
         let roster = match start.plan {
@@ -1018,7 +1083,11 @@ mod tests {
         let start = guard(&store, true).expect("the override");
 
         match start.plan {
-            Plan::Resume { roster, carried, owed } => {
+            Plan::Resume {
+                roster,
+                carried,
+                owed,
+            } => {
                 assert!(roster.is_empty(), "nothing was left unsent");
                 assert_eq!(carried.len(), 1, "the record that did land");
                 assert_eq!(
@@ -1068,9 +1137,18 @@ mod tests {
 
         let refusal = guard(&store, false).expect_err("must not be overwritten");
 
-        assert!(refusal.contains("could not record a submission in flight"), "{refusal}");
-        assert!(refusal.contains("cannot say how far through its queue it got"), "{refusal}");
-        assert!(refusal.contains("anything behind it may be on the portal"), "{refusal}");
+        assert!(
+            refusal.contains("could not record a submission in flight"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("cannot say how far through its queue it got"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("anything behind it may be on the portal"),
+            "{refusal}"
+        );
         assert!(refusal.contains('2'), "the trainee in question: {refusal}");
         assert!(
             refusal.contains("0 a resume would run"),
@@ -1095,7 +1173,11 @@ mod tests {
         let start = guard(&store, true).expect("the override");
 
         match start.plan {
-            Plan::Resume { roster, carried, owed } => {
+            Plan::Resume {
+                roster,
+                carried,
+                owed,
+            } => {
                 let ids: Vec<String> = roster.iter().filter_map(|r| r.id.clone()).collect();
 
                 assert!(
@@ -1165,14 +1247,22 @@ mod tests {
     fn the_refusal_names_the_file_the_counts_and_the_ways_forward() {
         let scratch = Scratch::new("refusal-text");
         let store = scratch.store();
-        store.save(&unfinished(CheckpointStatus::Finished)).expect("saves");
+        store
+            .save(&unfinished(CheckpointStatus::Finished))
+            .expect("saves");
 
         let refusal = guard(&store, false).expect_err("refused");
 
         assert!(refusal.contains("dssp.checkpoint.json"), "{refusal}");
-        assert!(refusal.contains("1758285600000"), "the batch's clock: {refusal}");
+        assert!(
+            refusal.contains("1758285600000"),
+            "the batch's clock: {refusal}"
+        );
         assert!(refusal.contains("4 trainee(s)"), "{refusal}");
-        assert!(refusal.contains("1 settled"), "not the in-flight count: {refusal}");
+        assert!(
+            refusal.contains("1 settled"),
+            "not the in-flight count: {refusal}"
+        );
         assert!(refusal.contains("1 unconfirmed"), "{refusal}");
         assert!(refusal.contains("2 never attempted"), "{refusal}");
         assert!(refusal.contains("DSSP_RESUME=1"), "{refusal}");

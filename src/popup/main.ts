@@ -8,9 +8,11 @@ import {
 } from "../core/infrastructure/daemon/DaemonClient";
 import type { DaemonSettings } from "../core/infrastructure/daemon/DaemonClient";
 import type { TrainingFormOption } from "../core/domain/TrainingFormOptions";
+import type { BatchProgress } from "../core/infrastructure/messaging/Messages";
 import { parseTraineeInput } from "../core/shared/parseTraineeInput";
 import {
   readDaemonView,
+  pauseSummary,
   recoverySummary,
   reportSummary,
   sessionLocked,
@@ -36,7 +38,11 @@ const ui = {
   trainingDate: element<HTMLInputElement>("training-date"),
   trainees: element<HTMLTextAreaElement>("trainees"),
   current: element<HTMLParagraphElement>("current"),
+  pauseStatus: element<HTMLParagraphElement>("pause-status"),
   start: element<HTMLButtonElement>("start"),
+  pause: element<HTMLButtonElement>("pause"),
+  resume: element<HTMLButtonElement>("resume"),
+  stop: element<HTMLButtonElement>("stop"),
   status: element<HTMLParagraphElement>("status"),
   recoverySection: element<HTMLElement>("recovery-section"),
   recovery: element<HTMLParagraphElement>("recovery"),
@@ -59,7 +65,8 @@ ui.port.value = String(DEFAULT_DAEMON_PORT);
 let client: DaemonClient | null = null;
 let connected = false;
 let optionsReady = false;
-let polling = false;
+let polling: { client: DaemonClient; generation: number } | null = null;
+let progress: BatchProgress | null = null;
 let busy = false;
 let viewGeneration = 0;
 
@@ -68,8 +75,21 @@ function status(text: string, error = false): void {
   ui.status.dataset.tone = error ? "error" : "info";
 }
 function controls(): void {
+  const state = progress?.state ?? "unknown";
   const locked =
-    !connected || busy || sessionLocked(ui.state.dataset.state ?? "unknown");
+    !connected || busy || sessionLocked(state) || !!progress?.pauseRequested;
+  // Initializing also covers admission, before Rust installs its controller.
+  const active = ["loading_trainee", "submitting", "retrying"].includes(state);
+  ui.pause.disabled =
+    !connected || busy || !active || !!progress?.pauseRequested;
+  ui.resume.disabled =
+    !connected ||
+    busy ||
+    !(
+      (state === "paused" && progress?.pauseRequested !== false) ||
+      (active && progress?.pauseRequested)
+    );
+  ui.stop.disabled = true;
   ui.start.disabled = locked || !optionsReady;
   ui.loadOptions.disabled = locked;
   ui.instructor.disabled = locked || !optionsReady;
@@ -80,6 +100,9 @@ function controls(): void {
 }
 function disconnected(reason: string): void {
   connected = false;
+  progress = null;
+  ui.pauseStatus.hidden = true;
+  ui.pauseStatus.textContent = "";
   ui.connection.textContent = reason;
   ui.help.hidden = false;
   ui.state.textContent = "disconnected";
@@ -117,15 +140,22 @@ function resetOptions(): void {
   selectOptions(ui.trainingType, [], "Load training types explicitly");
 }
 async function refresh(): Promise<void> {
-  if (!client || polling) return;
-  polling = true;
+  if (!client) return;
   const requestedClient = client;
   const requestedGeneration = viewGeneration;
+  if (polling?.client === client && polling.generation === requestedGeneration)
+    return;
+  const request = { client: requestedClient, generation: requestedGeneration };
+  polling = request;
   try {
     const view = await readDaemonView(requestedClient);
     if (client !== requestedClient || viewGeneration !== requestedGeneration)
       return;
     connected = true;
+    progress = view.progress;
+    const pause = pauseSummary(progress);
+    ui.pauseStatus.hidden = pause === null;
+    ui.pauseStatus.textContent = pause ?? "";
     ui.connection.textContent =
       "Daemon connected. Rust owns execution and recovery.";
     ui.help.hidden = true;
@@ -137,7 +167,7 @@ async function refresh(): Promise<void> {
       view.progress.currentTraineeName ?? "No current trainee reported";
     ui.reportSection.hidden = view.report === null;
     ui.report.textContent = view.report ? reportSummary(view.report) : "";
-    const recovery = recoverySummary(view.checkpoint);
+    const recovery = recoverySummary(view.checkpoint, view.progress);
     ui.recoverySection.hidden = recovery === null;
     ui.recovery.textContent = recovery ?? "";
     controls();
@@ -147,9 +177,47 @@ async function refresh(): Promise<void> {
         error instanceof Error ? error.message : "Daemon unavailable.",
       );
   } finally {
-    polling = false;
+    if (polling === request) polling = null;
   }
 }
+
+function refreshAfterRequest(): void {
+  // Invalidate every pre-result read, even if it is still in flight. A new
+  // generation can poll immediately; old completions cannot unlock controls.
+  viewGeneration += 1;
+  connected = false;
+  busy = false;
+  controls();
+  void refresh();
+}
+
+function control(action: "pause" | "resume"): void {
+  if (!client || busy || ui[action].disabled) return;
+  const requestedClient = client;
+  busy = true;
+  controls();
+  status(
+    action === "pause"
+      ? "Requesting pause at Rust's safe boundary; this does not cancel an in-flight POST."
+      : "Requesting resume of the same in-memory batch (or cancellation of pending pause), not checkpoint recovery.",
+  );
+  void requestedClient[action]()
+    .then(() => {
+      status(
+        `${action === "pause" ? "Pause" : "Resume"} request accepted. Refreshing authoritative Rust status.`,
+      );
+    })
+    .catch((error: unknown) => {
+      status(
+        error instanceof Error ? error.message : "Batch control failed.",
+        true,
+      );
+    })
+    .finally(refreshAfterRequest);
+}
+
+ui.pause.addEventListener("click", () => control("pause"));
+ui.resume.addEventListener("click", () => control("resume"));
 
 ui.save.addEventListener("click", () => {
   void (async () => {
@@ -211,11 +279,7 @@ ui.loadOptions.addEventListener("click", () => {
         true,
       );
     })
-    .finally(() => {
-      busy = false;
-      controls();
-      void refresh();
-    });
+    .finally(refreshAfterRequest);
 });
 
 ui.start.addEventListener("click", () => {
@@ -258,14 +322,7 @@ ui.start.addEventListener("click", () => {
         true,
       );
     })
-    .finally(() => {
-      // A read begun before admission completed cannot unlock a second start.
-      viewGeneration += 1;
-      connected = false;
-      busy = false;
-      controls();
-      void refresh();
-    });
+    .finally(refreshAfterRequest);
 });
 
 command(DEFAULT_DAEMON_PORT);

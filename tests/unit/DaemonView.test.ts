@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { DaemonClient } from "../../src/core/infrastructure/daemon/DaemonClient";
+import type { BatchProgress } from "../../src/core/infrastructure/messaging/Messages";
 import type {
   DaemonCheckpoint,
   DaemonReport,
@@ -7,6 +8,7 @@ import type {
 import {
   displayTimestamp,
   readDaemonView,
+  pauseSummary,
   recoverySummary,
   reportSummary,
   sessionLocked,
@@ -40,7 +42,7 @@ const report: DaemonReport = {
     },
   ],
 };
-const idle = {
+const idle: BatchProgress = {
   state: "idle",
   total: 0,
   processed: 0,
@@ -146,11 +148,12 @@ describe("daemon UI projections", () => {
       }),
     ).toBeNull();
   });
-  it("locks active/unknown/disconnected phases; controls never implement pause/resume/stop", () => {
+  it("locks active, pending, paused, unknown and disconnected phases", () => {
     for (const state of [
       "initializing",
       "submitting",
       "loading_trainee",
+      "retrying",
       "paused",
       "unknown",
       "disconnected",
@@ -158,5 +161,59 @@ describe("daemon UI projections", () => {
       expect(sessionLocked(state)).toBe(true);
     for (const state of ["idle", "complete", "stopped"])
       expect(sessionLocked(state)).toBe(false);
+  });
+
+  it("distinguishes active paused checkpoints from restart recovery, without mutating them", () => {
+    const paused = { ...checkpoint, status: "paused" as const, inFlight: null };
+    const before = JSON.stringify(paused);
+    const live = recoverySummary(paused, {
+      ...idle,
+      state: "paused",
+      pauseRequested: true,
+    });
+    expect(live).toContain("in-memory paused batch, not an interrupted batch");
+    expect(live).toContain("same batch without new admission or a new worker");
+    expect(live).not.toContain("Resume cannot recover");
+    const restarted = recoverySummary(paused, idle);
+    expect(restarted).toContain(
+      "durable checkpoint alone is not a resumable in-memory batch",
+    );
+    expect(restarted).toContain(
+      "resume: true and the original session template",
+    );
+    expect(restarted).not.toContain("Resume is not available");
+    expect(
+      recoverySummary({ ...paused, status: "interrupted" }, idle),
+    ).toContain("checkpoint: interrupted");
+    expect(
+      recoverySummary(paused, {
+        ...idle,
+        state: "submitting",
+        pauseRequested: true,
+      }),
+    ).toContain("active batch, not an interrupted batch");
+    expect(JSON.stringify(paused)).toBe(before);
+  });
+
+  it("describes pending intent, durable pause and resume wake-up without optimistic local state", () => {
+    expect(
+      pauseSummary({ ...idle, state: "submitting", pauseRequested: true }),
+    ).toContain("Pause pending");
+    expect(
+      pauseSummary({ ...idle, state: "submitting", pauseRequested: true }),
+    ).toContain("does not cancel an in-flight POST");
+    expect(
+      pauseSummary({ ...idle, state: "paused", pauseRequested: true }),
+    ).toContain("checkpoint was persisted");
+    expect(
+      pauseSummary({ ...idle, state: "paused", pauseRequested: false }),
+    ).toContain("waiting for Rust to persist the running checkpoint");
+    expect(pauseSummary({ ...idle, state: "paused" })).toContain(
+      "same in-memory batch",
+    );
+    expect(
+      pauseSummary({ ...idle, state: "submitting", pauseRequested: false }),
+    ).toBeNull();
+    expect(pauseSummary(idle)).toBeNull();
   });
 });

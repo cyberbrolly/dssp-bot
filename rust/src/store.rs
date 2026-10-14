@@ -80,7 +80,8 @@ impl CheckpointStore {
             Err(e) => return Err(format!("{}: {e}", self.path.display())),
         };
 
-        let unreadable = |e: serde_json::Error| format!("{}: unreadable checkpoint: {e}", self.path.display());
+        let unreadable =
+            |e: serde_json::Error| format!("{}: unreadable checkpoint: {e}", self.path.display());
 
         // Parsed as loose JSON first: `#[serde(default)]` makes an absent
         // `in_flight` key and a null one identical once the struct exists, and
@@ -224,10 +225,8 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "dssp-bot-store-{}-{name}",
-                uuid::Uuid::new_v4()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("dssp-bot-store-{}-{name}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&dir).expect("scratch dir");
 
             Self { dir }
@@ -240,7 +239,13 @@ mod tests {
         fn entries(&self) -> Vec<String> {
             let mut names: Vec<String> = fs::read_dir(&self.dir)
                 .expect("read scratch dir")
-                .map(|entry| entry.expect("dir entry").file_name().to_string_lossy().into())
+                .map(|entry| {
+                    entry
+                        .expect("dir entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into()
+                })
                 .collect();
             names.sort();
 
@@ -287,10 +292,12 @@ mod tests {
     fn a_missing_file_reads_as_no_checkpoint() {
         let scratch = Scratch::new("missing");
 
-        assert!(CheckpointStore::new(scratch.file("never-written.json"))
-            .load()
-            .expect("a first run is not an error")
-            .is_none());
+        assert!(
+            CheckpointStore::new(scratch.file("never-written.json"))
+                .load()
+                .expect("a first run is not an error")
+                .is_none()
+        );
     }
 
     /// The whole point of the store: a later process sees what an earlier one
@@ -300,7 +307,9 @@ mod tests {
         let scratch = Scratch::new("round-trip");
         let store = CheckpointStore::new(scratch.file("dssp.checkpoint.json"));
 
-        store.save(&checkpoint(CheckpointStatus::Running)).expect("saves");
+        store
+            .save(&checkpoint(CheckpointStatus::Running))
+            .expect("saves");
 
         let restored = store
             .load()
@@ -324,8 +333,12 @@ mod tests {
         let scratch = Scratch::new("replace");
         let store = CheckpointStore::new(scratch.file("dssp.checkpoint.json"));
 
-        store.save(&checkpoint(CheckpointStatus::Running)).expect("saves");
-        store.save(&checkpoint(CheckpointStatus::Finished)).expect("resaves");
+        store
+            .save(&checkpoint(CheckpointStatus::Running))
+            .expect("saves");
+        store
+            .save(&checkpoint(CheckpointStatus::Finished))
+            .expect("resaves");
 
         let restored = store.load().expect("reads").expect("still there");
 
@@ -380,7 +393,9 @@ mod tests {
         let path = scratch.file("dssp.checkpoint.json");
         let store = CheckpointStore::new(&path);
 
-        store.save(&checkpoint(CheckpointStatus::Running)).expect("saves");
+        store
+            .save(&checkpoint(CheckpointStatus::Running))
+            .expect("saves");
         assert!(
             store
                 .load_with_provenance()
@@ -439,7 +454,9 @@ mod tests {
         let scratch = Scratch::new("no-temp");
         let store = CheckpointStore::new(scratch.file("dssp.checkpoint.json"));
 
-        store.save(&checkpoint(CheckpointStatus::Running)).expect("saves");
+        store
+            .save(&checkpoint(CheckpointStatus::Running))
+            .expect("saves");
 
         assert_eq!(scratch.entries(), vec!["dssp.checkpoint.json"]);
     }
@@ -488,7 +505,12 @@ mod tests {
 
         // The TS original's camelCase must not leak in: a reader keyed on
         // `startedAt` would find nothing and call a real batch a first run.
-        for camel in ["\"startedAt\"", "\"traineeId\"", "\"errorCode\"", "\"inFlight\""] {
+        for camel in [
+            "\"startedAt\"",
+            "\"traineeId\"",
+            "\"errorCode\"",
+            "\"inFlight\"",
+        ] {
             assert!(!text.contains(camel), "leaked {camel} in {text}");
         }
 

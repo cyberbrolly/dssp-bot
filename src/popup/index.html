@@ -83,6 +83,7 @@
         <h2>Progress</h2>
 
         <p id="current" class="muted">No batch running</p>
+        <p id="pause-status" class="muted" role="status" hidden></p>
 
         <div class="grid">
           <div><span class="label">Total</span><span id="total">0</span></div>
@@ -110,17 +111,17 @@
           id="pause"
           type="button"
           disabled
-          title="Stage 30 — not supported"
+          title="Request pause at the safe checkpoint boundary; does not cancel an in-flight POST"
         >
-          Pause (reserved)
+          Pause
         </button>
         <button
           id="resume"
           type="button"
           disabled
-          title="Stage 30 — not supported"
+          title="Resume the same in-memory batch or cancel a pending pause; not restart recovery"
         >
-          Resume (reserved)
+          Resume
         </button>
         <button
           id="stop"

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::checkpoint::{BatchCheckpoint, CheckpointWriter};
-use crate::engine::{BatchEngine, Transport};
+use crate::engine::{BatchControl, BatchEngine, Transport};
 use crate::protocol::{Request, Response, SessionInput, Status, TraineeRef};
 use crate::report::{BatchReport, Outcome};
 use crate::store::CheckpointStore;
@@ -159,6 +159,7 @@ struct State {
     busy: bool,
     progress: Value,
     report: Option<BatchReport>,
+    control: Option<Arc<BatchControl>>,
 }
 
 fn progress(
@@ -171,7 +172,7 @@ fn progress(
     let mut value = json!({"state": state, "total": total, "processed": results.len(),
         "successful": count(Outcome::Success), "failed": count(Outcome::Failed),
         "skipped": count(Outcome::Skipped), "indeterminate": count(Outcome::Indeterminate),
-        "remaining": total.saturating_sub(results.len())});
+        "remaining": total.saturating_sub(results.len()), "pauseRequested": false});
     if let Some(name) = name {
         value["currentTraineeName"] = json!(name);
     }
@@ -216,12 +217,19 @@ impl CheckpointWriter for Sink {
         let phase = match cp.status {
             crate::checkpoint::CheckpointStatus::Finished => "complete",
             crate::checkpoint::CheckpointStatus::Aborted => "stopped",
+            crate::checkpoint::CheckpointStatus::Paused => "paused",
             _ if cp.in_flight.is_some() => "submitting",
             _ => "loading_trainee",
         };
         let name = cp.in_flight.as_ref().and_then(|id| self.names.get(id));
-        self.state.lock().unwrap().progress =
-            progress(phase, cp.total, &cp.results, name.map(String::as_str));
+        let mut state = self.state.lock().unwrap();
+        let requested = state.progress["pauseRequested"].clone();
+        state.progress = progress(phase, cp.total, &cp.results, name.map(String::as_str));
+        if matches!(phase, "complete" | "stopped") {
+            state.control = None;
+        } else {
+            state.progress["pauseRequested"] = requested;
+        }
         Ok(())
     }
 }
@@ -233,22 +241,37 @@ impl Transport for Bridge {
     }
 }
 
+fn clear_control(state: &mut State) {
+    state.control = None;
+    state.progress["pauseRequested"] = json!(false);
+    if matches!(
+        state.progress["state"].as_str(),
+        Some("initializing" | "submitting" | "loading_trainee" | "retrying" | "paused")
+    ) {
+        state.progress["state"] = json!("stopped");
+        state
+            .progress
+            .as_object_mut()
+            .unwrap()
+            .remove("currentTraineeName");
+    }
+}
+
 struct Busy(Arc<Mutex<State>>);
 impl Drop for Busy {
     fn drop(&mut self) {
         let mut state = self.0.lock().unwrap();
+        clear_control(&mut state);
         state.busy = false;
-        if matches!(
-            state.progress["state"].as_str(),
-            Some("initializing" | "submitting" | "loading_trainee" | "retrying")
-        ) {
-            state.progress["state"] = json!("stopped");
-            state
-                .progress
-                .as_object_mut()
-                .unwrap()
-                .remove("currentTraineeName");
-        }
+    }
+}
+
+// Unwinding closes controls before the worker's possibly blocking teardown,
+// while WorkerLease retains Busy until that teardown has actually ended.
+struct ControlLease(Arc<Mutex<State>>);
+impl Drop for ControlLease {
+    fn drop(&mut self) {
+        clear_control(&mut self.0.lock().unwrap());
     }
 }
 
@@ -334,6 +357,21 @@ impl Daemon {
         {
             return error(403, "Origin is not allowed");
         }
+        if request.method == "POST"
+            && matches!(
+                request.path.as_str(),
+                "/batch" | "/batch/pause" | "/batch/resume"
+            )
+            && !request.headers.get("content-type").is_some_and(|s| {
+                s.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("application/json")
+            })
+        {
+            return error(415, "Content-Type application/json required");
+        }
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/status") => (200, self.state.lock().unwrap().progress.clone()),
             ("GET", "/report") => (
@@ -346,27 +384,50 @@ impl Daemon {
             },
             ("GET", "/form-options") => self.form_options(),
             ("POST", "/batch") => {
-                if !request.headers.get("content-type").is_some_and(|s| {
-                    s.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("application/json")
-                }) {
-                    return error(415, "Content-Type application/json required");
-                }
                 let req: BatchRequest = match serde_json::from_slice(&request.body) {
                     Ok(req) => req,
                     Err(e) => return error(422, format!("invalid batch: {e}")),
                 };
                 self.start(req)
             }
-            _ => error(
-                405,
-                "method/endpoint not implemented (pause/resume/stop reserved)",
-            ),
+            ("POST", "/batch/pause" | "/batch/resume") => {
+                match serde_json::from_slice::<Value>(&request.body) {
+                    Ok(Value::Object(map)) if map.is_empty() => {}
+                    _ => return error(422, "control body must be JSON {}"),
+                }
+                self.control(request.path == "/batch/pause")
+            }
+            _ => error(405, "method/endpoint not implemented (stop reserved)"),
         }
     }
+    fn control(&self, pause: bool) -> Reply {
+        let control = self.state.lock().unwrap().control.clone();
+        let Some(control) = control else {
+            return error(
+                409,
+                "no controllable batch (idle, finished, form-options, or admission)",
+            );
+        };
+        let mut requested = control
+            .pause_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap();
+        // A command that captured an old controller must not affect a new batch,
+        // nor a worker whose result is terminal but whose teardown still owns Busy.
+        if !state
+            .control
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &control))
+        {
+            return error(409, "batch is no longer controllable");
+        }
+        *requested = pause;
+        state.progress["pauseRequested"] = json!(pause);
+        control.changed.notify_all();
+        (200, state.progress.clone())
+    }
+
     fn form_options(&self) -> Reply {
         let _busy = match self.acquire() {
             Ok(b) => b,
@@ -486,6 +547,8 @@ impl Daemon {
         };
         let names = list.into_iter().map(|t| (t.id, t.name)).collect();
         let state = self.state.clone();
+        let control = Arc::new(BatchControl::default());
+        state.lock().unwrap().control = Some(control.clone());
         let lease = WorkerLease {
             worker,
             _busy: busy,
@@ -494,18 +557,22 @@ impl Daemon {
             .name("dssp-batch".into())
             .spawn(move || {
                 let mut lease = lease;
+                let _control_lease = ControlLease(state.clone());
                 let sink = Sink {
                     store,
                     state: state.clone(),
                     names,
                 };
-                let mut engine = BatchEngine::new(Box::new(sink)).with_carried(carried);
+                let mut engine = BatchEngine::new(Box::new(sink))
+                    .with_carried(carried)
+                    .with_control(control);
                 match engine.run(&mut lease.worker, &req.session, resolved) {
                     Ok(mut report) => {
                         // Missing records can be owed even when every runnable
                         // trainee succeeded; do not present that as a clean run.
                         report.aborted |= owed > 0;
                         let mut state = state.lock().unwrap();
+                        state.control = None;
                         state.progress = progress(
                             if report.aborted || owed > 0 {
                                 "stopped"
@@ -521,6 +588,8 @@ impl Daemon {
                     Err(e) => {
                         eprintln!("dssp-bot: daemon batch aborted: {e}");
                         let mut state = state.lock().unwrap();
+                        state.control = None;
+                        state.progress["pauseRequested"] = json!(false);
                         state.progress["state"] = json!("stopped");
                         state
                             .progress

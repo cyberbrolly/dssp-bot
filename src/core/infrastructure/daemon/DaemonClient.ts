@@ -124,12 +124,15 @@ export function isDaemonProgress(value: unknown): value is BatchProgress {
       "loading_trainee",
       "submitting",
       "retrying",
+      "paused",
       "stopped",
       "complete",
     ].includes(String(value.state)) &&
     counts(value, [...countKeys, "processed", "remaining"]) &&
     (value.currentTraineeName === undefined ||
-      typeof value.currentTraineeName === "string")
+      typeof value.currentTraineeName === "string") &&
+    (value.pauseRequested === undefined ||
+      typeof value.pauseRequested === "boolean")
   );
 }
 function isReport(value: unknown): value is DaemonReport | null {
@@ -191,6 +194,7 @@ export class DaemonClient {
     path: string,
     validate: (value: unknown) => value is T,
     body?: unknown,
+    expectedStatus = 200,
   ): Promise<T> {
     let response: Response;
     try {
@@ -221,7 +225,9 @@ export class DaemonClient {
       throw new DaemonError(
         body === undefined
           ? "Daemon disconnected. Start it manually in the rust directory."
-          : "Daemon connection lost during admission. Outcome unknown; inspect daemon status/checkpoint before another start. This request was not retried.",
+          : path === "/batch"
+            ? "Daemon connection lost during admission. Outcome unknown; inspect daemon status/checkpoint before another start. This request was not retried."
+            : "Daemon connection lost during control. Outcome unknown; inspect daemon status before another control request. This request was not retried.",
       );
     }
     let value: unknown;
@@ -243,10 +249,7 @@ export class DaemonClient {
         response.status,
       );
     }
-    if (
-      response.status !== (body === undefined ? 200 : 202) ||
-      !validate(value)
-    ) {
+    if (response.status !== expectedStatus || !validate(value)) {
       throw new DaemonError(
         "Daemon returned an unexpected response.",
         response.status,
@@ -267,6 +270,12 @@ export class DaemonClient {
   formOptions(): Promise<TrainingFormOptions> {
     return this.request("/form-options", isOptions);
   }
+  pause(): Promise<BatchProgress> {
+    return this.request("/batch/pause", isDaemonProgress, {});
+  }
+  resume(): Promise<BatchProgress> {
+    return this.request("/batch/resume", isDaemonProgress, {});
+  }
   start(input: DaemonBatchInput): Promise<{ batchId: string }> {
     if (input.resume !== undefined && typeof input.resume !== "boolean")
       throw new DaemonError("resume must be a boolean.");
@@ -285,6 +294,7 @@ export class DaemonClient {
         },
         resume: input.resume ?? false,
       },
+      202,
     );
   }
 }
@@ -295,15 +305,10 @@ export async function proxyDaemonMessage(
 ): Promise<MessageResponse> {
   if (!message || typeof message.type !== "string")
     return { success: false, error: "Unsupported daemon request." };
-  if (
-    ["PAUSE_AUTOMATION", "RESUME_AUTOMATION", "STOP_AUTOMATION"].includes(
-      message.type,
-    )
-  ) {
+  if (message.type === "STOP_AUTOMATION") {
     return {
       success: false,
-      error:
-        "Pause/resume/stop are not supported in Stage 29 (reserved for Stages 30/31).",
+      error: "Stop is not supported (reserved for Stage 31).",
     };
   }
   try {
@@ -312,6 +317,12 @@ export async function proxyDaemonMessage(
     switch (message.type) {
       case "GET_STATUS":
         data = await client.status();
+        break;
+      case "PAUSE_AUTOMATION":
+        data = await client.pause();
+        break;
+      case "RESUME_AUTOMATION":
+        data = await client.resume();
         break;
       case "GET_REPORT":
         data = await client.report();

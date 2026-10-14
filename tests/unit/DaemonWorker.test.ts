@@ -97,14 +97,104 @@ describe("stateless service-worker bridge", () => {
     expect(storage.set).not.toHaveBeenCalled();
   });
 
-  it("maps typed trainee refs and session values, returns admission instead of a local report", async () => {
-    const fetcher = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(
-        new Response(JSON.stringify({ batchId: "fixture-admission" }), {
-          status: 202,
+  it.each([
+    ["PAUSE_AUTOMATION", "pause", "submitting", true],
+    ["RESUME_AUTOMATION", "resume", "paused", false],
+  ] as const)(
+    "proxies %s from extension UI to Rust without admission, storage writes or a local engine",
+    async (type, action, state, pauseRequested) => {
+      vi.resetModules();
+      const listener = vi.fn();
+      const storage = {
+        get: vi.fn().mockResolvedValue({ [DAEMON_SETTINGS_KEY]: settings }),
+        set: vi.fn(),
+      };
+      const progress = { ...idle, state, pauseRequested };
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(new Response(JSON.stringify(progress)));
+      vi.stubGlobal("fetch", fetcher);
+      vi.stubGlobal("chrome", {
+        runtime: {
+          id: "fixture-id",
+          getURL: () => "chrome-extension://fixture-id/",
+          onMessage: { addListener: listener },
+        },
+        storage: { local: storage },
+      });
+      await import("../../src/background/service-worker");
+      const handle = listener.mock.calls[0]?.[0];
+      const reply = vi.fn();
+      expect(
+        handle(
+          { type },
+          {
+            id: "fixture-id",
+            url: "chrome-extension://fixture-id/src/popup/index.html",
+          },
+          reply,
+        ),
+      ).toBe(true);
+      await vi.waitFor(() =>
+        expect(reply).toHaveBeenCalledExactlyOnceWith({
+          success: true,
+          data: progress,
         }),
       );
+      expect(fetcher).toHaveBeenCalledExactlyOnceWith(
+        `http://127.0.0.1:8765/batch/${action}`,
+        expect.objectContaining({
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${settings.token}`,
+            "Content-Type": "application/json",
+          },
+          body: "{}",
+        }),
+      );
+      expect(storage.get).toHaveBeenCalledExactlyOnceWith(DAEMON_SETTINGS_KEY);
+      expect(storage.set).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["PAUSE_AUTOMATION", "RESUME_AUTOMATION"] as const)(
+    "returns %s failures once, never retrying or admitting a batch",
+    async (type) => {
+      for (const reply of [
+        new Response(JSON.stringify({ error: "admission has no controller" }), {
+          status: 409,
+        }),
+        new Response("invalid json"),
+      ]) {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(reply);
+        vi.stubGlobal("fetch", fetcher);
+        const result = await proxyDaemonMessage({ type }, async () => settings);
+        expect(result).toMatchObject({
+          success: false,
+          error: expect.any(String),
+        });
+        expect(fetcher).toHaveBeenCalledOnce();
+      }
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockRejectedValue(new TypeError("offline"));
+      vi.stubGlobal("fetch", fetcher);
+      expect(
+        await proxyDaemonMessage({ type }, async () => settings),
+      ).toMatchObject({
+        success: false,
+        error: expect.stringContaining("Outcome unknown"),
+      });
+      expect(fetcher).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("maps typed trainee refs and session values, returns admission instead of a local report", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ batchId: "fixture-admission" }), {
+        status: 202,
+      }),
+    );
     vi.stubGlobal("fetch", fetcher);
     expect(
       await proxyDaemonMessage(

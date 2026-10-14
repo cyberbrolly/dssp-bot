@@ -172,7 +172,7 @@ No row here exits 1: that code means the coordinator never reached a submission
 there is no classified line to print. A session that lapses *mid-run* is a
 `HALT: SESSION_EXPIRED` and exits 3, as above.
 
-## Stage 29: loopback daemon
+## Stages 29–30: loopback daemon
 
 The CLI above remains unchanged. `cargo run --offline -- --daemon` selects the
 HTTP bridge; the extension never starts or owns this process. Starting a daemon
@@ -219,10 +219,11 @@ headers are emitted and `OPTIONS` is unsupported.
 | `GET /checkpoint` | `200` + durable checkpoint, or `null`; corrupt storage is `500` |
 | `GET /form-options` | `200` + `{instructors: [{value,label}], trainingTypes: [{value,label}]}` |
 | `POST /batch` | `202` + `{batchId}`; recovery refusal `409`; invalid/unresolvable input `422`; active worker `503` |
-| `POST /batch/pause`, `/batch/resume`, `/batch/stop` | `405` (Stages 30/31 unsupported) |
+| `POST /batch/pause`, `/batch/resume` | `200` + raw `BatchProgress`; no controllable batch `409` |
+| `POST /batch/stop` | `405` (Stage 31 unsupported) |
 
 Unknown methods/paths return `405`. Authentication failures are `401`, foreign
-origins `403`, non-JSON batch content types `415`, malformed HTTP `400`, excessive
+origins `403`, non-JSON batch/control content types `415`, malformed HTTP `400`, excessive
 headers/bodies `413`, and request read timeout `408`. Worker startup/session/list
 failures return `502`. All errors have shape `{error: string}`. Admission resolves
 the whole roster before returning `202`; no submissions happen on a `422` path.
@@ -250,7 +251,7 @@ Settled/possibly submitted trainees are carried, never requeued.
 
 `/status` uses the exact TS `BatchProgress` names: `state`, `total`, `processed`,
 `successful`, `failed`, `skipped`, `indeterminate`, `remaining`, and optional
-`currentTraineeName`. Checkpoint writes drive progress during execution; the
+`currentTraineeName`, plus `pauseRequested: boolean`. Checkpoint writes drive progress during execution; the
 worker's internal browser/form phases are not separately exposed. Report and
 checkpoint keys are camelCase on HTTP and unchanged snake_case on disk/CLI.
 Timestamps remain **epoch-millisecond strings**, not the legacy TS ISO format.
@@ -270,7 +271,51 @@ Only the checkpoint survives daemon restart: `/status` begins idle and `/report`
 returns null, while `/checkpoint` still exposes the durable predecessor and the
 start guard protects it. Do not run a CLI batch and daemon, or multiple daemons,
 against the same profile/checkpoint concurrently: there is no cross-process
-ownership lock. Graceful pause/stop/shutdown controls are out of Stage 29 scope.
+ownership lock. Stop and graceful daemon shutdown remain out of scope.
+
+### Stage 30: cooperative pause/resume
+
+`POST /batch/pause` and `POST /batch/resume` accept only an empty JSON object
+`{}` (whitespace is allowed) with `Content-Type: application/json`. They share
+batch authentication, Origin validation, body/header caps and read deadlines.
+Invalid control bodies return `422`. Successful controls return `200` with raw
+progress, not an envelope or a new batch ID.
+
+- **Pause is intent, not cancellation.** While a trainee is being submitted or
+  settled (including its existing safe retry policy), pause returns the current
+  active state with `pauseRequested: true`. The in-flight request is never
+  interrupted, requeued or duplicated. An unknown/indeterminate result still
+  aborts with no retry; abort and exhausted-queue completion take precedence over
+  pause.
+- **The safe boundary is before dequeue.** With pending work, the engine persists
+  `status: paused`, all settled results, the unchanged pending queue, and
+  `in_flight: null` before publishing progress `state: paused`. It then waits on
+  a condition variable, retaining the same worker, session, queue and batch.
+  `/status` remains responsive; another batch or form-options request is `503`.
+- **Resume is in-memory intent.** Resume clears `pauseRequested` and wakes the
+  existing engine; it does not create a worker or reconstruct/requeue the batch.
+  The response can still be `state: paused` while the engine wakes. The engine
+  must persist `status: running` at this safe boundary before any later submit.
+  Failure of either pause or resume checkpoint halts execution with no later
+  POST and clears the controller; it never publishes a failed paused write.
+- **Idempotence is scoped to an existing controller.** Repeated pause while
+  pending/paused and repeated resume while active return `200`. Resume during a
+  pending pause cancels that intent. Idle, finished/aborted batches, worker
+  teardown, form-options, and batch admission before the controller is installed
+  return `409` without changing progress or creating a worker. Admission finishes
+  session/roster resolution before installing the controller; retrying a control
+  after an accepted `202` is an explicit caller request, never automatic recovery.
+  Errors/panics clear controls before worker teardown; admission stays busy until
+  shutdown finishes. A new batch always gets fresh, unpaused control state.
+- **Restart recovery is a different operation.** A persisted paused checkpoint
+  does not create an in-memory controller after daemon restart. `/batch/resume`
+  returns `409`; plain `POST /batch` is refused by the existing recovery guard
+  before creating any worker. Only an explicit `POST /batch` with `resume: true`
+  acknowledges checkpoint recovery, carrying settled results and attempting only
+  never-submitted pending trainees. The original session template is still needed.
+
+Normal CLI execution has no controller and is unchanged. These are synthetic,
+offline semantics, not a claim of live batch acceptance.
 
 ### Offline verification
 
@@ -283,7 +328,11 @@ The socket tests inject fixture transports. Binary/CLI integration tests always
 set `DSSP_WORKER_PY` to `tests/fixtures/worker.py`, which reads only synthetic JSON
 and never imports `app.worker`, launches a browser, or opens a network. All
 mutable fixture input, tokens, checkpoints and protocol traces live in temporary
-scratch directories, not operator job/evidence/marker locations.
+scratch directories, not operator job/evidence/marker locations. Stage 30 tests
+cover a blocked submission with pending pause, durable safe-boundary publication,
+responsive polling, same-worker resume without duplicates, idempotent/cancelled
+intent, controller cleanup, shared request security, paused recovery refusal with
+zero worker starts, and fatal pause/resume checkpoint failures.
 
 ## Safety
 

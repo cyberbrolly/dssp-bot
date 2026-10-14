@@ -18,6 +18,8 @@ export interface BatchProgress {
   indeterminate: number;
   remaining: number;
   currentTraineeName?: string;
+  /** Daemon intent only; paused is published after the safe checkpoint boundary. */
+  pauseRequested?: boolean;
 }
 
 export type Message =

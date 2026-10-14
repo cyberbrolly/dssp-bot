@@ -23,6 +23,44 @@ run).
    explicit commit approval; pushing or opening/updating a PR also requires
    authorization. Real-portal submissions require separate explicit approval.
 
+## Stage 30 — offline pause/resume acceptance
+
+**Passed on synthetic jobs, fixture workers and mocked UI tests only.**
+
+- Rust owns cooperative pause intent. An in-flight trainee is allowed to settle
+  under the existing retry/abort policy; the pause never cancels/requeues a POST.
+  Pending intent is visible as `pauseRequested: true`, not a false paused claim.
+- Before dequeuing another trainee, Rust persists `paused` with settled results,
+  unchanged pending order and null `in_flight`, then waits on a condition variable.
+  Polling remains responsive and competing starts return `503`. Resume wakes the
+  same engine/worker and durably writes `running` before any further submission.
+- Pause/resume checkpoint failures halt with no later submission. Indeterminate
+  results still abort without retry; terminal completion/abort clears controls.
+  Idle/finished/form-options/admission-before-controller commands return `409`.
+- Authenticated JSON `{}` endpoints return `200` raw progress; pause/resume are
+  idempotent within a controllable batch and Resume can cancel pending pause.
+  They are distinct from checkpoint recovery via reviewed batch admission with
+  `resume: true`; a durable paused checkpoint cannot be resumed by a new daemon
+  through `/batch/resume`, and ordinary admission still refuses it before spawn.
+- Popup controls send intent once and poll authoritative Rust state. Pending,
+  paused and waking states lock session edits and new starts. Stale views cannot
+  overwrite newer control state. Stop remains disabled/HTTP `405` for Stage 31.
+- Verification: `cargo test --offline` **205 passed** (201 unit/loopback plus
+  4 binary/CLI fixture tests); Clippy with `-D warnings` passed; `pnpm typecheck`
+  passed; `pnpm test` **256 passed** across 20 files. Tests exercise in-flight
+  pause, no duplicate submits, queue preservation, responsive status, same-worker
+  resume, checkpoint failures, recovery refusal and UI control/error handling.
+  `git diff --check` passed. The earlier `cargo fmt --check` failure was resolved
+  by the operator-approved standard Rust formatting cleanup. `cargo fmt --check`
+  now passes; the full offline Rust suite was rerun (**205 passed**) and Clippy
+  with `-D warnings` passed. The initial combined validation timed out during the
+  test run after a long compilation; the cached-build rerun completed successfully.
+  This follow-up changes formatting only, not execution behavior.
+- No live portal requests/submissions or private job/evidence/attempt-marker
+  changes. No live batch, crash recovery or final-assessment claims. Stage 29's
+  Linux/single-process ownership and shutdown limits remain unchanged.
+- Current changes are uncommitted. Next stage: **31 — Stop** (not started).
+
 ## Stage 29 — offline daemon and thin extension acceptance
 
 **Passed on fixture-based acceptance; no live portal requests or submissions.**
@@ -139,7 +177,7 @@ run through Rust → Python → Playwright → DSSP → Python → Rust, revisio
 | 27 | Checkpointing             | 🟢 Passed     | `cargo test` (79) + clippy      | port TS `BatchCheckpoint.ts` + store + engine wiring; Gate 3 items → Stage 28 |
 | 28 | Recovery                  | 🟢 Passed     | `cargo test` (162) + clippy     | **Gate 3** — in-flight record + start gate; independent panel run, 5 defects fixed; the deferred one decided and fixed 2026-09-29 (follow-up), with a second panel over that fix |
 | 29 | Extension → Rust          | 🟢 Passed     | 193 Rust fixture tests; Clippy; pnpm typecheck; 223 TS tests | Guarded loopback daemon + stateless extension; offline acceptance only |
-| 30 | Pause                     | ⬜ Not Started | pause test                      | state exists; no engine API |
+| 30 | Pause                     | 🟢 Passed     | 205 Rust tests; Clippy; pnpm typecheck; 256 TS tests | Durable safe-boundary pause + same-worker resume; offline fixtures only |
 | 31 | Stop                      | ⬜ Not Started | stop test                       | abort path exists |
 | 32 | Error testing             | ⬜ Not Started | failure scenarios               | many paths already covered |
 | 33 | Full integration          | ⬜ Not Started | multi-layer test                | **Gate 4** |
@@ -1055,7 +1093,7 @@ them, designed but deliberately unbuilt.
 ## Migration Progress Summary
 
 ```text
-Completed:  30 / 40
+Completed:  31 / 40
 In Progress: 0
 Failed:      0
 Blocked:     0
@@ -1079,7 +1117,7 @@ Hard gates — do not continue past them until they pass.
 The order the work follows, not a list of what is outstanding: 10 and 25–28 are
 already Passed (see the status table above). Stages 15/24 are now Passed after
 one approved live submission and read-only reconciliation on 2026-10-05.
-Stage 29 passed offline fixture acceptance. Stage 30 (pause) is next;
+Stages 29/30 passed offline fixture acceptance. Stage 31 (stop) is next;
 batch recovery was not tested live.
 
 ```text
