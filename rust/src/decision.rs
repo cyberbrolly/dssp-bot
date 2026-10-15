@@ -43,9 +43,10 @@ impl Default for RetryPolicy {
 
 impl RetryPolicy {
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let raw = self
-            .initial_delay_ms
-            .saturating_mul(self.backoff_factor.saturating_pow(attempt.saturating_sub(1)));
+        let raw = self.initial_delay_ms.saturating_mul(
+            self.backoff_factor
+                .saturating_pow(attempt.saturating_sub(1)),
+        );
         Duration::from_millis(raw.min(self.max_delay_ms))
     }
 }
@@ -76,7 +77,9 @@ pub fn decide_submit(resp: &Response) -> Decision {
             )),
             Some("rejected") => Decision::Reject(format!(
                 "rejected — {}",
-                resp.message.as_deref().unwrap_or("portal refused the record")
+                resp.message
+                    .as_deref()
+                    .unwrap_or("portal refused the record")
             )),
             Some("indeterminate") => Decision::Halt(format!(
                 "indeterminate — {} (submitted but unconfirmed; verify on the portal before re-running)",

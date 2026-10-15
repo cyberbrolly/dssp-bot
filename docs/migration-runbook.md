@@ -23,6 +23,174 @@ run).
    explicit commit approval; pushing or opening/updating a PR also requires
    authorization. Real-portal submissions require separate explicit approval.
 
+## Stage 32 — offline error-boundary acceptance
+
+**Passed for the documented synthetic failure matrix; no live verification.**
+See [Stage 32 error testing](stage32-error-testing.md) for cases and limitations.
+
+- Added subprocess tests for startup/spawn failure, malformed/version/echo errors,
+  EOF, unexpected outcomes/status, missing/false delivery proof, safe bounded
+  retries, rejection continuation, silent/late workers, and hung shutdown.
+  Unsafe submits halt with requested provenance, no retry/later trainee, and
+  checkpoint refusal before another worker start.
+- Two failing-before regressions demonstrated false success when response `op`
+  or an explicitly requested trainee ID mismatched. `WorkerClient` now validates
+  those existing protocol fields; optional trainee payloads/name selectors remain
+  compatible. No new portal contract or duplicate heuristic was invented.
+- Added positive-integer Rust worker supervision settings: ready wait `10000 ms`,
+  per-response wait `360000 ms`, EOF grace `2000 ms`. Timeout/protocol failure
+  invalidates the client before future writes or late-reply consumption. EOF grace
+  is followed by direct-worker kill/reap, not request replay or portal rollback.
+- Python adds 48 fault cases: independent evidence-write failures, GET/form faults
+  before POST, unsafe/redirect response classification, post-response exceptions
+  and body-read failures with false delivery proof. Exactly-once/no-POST assertions
+  remain explicit; no application changes were needed in these tested paths.
+- Full validation: Rust **250 passed** (216 coordinator/loopback plus 34 fixture
+  binary/CLI); Rustfmt and Clippy `-D warnings` passed; Python **356 passed**;
+  `pnpm typecheck` passed; TypeScript **313 passed**. Existing Stage 29–31 security,
+  checkpoint, pause/stop and UI error tests remain green. `git diff --check` passed.
+- Limits: stdin writes lack a deadline; this is not an end-to-end job timeout.
+  Direct-child termination does not prove browser-descendant cleanup/profile
+  release, OS cleanup success or rollback of delivered records. Reader/output
+  resource bounds, cross-process ownership and installed-browser behavior remain
+  later security/integration work. No live batch/recovery/final-assessment claim.
+- Stage 31 is preserved in `04616f2`; Stage 32 changes remain uncommitted. No
+  private evidence/jobs/attempt markers were touched. Next: **33 — Full integration**
+  (**Gate 4**, not started; no automatic live authorization).
+
+## Stage 31 — offline cooperative Stop acceptance
+
+**Passed on synthetic jobs, fixture workers and mocked UI tests only.**
+
+- Authenticated JSON `{}` `POST /batch/stop` returns `200` raw progress with a
+  one-way `stopRequested` latch. Repeated pending Stop is idempotent; Pause/Resume
+  cannot undo it (`409`). Idle/finished/form-options/admission-before-controller
+  requests are refused without worker creation. Security and request limits are
+  unchanged.
+- Already admitted attempts settle without cancellation. No later submit attempt
+  is admitted after Stop, including retries. Stop interrupts retry backoff and
+  wakes paused execution; actual outcomes and attempt counts remain truthful.
+  Never-attempted trainees become ordered zero-attempt operator-stop skips.
+- Stop boundary and terminal aborted checkpoints must persist; failures halt
+  without later submissions or a fabricated successful report. Status polling
+  remains responsive. Stop-vs-completion ordering preserves last-row outcomes;
+  a stop that wins marks the batch aborted, even if its last trainee succeeded.
+- The thin extension sends Stop once and polls Rust. Pending Stop is not presented
+  as terminal stopped; latched controls/session edits/new Start stay locked.
+  Missing reports, errors and stale/reconnected views require review, not retry.
+  Controls never acknowledge checkpoint recovery or spawn replacement workers.
+- Verification: `cargo fmt --check` passed; full `cargo test --offline`
+  **215 passed** (211 unit/loopback plus 4 fixture binary/CLI tests); Clippy with
+  `-D warnings` passed; `pnpm typecheck` passed; `pnpm test` **313 passed** across
+  20 files. The full Rust inventory completed in one run; earlier split runs
+  were also successful. Fixtures cover stop during blocked attempts, pause and
+  backoff, no duplicates/retries, checkpoint failures, completion/controller races,
+  explicit-only recovery and UI no-retry/error handling.
+- No live portal requests/submissions, private evidence/job/attempt-marker changes,
+  or claims of live batch/recovery/final-assessment verification. Linux,
+  single-process ownership, connection-cap and unbounded shutdown limits remain.
+- Changes remain uncommitted. Next stage: **32 — Error testing** (not started).
+
+## Stage 30 — offline pause/resume acceptance
+
+**Passed on synthetic jobs, fixture workers and mocked UI tests only.**
+
+- Rust owns cooperative pause intent. An in-flight trainee is allowed to settle
+  under the existing retry/abort policy; the pause never cancels/requeues a POST.
+  Pending intent is visible as `pauseRequested: true`, not a false paused claim.
+- Before dequeuing another trainee, Rust persists `paused` with settled results,
+  unchanged pending order and null `in_flight`, then waits on a condition variable.
+  Polling remains responsive and competing starts return `503`. Resume wakes the
+  same engine/worker and durably writes `running` before any further submission.
+- Pause/resume checkpoint failures halt with no later submission. Indeterminate
+  results still abort without retry; terminal completion/abort clears controls.
+  Idle/finished/form-options/admission-before-controller commands return `409`.
+- Authenticated JSON `{}` endpoints return `200` raw progress; pause/resume are
+  idempotent within a controllable batch and Resume can cancel pending pause.
+  They are distinct from checkpoint recovery via reviewed batch admission with
+  `resume: true`; a durable paused checkpoint cannot be resumed by a new daemon
+  through `/batch/resume`, and ordinary admission still refuses it before spawn.
+- Popup controls send intent once and poll authoritative Rust state. Pending,
+  paused and waking states lock session edits and new starts. Stale views cannot
+  overwrite newer control state. Stop remains disabled/HTTP `405` for Stage 31.
+- Verification: `cargo test --offline` **205 passed** (201 unit/loopback plus
+  4 binary/CLI fixture tests); Clippy with `-D warnings` passed; `pnpm typecheck`
+  passed; `pnpm test` **256 passed** across 20 files. Tests exercise in-flight
+  pause, no duplicate submits, queue preservation, responsive status, same-worker
+  resume, checkpoint failures, recovery refusal and UI control/error handling.
+  `git diff --check` passed. The earlier `cargo fmt --check` failure was resolved
+  by the operator-approved standard Rust formatting cleanup. `cargo fmt --check`
+  now passes; the full offline Rust suite was rerun (**205 passed**) and Clippy
+  with `-D warnings` passed. The initial combined validation timed out during the
+  test run after a long compilation; the cached-build rerun completed successfully.
+  This follow-up changes formatting only, not execution behavior.
+- No live portal requests/submissions or private job/evidence/attempt-marker
+  changes. No live batch, crash recovery or final-assessment claims. Stage 29's
+  Linux/single-process ownership and shutdown limits remain unchanged.
+- Current changes are uncommitted. Next stage: **31 — Stop** (not started).
+
+## Stage 29 — offline daemon and thin extension acceptance
+
+**Passed on fixture-based acceptance; no live portal requests or submissions.**
+
+- Rust `--daemon` binds only `127.0.0.1`, requires a bearer token and exact
+  configured extension Origin (when supplied), and requires JSON batch POSTs.
+  Token files are owned `0600`, contain 256 bits of entropy, and are gitignored.
+  HTTP headers/bodies, total read time and concurrent handlers are bounded;
+  ambiguous framing and unsupported methods are rejected, with no CORS allow.
+- HTTP batch admission calls `recovery::guard` before worker creation. Unfinished
+  or unreadable checkpoints return `409` with zero worker starts. Concurrent
+  admission is `503`; request `resume` is explicit and `DSSP_RESUME` is ignored.
+  Status remains responsive during normal admission/execution. Worker teardown
+  retains admission; errors/panics preserve in-flight safety and release slots.
+- The extension is a thin authenticated client; Rust owns progress, reports,
+  queue, execution, checkpoints, recovery and retries. Legacy TS modules remain
+  present but inactive; no portal content scripts are injected. Connection
+  settings alone are stored, tokens entered manually, and no admission retry or
+  automatic daemon startup exists. Pause/resume/stop remain Stages 30/31.
+- Offline validation: `cargo test --offline` **193 passed** (189 unit/loopback,
+  4 fixture binary/CLI); Clippy with `-D warnings` passed; `pnpm typecheck`
+  passed; `pnpm test` **223 passed**. The existing legacy adapter forwarding
+  fixture now uses typed method-specific arguments (targeted **23 passed**).
+- All four `docs/daemon-api.md` build criteria are met: tested checkpoint refusal,
+  unchanged CLI using synthetic workers, no competing extension state with green
+  TypeScript checks, and tested authentication/Origin/content-type rejection.
+- Limits: Linux token hardening; no cross-process profile/checkpoint lock;
+  worker shutdown can hold admission indefinitely; polling availability is not
+  guaranteed at the connection cap. Installed-browser integration and Firefox
+  remain later checks. **No live batch/recovery/final-assessment verification
+  is claimed.** No private evidence/jobs/attempt markers were touched.
+- Changes remain uncommitted. Next stage: **30 — Pause** (not started).
+
+## Live gates reconciled — 2026-10-05
+
+Stages **15 and 24 Passed** on the single explicitly approved ordinary-session
+run through Rust → Python → Playwright → DSSP → Python → Rust, revision
+`7796360`. No second submission was made to resolve history ambiguity.
+
+- Private before-history was empty; canonical trainee-ID history had one new row,
+  with no pagination controls or active history filters detected. Type and
+  instructor matched the approved options; displayed duration was `1` (the
+  approved AJAX request does not contain a duration field).
+- The history's `Date of Training` convention was established read-only by an
+  existing entry displaying `09/30/2026` in that same column. The approved row's
+  `10/05/2026` therefore means October 5, 2026, not May 10.
+- Saved job date and payload reconstructed from the saved form both contain
+  `TrainingDate=2026-10-05`. No outgoing request-body/wire capture was enabled;
+  this is source-and-job reconstruction, not a captured request. The documented
+  gates require direct response capture, which is present.
+- Direct response: HTTP **200**, `application/json; charset=utf-8`, no Location,
+  JSON `IsSuccessful` is boolean true. Rust receipt: `confirmed`, exit **0**.
+- `Date Logged` falls inside the launch window at UTC+1 (portal display to
+  seconds); `Logged By` matches the authenticated account before and after.
+- Private response, before/after pages, date-convention evidence and reconciliation
+  notes remain gitignored under `python/.evidence/live-single/`. The attempt
+  marker is preserved. No credentials, identities, raw evidence or job contents
+  are published here.
+- All documented single-session acceptance checks are satisfied. This does not
+  establish a duplicate-response contract or verify batch recovery. Stage 29 is
+  the next unstarted task; do not launch further training submissions as tests.
+
 ## Latest offline review — duplicate classification and delivery phase
 
 - Removed unverified duplicate-text acceptance. Non-login HTTP 3xx is always
@@ -61,8 +229,8 @@ run).
 | 11 | Retrieve trainees         | 🟢 Passed     | trainee retrieval               | fixture-verified |
 | 12 | Trainee matching          | 🟢 Passed     | `pytest`                        | permanent suite in `python/tests/` |
 | 13 | Training form             | 🟢 Passed     | form workflow                   | fixture-verified |
-| 14 | Submission                | 🟢 Passed     | 212 focused Python tests; 308 full; 24 Rust decision tests | Ordinary-session AJAX contract fixture-verified; final assessments blocked; live POST response still unverified |
-| 15 | One-trainee milestone     | 🟡 Blocked    | real end-to-end test            | **Gate 1** — awaiting verified success-response format and operator approval |
+| 14 | Submission                | 🟢 Passed     | 212 focused Python tests; 308 full; 24 Rust decision tests | Ordinary-session AJAX contract and one live success verified; final assessments blocked |
+| 15 | One-trainee milestone     | 🟢 Passed     | approved live run + read-only reconciliation, 2026-10-05 | **Gate 1** — explicit JSON success and exactly one matching new history entry |
 | 16 | Initialize Rust           | 🟢 Passed     | `cargo check`                   |       |
 | 17 | Rust models               | 🟢 Passed     | `cargo check`                   | `protocol.rs`, `report.rs` |
 | 18 | Rust job                  | 🟢 Passed     | single-job flow                 | `job.example.json` |
@@ -71,15 +239,15 @@ run).
 | 21 | Rust ↔ Python protocol    | 🟢 Passed     | JSON request/response           | `docs/protocol.md` |
 | 22 | Protocol validation       | 🟢 Passed     | invalid-message tests           | bad JSON / unknown op / job_id echo |
 | 23 | Rust → Python connection  | 🟢 Passed     | IPC test                        | spawn + ready + ping |
-| 24 | Real Rust → Python → DSSP | 🟡 Blocked    | one-trainee test                | **Gate 2** — follows Gate 1; awaiting operator approval |
+| 24 | Real Rust → Python → DSSP | 🟢 Passed     | same authorized single Rust chain, confirmed / exit 0 | **Gate 2** — no second POST; receipt and private history evidence reviewed |
 | 25 | Rust coordinator          | 🟢 Passed     | `cargo test` (47)               | batch CLI + pre-flight dedupe; `2d2fcf9` |
 | 26 | Retry policy              | 🟢 Passed     | retry tests                     | `decision.rs` + E2E backoff |
 | 27 | Checkpointing             | 🟢 Passed     | `cargo test` (79) + clippy      | port TS `BatchCheckpoint.ts` + store + engine wiring; Gate 3 items → Stage 28 |
 | 28 | Recovery                  | 🟢 Passed     | `cargo test` (162) + clippy     | **Gate 3** — in-flight record + start gate; independent panel run, 5 defects fixed; the deferred one decided and fixed 2026-09-29 (follow-up), with a second panel over that fix |
-| 29 | Extension → Rust          | ⬜ Not Started | API integration                 | API designed → `docs/daemon-api.md`; TS still at repo root |
-| 30 | Pause                     | ⬜ Not Started | pause test                      | state exists; no engine API |
-| 31 | Stop                      | ⬜ Not Started | stop test                       | abort path exists |
-| 32 | Error testing             | ⬜ Not Started | failure scenarios               | many paths already covered |
+| 29 | Extension → Rust          | 🟢 Passed     | 193 Rust fixture tests; Clippy; pnpm typecheck; 223 TS tests | Guarded loopback daemon + stateless extension; offline acceptance only |
+| 30 | Pause                     | 🟢 Passed     | 205 Rust tests; Clippy; pnpm typecheck; 256 TS tests | Durable safe-boundary pause + same-worker resume; offline fixtures only |
+| 31 | Stop                      | 🟢 Passed     | 215 Rust tests; fmt/Clippy; pnpm typecheck; 313 TS tests | Latched cooperative stop; no later attempts/retries; offline fixtures only |
+| 32 | Error testing             | 🟢 Passed     | 250 Rust; 356 Python; 313 TS; typecheck/fmt/Clippy | Offline failure matrix, echo/identity fixes, bounded response/EOF supervision |
 | 33 | Full integration          | ⬜ Not Started | multi-layer test                | **Gate 4** |
 | 34 | Remove old TS automation  | ⬜ Not Started | build + tests                   | **not before this stage** |
 | 35 | Security review           | ⬜ Not Started | credential scan                 | design measures already in place |
@@ -993,10 +1161,10 @@ them, designed but deliberately unbuilt.
 ## Migration Progress Summary
 
 ```text
-Completed:  27 / 40
+Completed:  33 / 40
 In Progress: 0
 Failed:      0
-Blocked:     2   (15, 24)
+Blocked:     0
 Skipped:     0
 ```
 
@@ -1015,9 +1183,11 @@ Hard gates — do not continue past them until they pass.
 ## Current Execution Order
 
 The order the work follows, not a list of what is outstanding: 10 and 25–28 are
-already Passed (see the status table above). Stage 14's AJAX correction is now
-offline-verified; the next outstanding verification is the live gates at 15 and
-24, pending a real POST response and explicit operator approval.
+already Passed (see the status table above). Stages 15/24 are now Passed after
+one approved live submission and read-only reconciliation on 2026-10-05.
+Stages 29–32 passed offline fixture acceptance. Stage 33 (full integration,
+Gate 4) is next; no live authorization is implied. Batch recovery was not tested
+live.
 
 ```text
 10  Real DSSP session

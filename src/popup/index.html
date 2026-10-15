@@ -13,7 +13,50 @@
       </header>
 
       <section class="section">
+        <h2>Daemon connection</h2>
+        <label for="daemon-port">127.0.0.1 port</label>
+        <input
+          id="daemon-port"
+          type="number"
+          min="1"
+          max="65535"
+          step="1"
+          value="8765"
+        />
+        <label for="daemon-token">Daemon token (paste manually)</label>
+        <input
+          id="daemon-token"
+          type="password"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="save-daemon" type="button">Save and connect</button>
+        <p id="connection" class="status" role="status"></p>
+        <div id="daemon-help">
+          <p>
+            Start manually from the repository's <code>rust/</code> directory:
+          </p>
+          <pre id="daemon-command"></pre>
+          <p>
+            Allow this exact extension origin:
+            <code id="extension-origin"></code>.
+          </p>
+          <p>
+            Paste the token from the file reported by the daemon. No
+            auto-discovery or auto-start. Do not run CLI batches or other
+            daemons against the same profile/checkpoint.
+          </p>
+        </div>
+      </section>
+
+      <section class="section">
         <h2>Session</h2>
+        <button id="load-options" type="button" disabled>
+          Load form options
+        </button>
+        <p class="muted">
+          This explicit request may start the Python worker and contact DSSP.
+        </p>
 
         <label for="instructor">Instructor</label>
         <select id="instructor" disabled>
@@ -40,6 +83,7 @@
         <h2>Progress</h2>
 
         <p id="current" class="muted">No batch running</p>
+        <p id="pause-status" class="muted" role="status" hidden></p>
 
         <div class="grid">
           <div><span class="label">Total</span><span id="total">0</span></div>
@@ -63,15 +107,36 @@
 
       <section class="controls">
         <button id="start" type="button">Start batch</button>
-        <button id="pause" type="button" disabled>Pause</button>
-        <button id="resume" type="button" disabled>Resume</button>
-        <button id="stop" type="button" disabled>Stop</button>
+        <button
+          id="pause"
+          type="button"
+          disabled
+          title="Request pause at the safe checkpoint boundary; does not cancel an in-flight POST"
+        >
+          Pause
+        </button>
+        <button
+          id="resume"
+          type="button"
+          disabled
+          title="Resume the same in-memory batch or cancel a pending pause; not restart recovery"
+        >
+          Resume
+        </button>
+        <button
+          id="stop"
+          type="button"
+          disabled
+          title="Request latched stop; does not cancel an in-flight POST and cannot be cancelled by Pause or Resume"
+        >
+          Stop
+        </button>
       </section>
 
       <p id="status" class="status" role="status"></p>
 
       <section id="recovery-section" class="section" hidden>
-        <h2>Interrupted batch</h2>
+        <h2>Daemon checkpoint / recovery</h2>
         <p id="recovery" class="muted"></p>
       </section>
 

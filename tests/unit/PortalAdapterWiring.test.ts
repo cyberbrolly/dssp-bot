@@ -163,10 +163,13 @@ describe("RemotePortalAdapter forwarding", () => {
 
     await adapter.attach();
 
-    const call = (adapter as unknown as Record<string, (...args: unknown[]) => unknown>)[
-      method
-    ];
-    await call.call(adapter, trainee("1"), session);
+    if (method === "fillTrainingForm") {
+      await adapter.fillTrainingForm(session);
+    } else if (method === "openTrainee" || method === "prepareTrainee") {
+      await adapter[method](trainee("1"));
+    } else {
+      await adapter[method]();
+    }
 
     expect(sent).toHaveLength(1);
     expect(sent[0]).toEqual(expected);

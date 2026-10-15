@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 mod checkpoint;
+mod daemon;
 mod decision;
 mod engine;
 mod protocol;
@@ -29,7 +30,7 @@ use std::fs;
 use std::path::Path;
 use std::process::exit;
 
-use decision::{decide_submit, Decision, RetryPolicy};
+use decision::{Decision, RetryPolicy, decide_submit};
 use engine::BatchEngine;
 use protocol::{Request, SessionInput, Status, TraineeInfo, TraineeRef};
 use recovery::Start;
@@ -214,7 +215,7 @@ fn resolve_against(
 ///
 /// Needs an authenticated session — the caller establishes one first.
 fn resolve_trainees(
-    client: &mut WorkerClient,
+    client: &mut impl engine::Transport,
     trainees: &[TraineeRef],
 ) -> Result<Vec<TraineeRef>, ResolveFailure> {
     let resp = client
@@ -240,7 +241,16 @@ fn resolve_trainees(
 }
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "job.json".to_string());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "job.json".to_string());
+    if path == "--daemon" {
+        if let Err(error) = daemon::run() {
+            eprintln!("dssp-bot: {error}");
+            exit(1);
+        }
+        return;
+    }
     let job: Job = match fs::read_to_string(&path)
         .map_err(|e| e.to_string())
         .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
@@ -314,12 +324,16 @@ fn run_single(trainee: TraineeRef, session: &SessionInput) -> i32 {
 
     let (line, code) = loop {
         attempt += 1;
-        let req =
-            Request::submit_training(job_id.clone(), trainee.clone(), session.clone());
+        let req = Request::submit_training(job_id.clone(), trainee.clone(), session.clone());
 
         let resp = match client.send(&req) {
             Ok(resp) => resp,
-            Err(e) => break (format!("HALT: transport error, submission state unknown: {e}"), 3),
+            Err(e) => {
+                break (
+                    format!("HALT: transport error, submission state unknown: {e}"),
+                    3,
+                );
+            }
         };
 
         match decide_submit(&resp) {
@@ -553,11 +567,7 @@ fn preview(ids: &[String]) -> String {
 
 /// The name when there is one, else the id: what the operator would look up.
 fn label<'a>(id: &'a str, name: &'a str) -> &'a str {
-    if name.is_empty() {
-        id
-    } else {
-        name
-    }
+    if name.is_empty() { id } else { name }
 }
 
 /// Progress on stderr; the machine-readable report alone on stdout.
@@ -637,7 +647,9 @@ mod tests {
     }
 
     fn problems(result: Result<Vec<TraineeRef>, Vec<String>>) -> String {
-        result.expect_err("expected a resolution failure").join("; ")
+        result
+            .expect_err("expected a resolution failure")
+            .join("; ")
     }
 
     #[test]

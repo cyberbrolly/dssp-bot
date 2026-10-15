@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
+import { createManifest } from "../../manifest";
 
-import { parsePortalMatches } from "../../manifest";
-
-describe("portal manifest matches", () => {
-  it("injects the content script into the live DSSP origin by default", () => {
-    expect(parsePortalMatches(undefined)).toEqual([
-      "https://dssp.frsc.gov.ng/*",
-    ]);
+describe("thin daemon client manifest", () => {
+  it("permits loopback only and never activates legacy portal scripts", () => {
+    const manifest = createManifest(["https://arbitrary.example/*"]);
+    expect(manifest).toMatchObject({
+      permissions: ["storage"],
+      host_permissions: ["http://127.0.0.1/*"],
+      background: {
+        service_worker: "src/background/service-worker.ts",
+        type: "module",
+      },
+    });
+    expect(manifest).not.toHaveProperty("content_scripts");
   });
 });

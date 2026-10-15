@@ -1,5 +1,8 @@
-import type { BatchReport } from "../../domain/BatchReport";
-import type { BatchCheckpoint } from "../../automation/BatchCheckpoint";
+import type {
+  DaemonReport,
+  DaemonCheckpoint,
+  TraineeRef,
+} from "../daemon/DaemonClient";
 import type { TrainingSession } from "../../domain/TrainingSession";
 import type { AutomationState } from "../../automation/AutomationState";
 import type { TrainingFormOptions } from "../../domain/TrainingFormOptions";
@@ -15,6 +18,10 @@ export interface BatchProgress {
   indeterminate: number;
   remaining: number;
   currentTraineeName?: string;
+  /** Daemon intent only; paused is published after the safe checkpoint boundary. */
+  pauseRequested?: boolean;
+  /** Latched daemon intent; stopped is published only by the engine. */
+  stopRequested?: boolean;
 }
 
 export type Message =
@@ -23,6 +30,8 @@ export type Message =
   | {
       type: "START_AUTOMATION";
       traineeIds: string[];
+      trainees?: TraineeRef[];
+      resume?: boolean;
       session: Omit<TrainingSession, "traineeId">;
     }
   | { type: "PAUSE_AUTOMATION" }
@@ -43,12 +52,12 @@ export interface StatusResponse {
 
 export interface ReportResponse {
   success: true;
-  data: BatchReport | null;
+  data: DaemonReport | null;
 }
 
 export interface CheckpointResponse {
   success: true;
-  data: BatchCheckpoint | null;
+  data: DaemonCheckpoint | null;
 }
 
 export interface FormOptionsResponse {

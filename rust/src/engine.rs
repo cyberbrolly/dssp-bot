@@ -8,11 +8,13 @@
 //! testable without a subprocess or a browser.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::checkpoint::{BatchCheckpoint, CheckpointStatus, CheckpointWriter};
-use crate::decision::{settle_submit, RetryPolicy, Settle};
+use crate::decision::{RetryPolicy, Settle, settle_submit};
 use crate::protocol::{Request, Response, SessionInput, Status, TraineeRef};
 use crate::queue::TaskQueue;
 use crate::report::{BatchReport, Outcome, TrainingResult};
@@ -97,6 +99,18 @@ fn dedupe(trainees: Vec<TraineeRef>) -> Vec<(String, TraineeRef)> {
     unique
 }
 
+/// Optional daemon-only intent. The pause mutex serializes controls, attempt
+/// admission and terminal completion. An admitted round trip is never cancelled.
+#[derive(Default)]
+pub struct BatchControl {
+    pub(crate) pause_requested: Mutex<bool>,
+    pub(crate) changed: Condvar,
+    pub(crate) stop_requested: AtomicBool,
+    pub(crate) closed: AtomicBool,
+    #[cfg(test)]
+    pub(crate) backoff_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
 pub struct BatchEngine {
     policy: RetryPolicy,
     machine: StateMachine,
@@ -110,6 +124,7 @@ pub struct BatchEngine {
     /// run. Carried because the file is rewritten in full, so a resumed batch's
     /// first write would otherwise drop the record of a possible submission.
     carried: Vec<TrainingResult>,
+    control: Option<Arc<BatchControl>>,
 }
 
 impl BatchEngine {
@@ -127,6 +142,7 @@ impl BatchEngine {
             machine: StateMachine::new(),
             checkpoint,
             carried: Vec::new(),
+            control: None,
         }
     }
 
@@ -137,12 +153,16 @@ impl BatchEngine {
         self
     }
 
+    pub fn with_control(mut self, control: Arc<BatchControl>) -> Self {
+        self.control = Some(control);
+        self
+    }
+
     /// Write the current position to durable storage.
     ///
-    /// The error is the caller's to use, and only the pre-submission call in
-    /// [`BatchEngine::run`] does: that write is fatal, every other one is
-    /// dropped, because a storage error must not abort an otherwise-succeeding
-    /// batch (stranding a trainee mid-flow is worse) — the sink already reports it.
+    /// Pre-submission and pause/resume/stop boundary writes are fatal on failure.
+    /// Settlement/terminal writes retain the CLI's existing best-effort behavior;
+    /// a safe boundary never strands a trainee mid-flow.
     fn save_checkpoint(
         &mut self,
         status: CheckpointStatus,
@@ -165,6 +185,82 @@ impl BatchEngine {
         };
 
         self.checkpoint.write(&snapshot)
+    }
+
+    fn control_boundary(
+        &mut self,
+        started_at: &str,
+        total: usize,
+        results: &[TrainingResult],
+        queue: &TaskQueue<TraineeRef>,
+    ) -> Result<bool, String> {
+        let Some(control) = self.control.clone() else {
+            return Ok(false);
+        };
+        // Serialize intent with durable publication, so resume cannot race a
+        // paused write. The daemon never holds its state lock while acquiring
+        // this lock; the checkpoint sink may acquire that state lock here.
+        let mut requested = control
+            .pause_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if control.stop_requested.load(Ordering::SeqCst) {
+            self.stop_checkpoint(started_at, total, results, queue)?;
+            return Ok(true);
+        }
+        if !*requested {
+            return Ok(false);
+        }
+        self.save_checkpoint(
+            CheckpointStatus::Paused,
+            started_at,
+            total,
+            results,
+            queue,
+            None,
+        )
+        .map_err(|e| format!("pause checkpoint: {e}"))?;
+        self.machine.transition_to(AutomationState::Paused)?;
+        while *requested && !control.stop_requested.load(Ordering::SeqCst) {
+            requested = control
+                .changed
+                .wait(requested)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        if control.stop_requested.load(Ordering::SeqCst) {
+            self.stop_checkpoint(started_at, total, results, queue)?;
+            return Ok(true);
+        }
+        self.save_checkpoint(
+            CheckpointStatus::Running,
+            started_at,
+            total,
+            results,
+            queue,
+            None,
+        )
+        .map_err(|e| format!("resume checkpoint: {e}"))?;
+        self.machine
+            .transition_to(AutomationState::LoadingTrainee)?;
+        Ok(false)
+    }
+
+    fn stop_checkpoint(
+        &mut self,
+        started_at: &str,
+        total: usize,
+        results: &[TrainingResult],
+        queue: &TaskQueue<TraineeRef>,
+    ) -> Result<(), String> {
+        self.save_checkpoint(
+            CheckpointStatus::Aborted,
+            started_at,
+            total,
+            results,
+            queue,
+            None,
+        )
+        .map_err(|e| format!("stop checkpoint: {e}"))
     }
 
     /// Run a batch: one shared session, one training template, many trainees.
@@ -207,7 +303,25 @@ impl BatchEngine {
         // and the run reads as one that worked through its queue.
         let mut aborted = false;
 
-        while let Some(task) = queue.dequeue() {
+        while !queue.is_empty() {
+            if self.control_boundary(&started_at, total, &results, &queue)? {
+                drain_skipped(&mut queue, &mut results, OPERATOR_STOP);
+                aborted = true;
+                let _ = self.machine.transition_to(AutomationState::Stopped);
+                break;
+            }
+            let control = self.control.clone();
+            let dequeue_guard = control
+                .as_ref()
+                .map(|c| c.pause_requested.lock().unwrap_or_else(|e| e.into_inner()));
+            if control
+                .as_ref()
+                .is_some_and(|c| c.stop_requested.load(Ordering::SeqCst))
+            {
+                continue; // The next boundary persists the unchanged queue.
+            }
+            let task = queue.dequeue().expect("queue was not empty");
+            drop(dequeue_guard);
             // Taken before the submission, not after. From here the trainee is in
             // no other group, so if the process dies now this write is the only
             // thing that can say a submission may have reached the portal; its
@@ -256,12 +370,42 @@ impl BatchEngine {
 
             let last = results.last().expect("just pushed");
             if should_abort(last) {
-                let reason = abort_reason(last);
+                let mut reason = abort_reason(last);
+                // A stop still requires a durable safe boundary, even when the
+                // settled result independently requires an indeterminate abort.
+                if self
+                    .control
+                    .as_ref()
+                    .is_some_and(|c| c.stop_requested.load(Ordering::SeqCst))
+                {
+                    self.stop_checkpoint(&started_at, total, &results, &queue)?;
+                    reason = OPERATOR_STOP.into();
+                }
                 drain_skipped(&mut queue, &mut results, &reason);
                 aborted = true;
                 let _ = self.machine.transition_to(AutomationState::Stopped);
                 break;
             }
+        }
+
+        // Completion and a late stop have one ordering point. A stop observed
+        // here aborts even on the last row, preserving its actual result. Once
+        // closed, a late control is refused rather than relabeling success.
+        let control = self.control.clone();
+        let _completion = control
+            .as_ref()
+            .map(|c| c.pause_requested.lock().unwrap_or_else(|e| e.into_inner()));
+        let stopped = control
+            .as_ref()
+            .is_some_and(|c| c.stop_requested.load(Ordering::SeqCst));
+        if stopped && !aborted {
+            self.stop_checkpoint(&started_at, total, &results, &queue)?;
+            drain_skipped(&mut queue, &mut results, OPERATOR_STOP);
+            aborted = true;
+            let _ = self.machine.transition_to(AutomationState::Stopped);
+        }
+        if let Some(control) = &control {
+            control.closed.store(true, Ordering::SeqCst);
         }
 
         if self.machine.state() != AutomationState::Stopped {
@@ -274,7 +418,7 @@ impl BatchEngine {
         // had already landed still on the portal, so it is written as `Aborted` and
         // the start gate refuses a plain re-run over it. Calling both `Finished` left
         // the gate's one landed-work exemption covering the case it was written for.
-        let _ = self.save_checkpoint(
+        let terminal = self.save_checkpoint(
             if aborted {
                 CheckpointStatus::Aborted
             } else {
@@ -287,6 +431,9 @@ impl BatchEngine {
             None,
         );
 
+        if stopped {
+            terminal.map_err(|e| format!("stop terminal checkpoint: {e}"))?;
+        }
         Ok(BatchReport::build(results, started_at, now_ms(), aborted))
     }
 
@@ -303,9 +450,30 @@ impl BatchEngine {
         let fallback_id = trainee.id.clone().unwrap_or_default();
         let fallback_name = trainee.name.clone().unwrap_or_default();
         let mut attempts = 0u32;
+        let mut retry_result = None;
 
         loop {
+            // Admission, not the entire blocking send, is serialized with stop.
+            // Releasing this lock keeps controls responsive during the round trip.
+            let control = self.control.clone();
+            let admission = control
+                .as_ref()
+                .map(|c| c.pause_requested.lock().unwrap_or_else(|e| e.into_inner()));
+            if control
+                .as_ref()
+                .is_some_and(|c| c.stop_requested.load(Ordering::SeqCst))
+            {
+                return retry_result.unwrap_or_else(|| TrainingResult {
+                    trainee_id: fallback_id.clone(),
+                    trainee_name: fallback_name.clone(),
+                    outcome: Outcome::Skipped,
+                    attempts: 0,
+                    error_code: None,
+                    message: Some(OPERATOR_STOP.into()),
+                });
+            }
             attempts += 1;
+            drop(admission);
             let _ = self.machine.transition_to(AutomationState::Submitting);
 
             let req = Request::submit_training(job_id.clone(), trainee.clone(), session.clone());
@@ -376,8 +544,34 @@ impl BatchEngine {
                             message: Some(format!("gave up after {attempts} attempts: {message}")),
                         };
                     }
+                    retry_result = Some(TrainingResult {
+                        trainee_id: id,
+                        trainee_name: name,
+                        outcome: Outcome::Failed,
+                        attempts,
+                        error_code: Some(code),
+                        message: Some(format!("operator stop before retry: {message}")),
+                    });
                     let _ = self.machine.transition_to(AutomationState::Retrying);
-                    thread::sleep(self.policy.delay_for_attempt(attempts));
+                    let delay = self.policy.delay_for_attempt(attempts);
+                    if let Some(control) = &self.control {
+                        let guard = control
+                            .pause_requested
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        #[cfg(test)]
+                        if let Some(notice) = control.backoff_started.lock().unwrap().take() {
+                            notice.send(()).unwrap();
+                        }
+                        let _wait = control
+                            .changed
+                            .wait_timeout_while(guard, delay, |_| {
+                                !control.stop_requested.load(Ordering::SeqCst)
+                            })
+                            .unwrap_or_else(|e| e.into_inner());
+                    } else {
+                        thread::sleep(delay);
+                    }
                 }
             }
         }
@@ -408,7 +602,10 @@ fn abort_reason(result: &TrainingResult) -> String {
     } else {
         format!(
             "batch aborted: {}",
-            result.error_code.as_deref().unwrap_or("unrecoverable error")
+            result
+                .error_code
+                .as_deref()
+                .unwrap_or("unrecoverable error")
         )
     }
 }
@@ -417,6 +614,7 @@ fn abort_reason(result: &TrainingResult) -> String {
 /// Distinct from an abort's reason: an abort means the portal refused something,
 /// this means the run never asked — a local fault the operator can clear.
 const NOT_SUBMITTED: &str = "not submitted: the run stopped before reaching it";
+const OPERATOR_STOP: &str = "not submitted: operator stop";
 
 fn drain_skipped(
     queue: &mut TaskQueue<TraineeRef>,
@@ -444,6 +642,411 @@ mod tests {
     use std::rc::Rc;
 
     use crate::checkpoint::{BatchCheckpoint, CheckpointStatus, CheckpointWriter};
+
+    fn request_stop(control: &BatchControl) {
+        let _guard = control.pause_requested.lock().unwrap();
+        control.stop_requested.store(true, Ordering::SeqCst);
+        control.changed.notify_all();
+    }
+
+    struct StopSink {
+        recorder: Recorder,
+        control: Arc<BatchControl>,
+        stop_on_in_flight: bool,
+        stop_on_settlement: bool,
+        fail_aborted: usize,
+        aborted_writes: usize,
+    }
+    impl CheckpointWriter for StopSink {
+        fn write(&mut self, cp: &BatchCheckpoint) -> Result<(), String> {
+            if cp.status == CheckpointStatus::Aborted {
+                self.aborted_writes += 1;
+                if self.aborted_writes == self.fail_aborted {
+                    return Err("synthetic stop checkpoint failure".into());
+                }
+            }
+            self.recorder.write(cp)?;
+            if cp.status == CheckpointStatus::Running
+                && ((self.stop_on_in_flight && cp.in_flight.is_some())
+                    || (self.stop_on_settlement && cp.in_flight.is_none()))
+            {
+                request_stop(&self.control);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stop_before_first_attempt_records_skips_and_ordered_aborted_boundary() {
+        let recorder = Recorder::default();
+        let control = Arc::new(BatchControl::default());
+        let sink = StopSink {
+            recorder: recorder.clone(),
+            control: control.clone(),
+            stop_on_in_flight: true,
+            stop_on_settlement: false,
+            fail_aborted: 0,
+            aborted_writes: 0,
+        };
+        let mut engine = BatchEngine::new(Box::new(sink)).with_control(control);
+        let mut worker = FakeTransport::new(true, vec![]);
+        let report = engine
+            .run(&mut worker, &session(), refs(&["a", "b", "c"]))
+            .unwrap();
+        assert!(report.aborted);
+        assert_eq!(worker.submit_calls, 0);
+        assert_eq!(report.skipped, 3);
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|r| r.attempts == 0 && r.message.as_deref() == Some(OPERATOR_STOP))
+        );
+        let writes = recorder.written();
+        let boundary = writes
+            .iter()
+            .find(|cp| cp.status == CheckpointStatus::Aborted)
+            .unwrap();
+        assert_eq!(boundary.pending, ["b", "c"]);
+        assert!(boundary.in_flight.is_none());
+        assert_eq!(boundary.results[0].trainee_id, "a");
+        assert_eq!(writes.last().unwrap().results.len(), 3);
+    }
+
+    #[test]
+    fn stop_already_latched_wakes_initial_pause_without_dequeue_or_post() {
+        let recorder = Recorder::default();
+        let control = Arc::new(BatchControl::default());
+        *control.pause_requested.lock().unwrap() = true;
+        request_stop(&control);
+        let mut engine = with_recorder(&recorder).with_control(control);
+        let mut worker = FakeTransport::new(true, vec![]);
+        let report = engine
+            .run(&mut worker, &session(), refs(&["a", "b"]))
+            .unwrap();
+        assert!(report.aborted);
+        assert_eq!(worker.submit_calls, 0);
+        assert_eq!(report.skipped, 2);
+        let writes = recorder.written();
+        assert_eq!(writes[0].status, CheckpointStatus::Aborted);
+        assert_eq!(writes[0].pending, ["a", "b"]);
+        assert!(writes[0].results.is_empty());
+        assert!(writes[0].in_flight.is_none());
+    }
+
+    #[test]
+    fn stop_before_finish_on_last_success_preserves_success_but_records_abort() {
+        let recorder = Recorder::default();
+        let control = Arc::new(BatchControl::default());
+        let sink = StopSink {
+            recorder: recorder.clone(),
+            control: control.clone(),
+            stop_on_in_flight: false,
+            stop_on_settlement: true,
+            fail_aborted: 0,
+            aborted_writes: 0,
+        };
+        let mut engine = BatchEngine::new(Box::new(sink)).with_control(control.clone());
+        let mut worker = FakeTransport::new(true, vec![confirmed("a", "A")]);
+        let report = engine.run(&mut worker, &session(), refs(&["a"])).unwrap();
+        assert!(report.aborted);
+        assert_eq!(report.successful, 1);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.results[0].attempts, 1);
+        assert!(control.closed.load(Ordering::SeqCst));
+        assert_eq!(
+            recorder.written().last().unwrap().status,
+            CheckpointStatus::Aborted
+        );
+    }
+
+    #[test]
+    fn both_stop_boundary_and_stop_terminal_write_fail_closed() {
+        for fail_aborted in [1, 2] {
+            let recorder = Recorder::default();
+            let control = Arc::new(BatchControl::default());
+            let sink = StopSink {
+                recorder: recorder.clone(),
+                control: control.clone(),
+                stop_on_in_flight: false,
+                stop_on_settlement: true,
+                fail_aborted,
+                aborted_writes: 0,
+            };
+            let mut engine = BatchEngine::new(Box::new(sink)).with_control(control);
+            let mut worker = FakeTransport::new(true, vec![confirmed("a", "A")]);
+            let error = engine
+                .run(&mut worker, &session(), refs(&["a", "b", "c"]))
+                .unwrap_err();
+            assert!(error.contains("stop"), "{error}");
+            assert_eq!(worker.submit_calls, 1);
+            let writes = recorder.written();
+            let old = writes.last().unwrap();
+            assert_eq!(old.results.len(), 1);
+            assert_eq!(old.results[0].outcome, Outcome::Success);
+            assert_eq!(old.pending, ["b", "c"]);
+            assert!(old.in_flight.is_none());
+            assert_eq!(
+                old.status,
+                if fail_aborted == 1 {
+                    CheckpointStatus::Running
+                } else {
+                    CheckpointStatus::Aborted
+                }
+            );
+        }
+    }
+
+    struct StopAfterResponse {
+        worker: FakeTransport,
+        control: Arc<BatchControl>,
+    }
+    impl Transport for StopAfterResponse {
+        fn send(&mut self, req: &Request) -> Result<Response, String> {
+            let response = self.worker.send(req)?;
+            if req.op == crate::protocol::op::SUBMIT_TRAINING {
+                request_stop(&self.control);
+            }
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn stop_after_provably_unsent_response_preserves_failure_and_actual_attempts() {
+        let control = Arc::new(BatchControl::default());
+        let mut worker = StopAfterResponse {
+            worker: FakeTransport::new(
+                true,
+                vec![resp(
+                    r#"{"v":1,"status":"error","error_code":"ELEMENT_NOT_FOUND","message":"safe fixture error","proves_nothing_submitted":true}"#,
+                )],
+            ),
+            control: control.clone(),
+        };
+        let report = fast_engine()
+            .with_control(control)
+            .run(&mut worker, &session(), refs(&["a", "b"]))
+            .unwrap();
+        assert!(report.aborted);
+        assert_eq!(worker.worker.submit_calls, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.results[0].attempts, 1);
+        assert_eq!(
+            report.results[0].error_code.as_deref(),
+            Some("ELEMENT_NOT_FOUND")
+        );
+        assert_eq!(
+            report.results[0].message.as_deref(),
+            Some("operator stop before retry: safe fixture error")
+        );
+    }
+
+    #[test]
+    fn stop_interrupts_current_backoff_without_waiting_or_admitting_retry() {
+        let control = Arc::new(BatchControl::default());
+        let (notice, waiting) = std::sync::mpsc::channel();
+        *control.backoff_started.lock().unwrap() = Some(notice);
+        let c = control.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let thread = thread::spawn(move || {
+            let recorder = Recorder::default();
+            let mut worker = FakeTransport::new(
+                true,
+                vec![resp(
+                    r#"{"v":1,"status":"error","error_code":"TIMEOUT","message":"safe timeout","proves_nothing_submitted":true}"#,
+                )],
+            );
+            let mut engine = BatchEngine::with_policy(
+                RetryPolicy {
+                    max_attempts: 3,
+                    initial_delay_ms: 60_000,
+                    max_delay_ms: 60_000,
+                    backoff_factor: 2,
+                },
+                Box::new(recorder.clone()),
+            )
+            .with_control(c);
+            let report = engine
+                .run(&mut worker, &session(), refs(&["a", "b"]))
+                .unwrap();
+            done.send((report, worker.submit_calls, recorder.written()))
+                .unwrap();
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        request_stop(&control);
+        let (report, calls, writes) = result
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(report.aborted);
+        assert_eq!(calls, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.results[0].attempts, 1);
+        assert_eq!(report.results[0].error_code.as_deref(), Some("TIMEOUT"));
+        assert_eq!(writes.last().unwrap().status, CheckpointStatus::Aborted);
+    }
+
+    struct BoundarySink {
+        recorder: Recorder,
+        control: Arc<BatchControl>,
+        fail_paused: bool,
+        fail_resumed: bool,
+        request_after_settle: bool,
+        resume_notice: Option<std::sync::mpsc::Sender<()>>,
+    }
+    impl CheckpointWriter for BoundarySink {
+        fn write(&mut self, cp: &BatchCheckpoint) -> Result<(), String> {
+            if cp.status == CheckpointStatus::Paused && self.fail_paused {
+                return Err("synthetic paused write failure".into());
+            }
+            if cp.status == CheckpointStatus::Running && cp.in_flight.is_none() && self.fail_resumed
+            {
+                return Err("synthetic resumed write failure".into());
+            }
+            self.recorder.write(cp)?;
+            if cp.status == CheckpointStatus::Paused {
+                if let Some(notice) = self.resume_notice.take() {
+                    notice.send(()).unwrap();
+                }
+            } else if cp.status == CheckpointStatus::Running
+                && cp.in_flight.is_none()
+                && self.request_after_settle
+            {
+                *self.control.pause_requested.lock().unwrap() = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pause_at_first_boundary_preserves_queue_and_persists_running_before_send() {
+        let control = Arc::new(BatchControl::default());
+        *control.pause_requested.lock().unwrap() = true;
+        let recorder = Recorder::default();
+        let (notice, paused) = std::sync::mpsc::channel();
+        let c = control.clone();
+        let resume = std::thread::spawn(move || {
+            paused
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            *c.pause_requested.lock().unwrap() = false;
+            c.changed.notify_all();
+        });
+        let sink = BoundarySink {
+            recorder: recorder.clone(),
+            control: control.clone(),
+            fail_paused: false,
+            fail_resumed: false,
+            request_after_settle: false,
+            resume_notice: Some(notice),
+        };
+        let mut engine =
+            BatchEngine::with_policy(fast_policy(), Box::new(sink)).with_control(control);
+        let mut worker = FakeTransport::watching(
+            true,
+            vec![confirmed("1", "A"), confirmed("2", "B")],
+            &recorder,
+        );
+        let report = engine
+            .run(&mut worker, &session(), refs(&["1", "2"]))
+            .unwrap();
+        resume.join().unwrap();
+        assert_eq!(report.successful, 2);
+        assert_eq!(worker.submit_calls, 2);
+        let written = recorder.written();
+        assert_eq!(written[0].status, CheckpointStatus::Paused);
+        assert_eq!(written[0].pending, ["1", "2"]);
+        assert!(written[0].results.is_empty());
+        assert!(written[0].in_flight.is_none());
+        assert_eq!(written[1].status, CheckpointStatus::Running);
+        assert!(written[1].in_flight.is_none());
+        assert_eq!(written[1].pending, written[0].pending);
+        assert_eq!(written[1].started_at, written[0].started_at);
+        for n in 1..=2 {
+            assert_eq!(worker.at_send(n).status, CheckpointStatus::Running);
+            assert_eq!(worker.at_send(n).in_flight, Some(n.to_string()));
+        }
+        assert_eq!(engine.machine.state(), AutomationState::Complete);
+    }
+
+    #[test]
+    fn failed_pause_checkpoint_halts_without_dequeue_or_later_submit() {
+        for after_settle in [false, true] {
+            let control = Arc::new(BatchControl::default());
+            *control.pause_requested.lock().unwrap() = !after_settle;
+            let recorder = Recorder::default();
+            let sink = BoundarySink {
+                recorder: recorder.clone(),
+                control: control.clone(),
+                fail_paused: true,
+                fail_resumed: false,
+                request_after_settle: after_settle,
+                resume_notice: None,
+            };
+            let mut engine =
+                BatchEngine::with_policy(fast_policy(), Box::new(sink)).with_control(control);
+            let mut worker = FakeTransport::new(true, vec![confirmed("1", "A")]);
+            let error = engine
+                .run(&mut worker, &session(), refs(&["1", "2"]))
+                .unwrap_err();
+            assert!(error.contains("pause checkpoint"));
+            assert_eq!(worker.submit_calls, usize::from(after_settle));
+            let written = recorder.written();
+            if after_settle {
+                let last = written.last().unwrap();
+                assert_eq!(last.status, CheckpointStatus::Running);
+                assert_eq!(last.pending, ["2"]);
+                assert!(last.in_flight.is_none());
+                assert_eq!(last.results.len(), 1);
+                assert_eq!(last.results[0].trainee_id, "1");
+            } else {
+                assert!(written.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_resume_checkpoint_leaves_durable_paused_queue_and_sends_nothing() {
+        let control = Arc::new(BatchControl::default());
+        *control.pause_requested.lock().unwrap() = true;
+        let recorder = Recorder::default();
+        let (notice, paused) = std::sync::mpsc::channel();
+        let c = control.clone();
+        let resume = std::thread::spawn(move || {
+            paused
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            *c.pause_requested.lock().unwrap() = false;
+            c.changed.notify_all();
+        });
+        let sink = BoundarySink {
+            recorder: recorder.clone(),
+            control: control.clone(),
+            fail_paused: false,
+            fail_resumed: true,
+            request_after_settle: false,
+            resume_notice: Some(notice),
+        };
+        let mut engine =
+            BatchEngine::with_policy(fast_policy(), Box::new(sink)).with_control(control);
+        let mut worker = FakeTransport::new(true, vec![]);
+        let error = engine
+            .run(&mut worker, &session(), refs(&["1", "2"]))
+            .unwrap_err();
+        resume.join().unwrap();
+        assert!(error.contains("resume checkpoint"));
+        assert_eq!(worker.submit_calls, 0);
+        let written = recorder.written();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].status, CheckpointStatus::Paused);
+        assert_eq!(written[0].pending, ["1", "2"]);
+        assert!(written[0].in_flight.is_none());
+        assert_eq!(engine.machine.state(), AutomationState::Paused);
+    }
 
     /// Scripts one response per submit_training call, in order; also the
     /// instrument for the crash-window tests, snapshotting the sink at each send.
@@ -590,9 +1193,15 @@ mod tests {
     fn all_confirmed() {
         let mut w = FakeTransport::new(
             true,
-            vec![confirmed("1", "A"), confirmed("2", "B"), confirmed("3", "C")],
+            vec![
+                confirmed("1", "A"),
+                confirmed("2", "B"),
+                confirmed("3", "C"),
+            ],
         );
-        let report = fast_engine().run(&mut w, &session(), refs(&["1", "2", "3"])).unwrap();
+        let report = fast_engine()
+            .run(&mut w, &session(), refs(&["1", "2", "3"]))
+            .unwrap();
         assert_eq!((report.total, report.successful, report.failed), (3, 3, 0));
         assert_eq!(report.skipped, 0);
         assert_eq!(w.submit_calls, 3);
@@ -607,7 +1216,11 @@ mod tests {
         // assertion, not on an exhausted script; the third goes unused.
         let mut w = FakeTransport::new(
             true,
-            vec![confirmed("1", "A"), confirmed("1", "A"), confirmed("2", "B")],
+            vec![
+                confirmed("1", "A"),
+                confirmed("1", "A"),
+                confirmed("2", "B"),
+            ],
         );
 
         let report = fast_engine()
@@ -625,10 +1238,7 @@ mod tests {
     /// the CLI, but `run` is `pub`, so the comparison is namespaced here.
     #[test]
     fn an_id_that_looks_positional_does_not_swallow_a_nameless_entry() {
-        let mut w = FakeTransport::new(
-            true,
-            vec![confirmed("1", "A"), confirmed("2", "B")],
-        );
+        let mut w = FakeTransport::new(true, vec![confirmed("1", "A"), confirmed("2", "B")]);
 
         let roster = vec![numbered("#1"), anonymous()];
         let report = fast_engine().run(&mut w, &session(), roster).unwrap();
@@ -642,10 +1252,7 @@ mod tests {
     /// collapsing the two would drop one of them as a repeat.
     #[test]
     fn a_name_does_not_collide_with_an_id() {
-        let mut w = FakeTransport::new(
-            true,
-            vec![confirmed("1", "A"), confirmed("2", "B")],
-        );
+        let mut w = FakeTransport::new(true, vec![confirmed("1", "A"), confirmed("2", "B")]);
 
         let roster = vec![numbered("x"), named("x")];
         let report = fast_engine().run(&mut w, &session(), roster).unwrap();
@@ -683,11 +1290,15 @@ mod tests {
             true,
             vec![
                 confirmed("1", "A"),
-                resp(r#"{"v":1,"status":"ok","outcome":"indeterminate","message":"?","trainee":{"id":"2","name":"B"}}"#),
+                resp(
+                    r#"{"v":1,"status":"ok","outcome":"indeterminate","message":"?","trainee":{"id":"2","name":"B"}}"#,
+                ),
                 // third submit must never happen
             ],
         );
-        let report = fast_engine().run(&mut w, &session(), refs(&["1", "2", "3"])).unwrap();
+        let report = fast_engine()
+            .run(&mut w, &session(), refs(&["1", "2", "3"]))
+            .unwrap();
         assert_eq!(report.total, 3);
         assert_eq!(report.successful, 1);
         assert_eq!(report.indeterminate, 1);
@@ -701,13 +1312,27 @@ mod tests {
         let mut w = FakeTransport::new(
             true,
             vec![
-                resp(r#"{"v":1,"status":"ok","outcome":"rejected","message":"bad","trainee":{"id":"1","name":"A"}}"#),
+                resp(
+                    r#"{"v":1,"status":"ok","outcome":"rejected","message":"bad","trainee":{"id":"1","name":"A"}}"#,
+                ),
                 confirmed("2", "B"),
-                resp(r#"{"v":1,"status":"ok","outcome":"duplicate","message":"already logged","trainee":{"id":"3","name":"C"}}"#),
+                resp(
+                    r#"{"v":1,"status":"ok","outcome":"duplicate","message":"already logged","trainee":{"id":"3","name":"C"}}"#,
+                ),
             ],
         );
-        let report = fast_engine().run(&mut w, &session(), refs(&["1", "2", "3"])).unwrap();
-        assert_eq!((report.total, report.successful, report.failed, report.skipped), (3, 1, 2, 0));
+        let report = fast_engine()
+            .run(&mut w, &session(), refs(&["1", "2", "3"]))
+            .unwrap();
+        assert_eq!(
+            (
+                report.total,
+                report.successful,
+                report.failed,
+                report.skipped
+            ),
+            (3, 1, 2, 0)
+        );
         assert_eq!(w.submit_calls, 3);
     }
 
@@ -716,7 +1341,9 @@ mod tests {
         let mut w = FakeTransport::new(
             true,
             vec![
-                resp(r#"{"v":1,"status":"error","error_code":"ELEMENT_NOT_FOUND","message":"no field","proves_nothing_submitted":true}"#),
+                resp(
+                    r#"{"v":1,"status":"error","error_code":"ELEMENT_NOT_FOUND","message":"no field","proves_nothing_submitted":true}"#,
+                ),
                 confirmed("1", "A"),
             ],
         );
@@ -734,10 +1361,15 @@ mod tests {
                 r#"{"v":1,"status":"error","error_code":"SESSION_EXPIRED","message":"gone","proves_nothing_submitted":true}"#,
             )],
         );
-        let report = fast_engine().run(&mut w, &session(), refs(&["1", "2"])).unwrap();
+        let report = fast_engine()
+            .run(&mut w, &session(), refs(&["1", "2"]))
+            .unwrap();
         assert_eq!(report.failed, 1);
         assert_eq!(report.skipped, 1);
-        assert_eq!(report.results[0].error_code.as_deref(), Some("SESSION_EXPIRED"));
+        assert_eq!(
+            report.results[0].error_code.as_deref(),
+            Some("SESSION_EXPIRED")
+        );
         assert_eq!(w.submit_calls, 1);
     }
 
@@ -750,7 +1382,6 @@ mod tests {
         assert!(err.contains("session"), "{err}");
         assert_eq!(w.submit_calls, 0);
     }
-
 
     /// Records every checkpoint in order. The engine owns the sink, so the test
     /// keeps a handle rather than taking it back.
@@ -816,7 +1447,10 @@ mod tests {
 
     /// The store-backed engine: the real sink, on a real path.
     fn with_store(path: &std::path::Path) -> BatchEngine {
-        BatchEngine::with_policy(fast_policy(), Box::new(crate::store::CheckpointStore::new(path)))
+        BatchEngine::with_policy(
+            fast_policy(),
+            Box::new(crate::store::CheckpointStore::new(path)),
+        )
     }
 
     /// One settled write per trainee, then a terminal one: a single write at the
@@ -827,7 +1461,11 @@ mod tests {
         let recorder = Recorder::default();
         let mut w = FakeTransport::new(
             true,
-            vec![confirmed("1", "A"), confirmed("2", "B"), confirmed("3", "C")],
+            vec![
+                confirmed("1", "A"),
+                confirmed("2", "B"),
+                confirmed("3", "C"),
+            ],
         );
 
         with_recorder(&recorder)
@@ -861,7 +1499,11 @@ mod tests {
         let recorder = Recorder::default();
         let mut w = FakeTransport::new(
             true,
-            vec![confirmed("1", "A"), confirmed("2", "B"), confirmed("3", "C")],
+            vec![
+                confirmed("1", "A"),
+                confirmed("2", "B"),
+                confirmed("3", "C"),
+            ],
         );
 
         with_recorder(&recorder)
@@ -888,7 +1530,6 @@ mod tests {
         assert_eq!(first.pending, vec!["2", "3"]);
     }
 
-
     /// At the instant a submission is sent, the sink already names the trainee as
     /// in flight and the queue no longer does.
     #[test]
@@ -896,7 +1537,11 @@ mod tests {
         let recorder = Recorder::default();
         let mut w = FakeTransport::watching(
             true,
-            vec![confirmed("1", "A"), confirmed("2", "B"), confirmed("3", "C")],
+            vec![
+                confirmed("1", "A"),
+                confirmed("2", "B"),
+                confirmed("3", "C"),
+            ],
             &recorder,
         );
 
@@ -933,7 +1578,9 @@ mod tests {
         assert!(crashed.is_err(), "the simulated crash must propagate");
 
         let written = observed.borrow().clone();
-        let last = written.last().expect("the write taken before the second send");
+        let last = written
+            .last()
+            .expect("the write taken before the second send");
 
         assert_eq!(last.status, CheckpointStatus::Running);
         assert_eq!(last.in_flight.as_deref(), Some("2"));
@@ -941,9 +1588,16 @@ mod tests {
         assert_eq!(last.pending, vec!["3"]);
 
         let split = last.unreconciled();
-        assert_eq!(split.indeterminate.len(), 1, "the crashed trainee is unconfirmed");
+        assert_eq!(
+            split.indeterminate.len(),
+            1,
+            "the crashed trainee is unconfirmed"
+        );
         assert_eq!(split.indeterminate[0].trainee_id, "2");
-        assert!(!split.unprocessed.contains(&"2".to_string()), "and not merely queued");
+        assert!(
+            !split.unprocessed.contains(&"2".to_string()),
+            "and not merely queued"
+        );
     }
 
     /// End to end on a real disk: a batch killed in the commit window, and a
@@ -961,17 +1615,23 @@ mod tests {
 
         let mut w = FakeTransport::new(
             true,
-            vec![confirmed("1", "A"), confirmed("2", "B"), confirmed("3", "C")],
+            vec![
+                confirmed("1", "A"),
+                confirmed("2", "B"),
+                confirmed("3", "C"),
+            ],
         );
         w.die_on_call = Some(2);
 
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_store(&path)
-                .run(&mut w, &session(), refs(&["1", "2", "3"]))
+            with_store(&path).run(&mut w, &session(), refs(&["1", "2", "3"]))
         }));
 
         assert!(crashed.is_err(), "the simulated crash must propagate");
-        assert_eq!(w.submit_calls, 2, "the process died inside the second submit");
+        assert_eq!(
+            w.submit_calls, 2,
+            "the process died inside the second submit"
+        );
 
         // What the next process finds when it opens the same file.
         let store = CheckpointStore::new(&path);
@@ -982,7 +1642,11 @@ mod tests {
             Some("2"),
             "the trainee that was being submitted is named on disk"
         );
-        assert_eq!(found.pending, vec!["3"], "and the one behind it was not dequeued");
+        assert_eq!(
+            found.pending,
+            vec!["3"],
+            "and the one behind it was not dequeued"
+        );
 
         // Refused by default: a new batch's first write would replace the only
         // account of a submission that may already exist.
@@ -993,13 +1657,17 @@ mod tests {
         let start = recovery::guard(&store, true).expect("the override");
 
         match start.plan {
-            Plan::Resume { roster, carried, .. } => {
+            Plan::Resume {
+                roster, carried, ..
+            } => {
                 let ids: Vec<String> = roster.iter().filter_map(|r| r.id.clone()).collect();
 
                 assert_eq!(ids, vec!["3"], "only the trainee that was never sent");
                 assert!(carried.iter().any(|r| r.trainee_id == "2"));
                 assert!(
-                    carried.iter().any(|r| r.trainee_id == "1" && r.outcome == Outcome::Success),
+                    carried
+                        .iter()
+                        .any(|r| r.trainee_id == "1" && r.outcome == Outcome::Success),
                     "and the run it did record is not lost either"
                 );
             }
@@ -1012,7 +1680,8 @@ mod tests {
     /// A trainee is never in two groups at once: the write that records a
     /// result is the write that clears the marker.
     #[test]
-    fn the_in_flight_marker_is_cleared_once_the_trainee_settles() {        let recorder = Recorder::default();
+    fn the_in_flight_marker_is_cleared_once_the_trainee_settles() {
+        let recorder = Recorder::default();
         let mut w = FakeTransport::new(true, vec![confirmed("1", "A"), confirmed("2", "B")]);
 
         with_recorder(&recorder)
@@ -1039,7 +1708,9 @@ mod tests {
         let mut w = FakeTransport::new(
             true,
             vec![
-                resp(r#"{"v":1,"status":"error","error_code":"ELEMENT_NOT_FOUND","message":"no field","proves_nothing_submitted":true}"#),
+                resp(
+                    r#"{"v":1,"status":"error","error_code":"ELEMENT_NOT_FOUND","message":"no field","proves_nothing_submitted":true}"#,
+                ),
                 confirmed("1", "A"),
             ],
         );
@@ -1069,7 +1740,9 @@ mod tests {
             true,
             vec![
                 confirmed("1", "A"),
-                resp(r#"{"v":1,"status":"ok","outcome":"indeterminate","message":"?","trainee":{"id":"2","name":"B"}}"#),
+                resp(
+                    r#"{"v":1,"status":"ok","outcome":"indeterminate","message":"?","trainee":{"id":"2","name":"B"}}"#,
+                ),
             ],
         );
 
@@ -1078,7 +1751,10 @@ mod tests {
             .unwrap();
 
         let written = recorder.written();
-        assert!(written.len() >= 4, "one marker per attempt plus the settled writes");
+        assert!(
+            written.len() >= 4,
+            "one marker per attempt plus the settled writes"
+        );
 
         for checkpoint in &written {
             let accounted = checkpoint.results.len()
@@ -1088,7 +1764,6 @@ mod tests {
             assert_eq!(accounted, checkpoint.total, "{checkpoint:?}");
         }
     }
-
 
     fn indeterminate(id: &str, name: &str) -> TrainingResult {
         TrainingResult {
@@ -1114,7 +1789,11 @@ mod tests {
             .run(&mut w, &session(), refs(&["2"]))
             .unwrap();
 
-        let first = recorder.written().into_iter().next().expect("a first write");
+        let first = recorder
+            .written()
+            .into_iter()
+            .next()
+            .expect("a first write");
 
         assert_eq!(first.results.len(), 1);
         assert_eq!(first.results[0].trainee_id, "1");
@@ -1135,7 +1814,10 @@ mod tests {
         assert_eq!(w.submit_calls, 1, "only the trainee still to do");
         assert_eq!(report.total, 2);
         assert_eq!(report.successful, 1);
-        assert_eq!(report.indeterminate, 1, "the unconfirmed record is still reported");
+        assert_eq!(
+            report.indeterminate, 1,
+            "the unconfirmed record is still reported"
+        );
     }
 
     /// The carried record is the reason the previous batch stopped, so it must
@@ -1161,7 +1843,13 @@ mod tests {
         let mut engine = fast_engine().with_carried(vec![indeterminate("1", "A")]);
 
         let mut first = FakeTransport::new(true, vec![confirmed("2", "B")]);
-        assert_eq!(engine.run(&mut first, &session(), refs(&["2"])).unwrap().total, 2);
+        assert_eq!(
+            engine
+                .run(&mut first, &session(), refs(&["2"]))
+                .unwrap()
+                .total,
+            2
+        );
 
         let mut second = FakeTransport::new(true, vec![confirmed("3", "C")]);
         let report = engine.run(&mut second, &session(), refs(&["3"])).unwrap();
@@ -1197,7 +1885,9 @@ mod tests {
             true,
             vec![
                 confirmed("1", "A"),
-                resp(r#"{"v":1,"status":"ok","outcome":"indeterminate","message":"?","trainee":{"id":"2","name":"B"}}"#),
+                resp(
+                    r#"{"v":1,"status":"ok","outcome":"indeterminate","message":"?","trainee":{"id":"2","name":"B"}}"#,
+                ),
             ],
         );
 
@@ -1208,7 +1898,11 @@ mod tests {
         let written = recorder.written();
         let aborting = written
             .iter()
-            .find(|c| c.results.iter().any(|r| r.outcome == Outcome::Indeterminate))
+            .find(|c| {
+                c.results
+                    .iter()
+                    .any(|r| r.outcome == Outcome::Indeterminate)
+            })
             .expect("the write that saw the abort");
 
         assert_eq!(aborting.status, CheckpointStatus::Running);
@@ -1362,9 +2056,9 @@ mod tests {
     impl Transport for Probe {
         fn send(&mut self, req: &Request) -> Result<Response, String> {
             match req.op {
-                crate::protocol::op::ENSURE_SESSION => Ok(resp(
-                    r#"{"v":1,"status":"ok","authenticated":true}"#,
-                )),
+                crate::protocol::op::ENSURE_SESSION => {
+                    Ok(resp(r#"{"v":1,"status":"ok","authenticated":true}"#))
+                }
                 crate::protocol::op::SUBMIT_TRAINING => {
                     self.calls += 1;
                     let id = req
@@ -1443,8 +2137,11 @@ mod tests {
         };
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            BatchEngine::with_policy(fast_policy(), Box::new(sink))
-                .run(&mut transport, &session(), refs(trainees))
+            BatchEngine::with_policy(fast_policy(), Box::new(sink)).run(
+                &mut transport,
+                &session(),
+                refs(trainees),
+            )
         }));
 
         let found = CheckpointStore::new(&path).load().expect("reads");
@@ -1466,7 +2163,10 @@ mod tests {
 
         let found = found.expect("the crash left a file");
 
-        assert_eq!(found.total, 2, "the file accounts for two trainees, not three");
+        assert_eq!(
+            found.total, 2,
+            "the file accounts for two trainees, not three"
+        );
         assert_eq!(found.unaccounted(), 0, "the partition still adds up");
         assert!(
             !found.never_attempted().contains(&"1".to_string()),
@@ -1504,7 +2204,8 @@ mod tests {
                     cp.results.len() + cp.pending.len() + usize::from(cp.in_flight.is_some());
                 assert_eq!(accounted, cp.total, "partition broke: {label} {cp:?}");
 
-                let dir = std::env::temp_dir().join(format!("dssp-probe2-{}", uuid::Uuid::new_v4()));
+                let dir =
+                    std::env::temp_dir().join(format!("dssp-probe2-{}", uuid::Uuid::new_v4()));
                 std::fs::create_dir_all(&dir).expect("scratch dir");
                 let path = dir.join("dssp.checkpoint.json");
                 std::fs::write(&path, serde_json::to_string(&cp).unwrap()).expect("write");
@@ -1512,11 +2213,12 @@ mod tests {
 
                 let start = recovery::guard(&store, true).expect("resume");
                 let (roster, carried) = match start.plan {
-                    Plan::Resume { roster, carried, .. } => (roster, carried),
+                    Plan::Resume {
+                        roster, carried, ..
+                    } => (roster, carried),
                     other => panic!("expected a resume: {label} {other:?}"),
                 };
-                let roster_ids: Vec<String> =
-                    roster.iter().filter_map(|r| r.id.clone()).collect();
+                let roster_ids: Vec<String> = roster.iter().filter_map(|r| r.id.clone()).collect();
                 let carried_ids: Vec<String> =
                     carried.iter().map(|r| r.trainee_id.clone()).collect();
 
@@ -1604,7 +2306,9 @@ mod tests {
             let sent_now = sent.borrow().clone();
             all_sent.extend(sent_now.clone());
 
-            let label = format!("generation {generation} die_write={die_write:?} die_submit={die_submit:?}");
+            let label = format!(
+                "generation {generation} die_write={die_write:?} die_submit={die_submit:?}"
+            );
             let found = store.load().expect("reads").expect("a file");
             let accounted =
                 found.results.len() + found.pending.len() + usize::from(found.in_flight.is_some());
@@ -1612,11 +2316,12 @@ mod tests {
 
             let start = recovery::guard(&store, true).expect("resume");
             let (next_roster, next_carried) = match start.plan {
-                Plan::Resume { roster, carried, .. } => (roster, carried),
+                Plan::Resume {
+                    roster, carried, ..
+                } => (roster, carried),
                 other => panic!("expected a resume: {label} {other:?}"),
             };
-            let roster_ids: Vec<String> =
-                next_roster.iter().filter_map(|r| r.id.clone()).collect();
+            let roster_ids: Vec<String> = next_roster.iter().filter_map(|r| r.id.clone()).collect();
             let carried_ids: Vec<String> =
                 next_carried.iter().map(|r| r.trainee_id.clone()).collect();
 
